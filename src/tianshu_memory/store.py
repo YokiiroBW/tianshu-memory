@@ -1,0 +1,106 @@
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS accounts (
+  account_key TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES people(id),
+  version INTEGER NOT NULL, display_name TEXT);
+CREATE TABLE IF NOT EXISTS scopes (key TEXT PRIMARY KEY, version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS requests (
+  service TEXT NOT NULL, operation TEXT NOT NULL, key TEXT NOT NULL,
+  digest TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(service,operation,key));
+CREATE TABLE IF NOT EXISTS sources (
+  key TEXT PRIMARY KEY, revision INTEGER NOT NULL, epoch INTEGER NOT NULL,
+  state TEXT NOT NULL, scope TEXT NOT NULL, reality TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS groups (
+  id TEXT PRIMARY KEY, scope TEXT NOT NULL, state TEXT NOT NULL, members TEXT NOT NULL,
+  category TEXT NOT NULL, field_key TEXT, item_key TEXT);
+CREATE INDEX IF NOT EXISTS groups_scope ON groups(scope,state,category);
+CREATE TABLE IF NOT EXISTS records (
+  id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id),
+  version INTEGER NOT NULL, state TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS records_group ON records(group_id);
+CREATE TABLE IF NOT EXISTS history (
+  record_id TEXT NOT NULL, version INTEGER NOT NULL, state TEXT NOT NULL,
+  payload TEXT NOT NULL, PRIMARY KEY(record_id,version));
+CREATE TABLE IF NOT EXISTS lineage (
+  group_id TEXT NOT NULL REFERENCES groups(id), source_key TEXT NOT NULL REFERENCES sources(key),
+  revision INTEGER NOT NULL, epoch INTEGER NOT NULL,
+  PRIMARY KEY(group_id,source_key));
+CREATE TABLE IF NOT EXISTS projections (
+  ref TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES records(id),
+  version INTEGER NOT NULL, state TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS confirmations (
+  ref TEXT PRIMARY KEY, digest TEXT NOT NULL, account_key TEXT NOT NULL,
+  scope TEXT NOT NULL, expires_at TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS inbox (
+  event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, result TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS turn_inputs (
+  turn_id TEXT NOT NULL, revision INTEGER NOT NULL, digest TEXT NOT NULL,
+  result TEXT NOT NULL, PRIMARY KEY(turn_id,revision));
+CREATE TABLE IF NOT EXISTS aggregate_events (
+  owner TEXT NOT NULL, aggregate_id TEXT NOT NULL, version INTEGER NOT NULL,
+  digest TEXT NOT NULL, PRIMARY KEY(owner,aggregate_id,version));
+CREATE TABLE IF NOT EXISTS conflicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, operation TEXT NOT NULL,
+  request_id TEXT NOT NULL, digest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY, state TEXT NOT NULL, event TEXT NOT NULL, source_snapshot TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS write_ledger (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id), digest TEXT NOT NULL, result TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS source_writes (
+  source_key TEXT NOT NULL, revision INTEGER NOT NULL, scope TEXT NOT NULL,
+  job_id TEXT NOT NULL, PRIMARY KEY(source_key,revision,scope));
+CREATE TABLE IF NOT EXISTS relationship_entries (
+  group_id TEXT PRIMARY KEY REFERENCES groups(id), amount INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS outbox (
+  position INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL, payload TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0);
+CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
+  record_id UNINDEXED, record_version UNINDEXED, scope UNINDEXED, text);
+"""
+
+
+class Store:
+    """Local-file SQLite only. Each operation uses one atomic authority snapshot."""
+
+    def __init__(self, path: str | Path):
+        path = Path(path).resolve()
+        if str(path).startswith("\\\\"):
+            raise ValueError("SQLite requires a local file, not a network share")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = str(path)
+        with self.transaction() as db:
+            existing = db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='metadata'"
+            ).fetchone()
+            if existing:
+                version = db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()
+                if not version or version[0] != "1":
+                    raise ValueError("Database schema mismatch; explicit migration required")
+            # Statements are fixed, no user SQL and no executescript implicit transaction commit.
+            for statement in SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            db.execute("INSERT OR IGNORE INTO metadata VALUES ('schema','1')")
+
+    @contextmanager
+    def transaction(self):
+        db = sqlite3.connect(self.path, isolation_level=None, timeout=5)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("PRAGMA foreign_keys=ON")
+            if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
+                raise RuntimeError("SQLite WAL unavailable")
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("BEGIN IMMEDIATE")
+            yield db
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()

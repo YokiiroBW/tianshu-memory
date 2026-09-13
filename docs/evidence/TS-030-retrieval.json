@@ -1,0 +1,71 @@
+{
+  "scope": "six annotated synthetic queries; no embedding/semantic benchmark",
+  "samples": [
+    {
+      "sample": "private-full-clause",
+      "required_units": 1,
+      "selected_units": 1,
+      "required_evidence_coverage": 1.0,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "injection_utf8_bytes": 902,
+      "token_estimate": 902
+    },
+    {
+      "sample": "group-projection",
+      "required_units": 1,
+      "selected_units": 1,
+      "required_evidence_coverage": 1.0,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "injection_utf8_bytes": 747,
+      "token_estimate": 747
+    },
+    {
+      "sample": "exact-field",
+      "required_units": 1,
+      "selected_units": 1,
+      "required_evidence_coverage": 1.0,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "injection_utf8_bytes": 902,
+      "token_estimate": 902
+    },
+    {
+      "sample": "greeting-zero-history",
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "unrelated-topic",
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "zero-budget",
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    }
+  ]
+}

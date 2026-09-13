@@ -1,9 +1,39 @@
 # 天枢记忆
 
-人物、记忆、资料库与项目检索适配。
+TS-030 首个可运行人物与记忆服务，绑定文字合同 **1.0.0**。已实现 Python HTTP 端点、SQLite/WAL 持久化、精确字段/事项与 FTS5 全文检索、完整语义组预算选择、权威修订/遗忘、候选工作和幂等账本。这里只支持本人 subject；跨人物与全群画像属于 TS-031。
 
-当前为 V2 开发准备骨架，未实现业务服务。旧代码来源见主工作区 workspace.json。
+本服务组件可使用明确的合成来源后端运行。生产来源核验、确认签发、Chat Audit、跨平台账号证明、PostgreSQL 和嵌入检索尚未实现或验收；未配置依赖返回不可用。候选受理不自动生成或确认记忆。
 
-本项目有独立 Git；协调检出不供并发写入，任务在主工作区 worktrees 中进行。工作目录上下文见 .runtime/workspace-context.json，或回到主工作区 docs/development/CURRENT.md。
+## 安装与验证
 
-首个任务负责核定实际依赖、安装和检查命令；当前没有可运行应用，不执行生产连接。
+Python 3.12+，本次实际使用 uv 管理的 Python 3.13。所有命令在本仓库任务检出运行：
+
+```powershell
+uv sync --locked --group dev
+uv run ruff check .
+uv run ruff format --check .
+uv run python -m compileall -q src tests scripts
+uv run pytest tests/test_identity_auth.py tests/test_recall.py tests/test_revisions_events.py -q
+uv run pytest -q
+```
+
+测试优先读取 `TIANSHU_CONTRACT_DIRECTORY`；否则读取当前检出的 `.runtime/workspace-context.json` 定位主工作区已发布合同。独立克隆需显式设置：
+
+```powershell
+$env:TIANSHU_CONTRACT_DIRECTORY = 'C:/YOKI/Codex/tianshu-peiban-bot/contracts/text-dialogue/v1'
+```
+
+运行时读取并核验发布目录 manifest 与其中所有摘要，不复制共享 schema，也不读取旧候选合同。本服务自己的测试会将合同形状的请求送进实际端点；主工作区 `contracts/validate.py` 不是这里的产品测试。
+
+## 启动隔离演示
+
+```powershell
+uv run python scripts/create_local_fixture.py --contracts $env:TIANSHU_CONTRACT_DIRECTORY --output .runtime/demo
+uv run tianshu-memory --config .runtime/demo/config.json serve --port 8130
+```
+
+用生成的合成数据运行六个标注检索样本：`uv run python scripts/evaluate_fixture.py --fixture .runtime/demo`。报告在该目录 `evaluation.json`，不包含原文或身份 ID；这只是精确/关键词样本，不是通用语义检索成绩。
+
+初始化脚本只创建合成账号、来源与经显式审核的结构化记忆，并生成演示请求与私有令牌。拒绝覆盖已有配置；服务只监听 `127.0.0.1`，退出终端即可关闭。没有 QQ/TG、模型、生产库或设备连接。HTTP `/health` 明确显示 `local_fixture` 与未接入能力。
+
+脚本生成的 `select-private.json`、`select-group.json` 可通过 HTTP POST 调用；服务 Bearer 令牌见生成的本地 `config.json`。运行接口、配置和应用层工作流见 [运行说明](docs/runtime.md)。预算与正确性边界见 [实现决定](docs/design.md)，当前交付见 [TS-030 交接](docs/handoffs/TS-030.md)。
