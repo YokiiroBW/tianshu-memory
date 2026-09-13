@@ -1,5 +1,6 @@
 import hmac
 import json
+import ssl
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -41,7 +42,19 @@ class Authenticator:
             # Full endpoint is local deployment configuration, never user payload.
             require(urlparse(url).scheme == "https", "dependency_unavailable", 503)
             try:
-                with httpx.Client(timeout=5, follow_redirects=False, trust_env=False) as client:
+                verify = True
+                if "issuer_ca_file" in caller:
+                    ca_file = caller["issuer_ca_file"]
+                    require(
+                        isinstance(ca_file, str) and bool(ca_file) and Path(ca_file).is_absolute(),
+                        "dependency_unavailable",
+                        503,
+                    )
+                    # Private deployment trust roots, never a request field or TLS bypass.
+                    verify = ssl.create_default_context(cafile=ca_file)
+                with httpx.Client(
+                    verify=verify, timeout=5, follow_redirects=False, trust_env=False
+                ) as client:
                     response = client.post(
                         url,
                         headers={"Authorization": f"Bearer {credential}"},
@@ -59,7 +72,7 @@ class Authenticator:
                 self.contracts.validate("common#origin_resolve_response", resolved)
                 require(resolved["request_id"] == request_id)
                 context = resolved["context"]
-            except (httpx.HTTPError, ValueError):
+            except (httpx.HTTPError, OSError, ValueError):
                 raise Fault("dependency_unavailable", 503) from None
         require(not context.get("revoked", True))
         self.contracts.validate("common#trusted_context", context)

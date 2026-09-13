@@ -25,10 +25,44 @@ select 任一预算维度为零时，只核验当前账号/范围元数据和 kn
 - `mode`：仅 `local_fixture` 提供合成来源 ledger；其他模式来源核验不可用。
 - `callers.<service>.token/operations/allowed_actors`：该服务的凭据、允许操作及角色，操作名为 resolve/register/link/select/revise/consume。新画像权限独立使用 select_profiles。
 - `callers.<service>.issuer`：nonebot 或 platform；正式来源解析可配置 issuer_url（完整固定 HTTPS 端点）与 issuer_token。未配置拒绝。
+- `callers.<service>.issuer_ca_file`：可选，部署方提供的非空绝对 PEM CA 文件路径。
+  不配置时维持 HTTPX 默认受信 CA 校验；配置时以该文件构建标准库
+  `ssl.create_default_context(cafile=...)`，使用所指定的 CA 根，同时验证证书链、主机名、
+  有效期和服务器证书用途。不修改系统证书库，不从请求体读取，不提供关闭校验开关。
+  显式 false、空值、相对路径、缺失/损坏的 CA 文件及 TLS 握手失败均为
+  dependency_unavailable/503，不回退默认信任或明文。与其他 caller 配置一样逐请求重读。
 - `callers.companion.event_scopes`：仅事件消费使用的精确 scope 列表，从服务器授权配置读取。事件不使用 origins，不得把请求自报 scope 自动加入此列表。
 - `origins`：仅 local_fixture 模式使用的合成来源引用 → trusted_context；每次从文件重读，测试撤销/过期生效。正式模式不接受此替身。
 
 运行 CLI 固定 loopback，不提供公网或 TLS 部署命令。生产仍须完成凭据签发/撤销、TLS、來源适配与数据库方案，不能把本地 Bearer 演示外露作为生产。
+
+### 来源解析的 HTTPS 接线
+
+`configured_app()`、CLI 和 uvicorn factory 均通过同一 Authenticator 读取上述配置，
+无需替换认证器或修改启动入口。`issuer_url` 仍强制 HTTPS；不跟随任何重定向；
+`trust_env=False` 保持不变，环境代理、SSL_CERT_FILE/SSL_CERT_DIR 不影响该连接。
+issuer_token 是 Memory 访问 issuer 的独立解析凭据，不是 companion 调用 Memory 的 token。
+TS-050 使用 Platform 时，该凭据配置为 service=memory、resolver.caller=companion、
+resolver.purpose=dialogue，且已登记入口允许 companion → memory 的 dialogue 路由。
+用途由 issuer 的受信配置核验；不向已发布 origin_resolve_request 添加 purpose 字段。
+HTTPS 成功仅证明来源身份解析可用，正式模式 source_authority 仍未接线，健康检查、
+select（包括零预算）、profiles/select、revise、turn-commits 保持明确 503。
+
+隔离 TLS 回归使用真实 loopback HTTPS 服务和每次新建的测试 CA/证书，issuer 的业务响应
+为合成替身；不把它计为真实 Platform、渠道、模型或 L0 验收。测试证书生成需测试工具
+Python 中的 cryptography（此机器 bundled Python 已有）；不加入产品依赖或更改锁文件。
+没有该工具时测试明确失败，不跳过 TLS 验证。运行位置必须为本任务检出，所有测试数据
+置于被忽略的 .runtime；证书生成器另有输出目录检查：
+
+```powershell
+$env:TIANSHU_TEST_CERT_PYTHON = 'C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe'
+uv run pytest tests/test_auth_https.py -q --basetemp .runtime/tests-ts032-https
+```
+
+其他机器将该环境变量指向已有 cryptography 的测试工具解释器；若当前测试解释器已具备
+它，可不设置该变量。生成器仅将本轮临时叶证书私钥与 PEM 写入指定 .runtime 目录，
+不会导入证书库，也不持久化 CA 私钥。完整产品测试同样添加
+`--basetemp .runtime/tests-ts032-full`。
 
 ## 候选审核应用层
 
