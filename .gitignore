@@ -11,5 +11,7 @@ __pycache__/
 .ruff_cache/
 *.sqlite*
 *.db*
+source-guard.json
+*.source-guard.json*
 build/
 dist/

@@ -29,10 +29,25 @@ def main():
         "migrate-profiles", help="Stop writers; explicitly migrate schema 1 to 2 with a backup"
     )
     migrate.add_argument("--backup", required=True, help="New local backup path; never overwritten")
+    migrate_sources = sub.add_parser(
+        "migrate-sources", help="Stop writers; migrate schema 2 to 3 with a backup"
+    )
+    migrate_sources.add_argument("--backup", required=True)
     args = parser.parse_args()
-    if args.operation == "migrate-profiles":
+    if args.operation in {"migrate-profiles", "migrate-sources"}:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
-        result = Store(config["database_path"]).migrate_profiles(args.backup)
+        store = Store(
+            config["database_path"],
+            recovery_path=config.get("source_sync", {}).get("recovery_path"),
+        )
+        if args.operation == "migrate-sources":
+            from .contracts import Contracts
+
+            contracts = Contracts(config["contract_directory"])
+            contracts.load_sources()
+            result = store.migrate_sources(args.backup, contracts)
+        else:
+            result = store.migrate_profiles(args.backup)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     os.environ["TIANSHU_MEMORY_CONFIG"] = args.config

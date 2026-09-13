@@ -31,6 +31,8 @@ class Authenticator:
     def resolve(self, service, caller, assertion_ref, request_id):
         config = self.config()
         issuer = caller.get("issuer")
+        if config.get("mode") == "source_sync":
+            require(issuer == "platform", "dependency_unavailable", 503)
         if config.get("mode") == "local_fixture":
             context = config.get("origins", {}).get(assertion_ref)
             require(context is not None)

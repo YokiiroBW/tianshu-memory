@@ -1,8 +1,10 @@
 import json
+from contextlib import contextmanager
 from datetime import timedelta
 
 from .domain import (
     Fault,
+    admission_key,
     canonical,
     fingerprint,
     new_id,
@@ -32,6 +34,24 @@ class MemoryService:
         self.store, self.contracts, self.clock, self.max_units = store, contracts, clock, max_units
         self.source_authority = source_authority
         self.max_pending_jobs = max_pending_jobs
+
+    @property
+    def synchronized(self):
+        from .source_authority import SourceAuthority
+
+        return isinstance(self.source_authority, SourceAuthority)
+
+    def source_identity(self, source, scope):
+        return admission_key(source, scope) if self.synchronized else source_key(source)
+
+    @contextmanager
+    def operation(self, scope, **kwargs):
+        if self.synchronized:
+            with self.source_authority.operation(self, scope, **kwargs) as db:
+                yield db
+        else:
+            with self.store.transaction() as db:
+                yield db
 
     def _binding(self, db, account):
         return db.execute(
@@ -144,7 +164,9 @@ class MemoryService:
         require(len({source_key(s) for s in sources}) == len(sources), "invalid_input", 400)
         rows = []
         for source in sources:
-            row = db.execute("SELECT * FROM sources WHERE key=?", (source_key(source),)).fetchone()
+            row = db.execute(
+                "SELECT * FROM sources WHERE key=?", (self.source_identity(source, scope),)
+            ).fetchone()
             if row is None:
                 raise Fault("dependency_unavailable", 503)
             if (
@@ -196,6 +218,8 @@ class MemoryService:
             group = db.execute("SELECT * FROM groups WHERE id=?", (group_id,)).fetchone()
             if not group:
                 continue
+            if self.synchronized and group["state"] != "active" and target is None:
+                continue
             # Shared visibility changes only on the active -> invalidated transition. Later
             # private source revisions still update retained history/tombstones below, but
             # cannot signal their existence through a previously withdrawn profile's epoch.
@@ -226,15 +250,24 @@ class MemoryService:
                     "UPDATE projections SET version=version+1,state='invalidated' WHERE record_id=?",
                     (record["id"],),
                 )
+                if self.synchronized:
+                    db.execute("DELETE FROM search_index WHERE record_id=?", (record["id"],))
+        bumped = set()
         for scope_text in scopes:
             scope = json.loads(scope_text)
+            domain = canonical({k: v for k, v in scope.items() if k != "profile_subject"})
+            if domain in bumped:
+                continue
+            bumped.add(domain)
             version = self._bump(db, scope)
             self._emit(db, "memory.revised", {"scope": scope, "scope_version": version})
         self._invalidate_jobs(db, scopes=scopes)
         return scopes
 
     def revise(self, request, context):
-        with self.store.transaction() as db:
+        with self.operation(
+            scope=context["allowed_scope"], sources=request["evidence_refs"], context=context
+        ) as db:
             binding = self._authorize(db, context)
             row = db.execute(
                 "SELECT r.*,g.scope FROM records r JOIN groups g ON g.id=r.group_id WHERE r.id=?",
@@ -271,6 +304,12 @@ class MemoryService:
                     and proof["scope"] == canonical(scope)
                     and parse_time(proof["expires_at"]) > self.clock()
                 )
+                if self.synchronized:
+                    require(
+                        proof["binding_version"] == binding["version"]
+                        and proof["record_id"] == request["record_id"]
+                        and proof["expected_version"] == request["expected_version"]
+                    )
                 self._source_rows(db, request["evidence_refs"], scope)
                 # Invalidate every group derived from any target source; blocks late candidates too.
                 keys = [
@@ -290,6 +329,11 @@ class MemoryService:
                     db.execute(
                         "UPDATE sources SET epoch=epoch+1,state='withdrawn' WHERE key=?", (key,)
                     )
+                    if self.synchronized:
+                        db.execute(
+                            "INSERT OR IGNORE INTO suppression VALUES (?,?)",
+                            (key, request["revision_kind"]),
+                        )
                 self._invalidate(
                     db,
                     groups,
@@ -316,7 +360,7 @@ class MemoryService:
 
     def select(self, request, context):
         scope = request["requested_scope"]
-        with self.store.transaction() as db:
+        with self.operation(scope=scope, context=context) as db:
             self._authorize(db, context, scope=scope)
             version = self._scope_version(db, scope)
             if request["known_scope_version"] not in (None, version):
@@ -486,7 +530,7 @@ class MemoryService:
         require(publisher["authenticated_service"] == "companion")
         require(event["scope"] in publisher["allowed_scopes"])
         require(event["conversation_id"] == event["scope"]["conversation_id"], "invalid_input", 400)
-        with self.store.transaction() as db:
+        with self.operation(scope=event["scope"], sources=event["sources"], event=event) as db:
             require(
                 db.execute(
                     "SELECT id FROM people WHERE id=?", (event["scope"]["person_id"],)
@@ -542,7 +586,11 @@ class MemoryService:
                 "SELECT MAX(version) FROM aggregate_events WHERE owner=? AND aggregate_id=?",
                 aggregate_key[:2],
             ).fetchone()[0]
-            if latest is not None and event["aggregate_version"] > latest + 1:
+            if (
+                not self.synchronized
+                and latest is not None
+                and event["aggregate_version"] > latest + 1
+            ):
                 raise Fault("dependency_unavailable", 503)  # owner snapshot adapter not configured
             if prior:
                 require(prior["digest"] == input_digest, "idempotency_conflict", 409)
@@ -600,3 +648,21 @@ class MemoryService:
                 (*aggregate_key, aggregate_digest),
             )
             return result
+
+    def check_sources(self, request, publisher):
+        require(publisher["authenticated_service"] == "companion")
+        require(request["scope"] in publisher["allowed_scopes"])
+        require(self.synchronized, "dependency_unavailable", 503)
+        with self.operation(
+            scope=request["scope"], sources=request["sources"], check=request
+        ) as db:
+            self._source_rows(db, request["sources"], request["scope"])
+            return dict(
+                schema_version=1,
+                request_id=request["request_id"],
+                request_digest=fingerprint(request),
+                scope=request["scope"],
+                version_domain="text-dialogue/v1",
+                scope_version=self._scope_version(db, request["scope"]),
+                checked_at=utc(self.clock()),
+            )

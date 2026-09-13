@@ -18,17 +18,260 @@ from .service import CATEGORIES
 from .sources import LocalFixtureSources
 
 
-class LocalWorkflow:
-    """Explicit synthetic-source tooling and reviewed structured candidate commits.
-
-    The source and confirmation input is trusted local operator data, not HTTP payload authority.
-    A source/confirmation issuer for production remains a separate integration requirement.
-    """
+class _WorkflowBase:
+    """Memory-owned transaction helpers shared by separately gated applications."""
 
     def __init__(self, service):
         self.service = service
+
+    def _commit_candidate(self, job_id, drafts, *, exact_scope=False):
+        """Commit complete reviewed groups, or [] to skip. No LLM call or auto-confirmation.
+
+        A job is atomic and single-consumption. Source-version ledger deduplicates overlapping
+        events/turns, including relationship effects. Any stale dependency rejects the entire job.
+        """
+        require(isinstance(drafts, list) and len(drafts) <= 32, "invalid_input", 400)
+        require(
+            all(
+                isinstance(draft, dict) and isinstance(draft.get("units"), list) for draft in drafts
+            ),
+            "invalid_input",
+            400,
+        )
+        # The result contract cannot represent a partial commit or more than 256 records.
+        require(sum(len(draft["units"]) for draft in drafts) <= 256, "invalid_input", 400)
+        digest = fingerprint(drafts)
+        with self.service.store.transaction() as db:
+            initial = db.execute("SELECT event FROM jobs WHERE id=?", (job_id,)).fetchone()
+            require(initial is not None, "not_found", 404)
+            event = json.loads(initial["event"])
+        with self.service.operation(
+            scope=event["scope"], sources=event["sources"], event=event
+        ) as db:
+            job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            require(job is not None, "not_found", 404)
+            require(job["event"] == initial["event"], "version_conflict", 409)
+            if exact_scope:
+                # Reviewed source extraction does not itself approve broader disclosure.
+                require(all(draft["scope"] == event["scope"] for draft in drafts))
+            old = db.execute("SELECT * FROM write_ledger WHERE job_id=?", (job_id,)).fetchone()
+            if old:
+                require(old["digest"] == digest, "idempotency_conflict", 409)
+                return json.loads(old["result"])
+            event, snapshot = json.loads(job["event"]), json.loads(job["source_snapshot"])
+            if event["scope_version"] != self.service._scope_version(db, event["scope"]):
+                raise Fault("scope_changed", 409)
+            rows = self.service._source_rows(
+                db, event["sources"], event["scope"], reality=event["reality"]
+            )
+            require(
+                snapshot == {r["key"]: [r["revision"], r["epoch"]] for r in rows},
+                "version_conflict",
+                409,
+            )
+            source_map = {r["key"]: r for r in rows}
+            # An already-accounted source cannot be re-used under a new turn id or job id.
+            duplicate = any(
+                db.execute(
+                    "SELECT job_id FROM source_writes WHERE source_key=? AND revision=? AND scope=?",
+                    (r["key"], r["revision"], canonical(event["scope"])),
+                ).fetchone()
+                for r in rows
+            )
+            if duplicate:
+                result = {"state": "duplicate_source", "record_ids": [], "group_ids": []}
+            else:
+                record_ids, group_ids = [], []
+                for draft in drafts:
+                    result_group = self._write_group(db, draft, event, source_map)
+                    group_ids.append(result_group[0])
+                    record_ids.extend(result_group[1])
+                for row in rows:
+                    db.execute(
+                        "INSERT INTO source_writes VALUES (?,?,?,?)",
+                        (
+                            row["key"],
+                            row["revision"],
+                            canonical(event["scope"]),
+                            job_id,
+                        ),
+                    )
+                result = {
+                    "state": "committed" if drafts else "skipped",
+                    "record_ids": record_ids,
+                    "group_ids": group_ids,
+                }
+            db.execute(
+                "INSERT INTO write_ledger VALUES (?,?,?)", (job_id, digest, canonical(result))
+            )
+            db.execute("UPDATE jobs SET state=? WHERE id=?", (result["state"], job_id))
+            self.service._emit(
+                db, "memory.candidate_completed", {"candidate_job_ref": job_id, **result}
+            )
+            return result
+
+    def _write_group(self, db, draft, event, source_map):
+        require(
+            set(draft)
+            <= {"scope", "category", "field_key", "item_key", "units", "relationship_delta"},
+            "invalid_input",
+            400,
+        )
+        scope = draft["scope"]
+        self.service.contracts.validate("common#scope", scope)
+        require(draft["category"] in CATEGORIES, "invalid_input", 400)
+        require(
+            scope["actor_id"] == event["scope"]["actor_id"]
+            and scope["person_id"] == event["scope"]["person_id"]
+        )
+        shared = scope["audience"] == "group"
+        # Publishing a projection is an explicit reviewed draft, not a change in the source scope.
+        if not shared:
+            require(scope == event["scope"])
+        require(
+            isinstance(draft["units"], list) and 0 < len(draft["units"]) <= self.service.max_units,
+            "invalid_input",
+            400,
+        )
+        group_id = new_id("group")
+        ids = [new_id("record") for _ in draft["units"]]
+        db.execute(
+            "INSERT INTO groups VALUES (?,?,'active',?,?,?,?)",
+            (
+                group_id,
+                canonical(scope),
+                canonical(ids),
+                draft["category"],
+                draft.get("field_key"),
+                draft.get("item_key"),
+            ),
+        )
+        lineage = set()
+        for record_id, draft_unit in zip(ids, draft["units"], strict=True):
+            require(
+                set(draft_unit)
+                == {
+                    "statement",
+                    "conditions",
+                    "negations",
+                    "valid_time",
+                    "uncertainty",
+                    "reality",
+                    "sources",
+                },
+                "invalid_input",
+                400,
+            )
+            require(bool(draft_unit["sources"]), "invalid_input", 400)
+            for source in draft_unit["sources"]:
+                key = self.service.source_identity(source, event["scope"])
+                require(key in source_map and json.loads(source_map[key]["payload"]) == source)
+                require(source_map[key]["reality"] == draft_unit["reality"], "invalid_input", 400)
+                lineage.add(key)
+            unit = {k: v for k, v in draft_unit.items() if k != "sources"}
+            unit.update(
+                record_id=record_id,
+                record_version=1,
+                semantic_group_id=group_id,
+                subject_person_id=scope["person_id"],
+                visibility="shared_projection" if shared else "self_private",
+            )
+            if shared:
+                ref = new_id("projection")
+                unit["sources"] = [
+                    {
+                        "kind": "shareable_projection",
+                        "owner": "memory",
+                        "projection_ref": ref,
+                        "projection_version": 1,
+                    }
+                ]
+            else:
+                unit["sources"] = [
+                    {"kind": "raw_message", "source": s} for s in draft_unit["sources"]
+                ]
+            self.service.contracts.validate("identity-memory#unit", unit)
+            self._store_unit(
+                db, unit, group_id, scope, draft.get("field_key"), draft.get("item_key")
+            )
+        for key in lineage:
+            row = source_map[key]
+            db.execute(
+                "INSERT INTO lineage VALUES (?,?,?,?)",
+                (group_id, key, row["revision"], row["epoch"]),
+            )
+        delta = draft.get("relationship_delta")
+        if delta is not None:
+            require(
+                draft["category"] == "relationship" and type(delta) is int and -100 <= delta <= 100,
+                "invalid_input",
+                400,
+            )
+            db.execute("INSERT INTO relationship_entries VALUES (?,?)", (group_id, delta))
+        return group_id, ids
+
+    def _store_unit(self, db, unit, group_id, scope, field, item):
+        record_id = unit["record_id"]
+        db.execute(
+            "INSERT INTO records VALUES (?,?,1,'active',?)", (record_id, group_id, canonical(unit))
+        )
+        db.execute("INSERT INTO history VALUES (?,1,'active',?)", (record_id, canonical(unit)))
+        for source in unit["sources"]:
+            if source["kind"] == "shareable_projection":
+                db.execute(
+                    "INSERT INTO projections VALUES (?,?,1,'active')",
+                    (source["projection_ref"], record_id),
+                )
+        self._index(db, unit, scope, field, item)
+
+    def _index(self, db, unit, scope, field, item):
+        text = " ".join(
+            [
+                unit["statement"],
+                *unit["conditions"],
+                *unit["negations"],
+                unit["valid_time"],
+                field or "",
+                item or "",
+            ]
+        )
+        db.execute(
+            "INSERT INTO search_index VALUES (?,?,?,?)",
+            (
+                unit["record_id"],
+                unit["record_version"],
+                canonical(scope),
+                " ".join(terms(text)),
+            ),
+        )
+
+    def jobs(self):
+        with self.service.store.transaction() as db:
+            return [dict(r) for r in db.execute("SELECT id,state FROM jobs ORDER BY rowid")]
+
+    def outbox(self, after=0, limit=100):
+        require(0 < limit <= 1000, "invalid_input", 400)
+        with self.service.store.transaction() as db:
+            return [
+                dict(r, payload=json.loads(r["payload"]))
+                for r in db.execute(
+                    "SELECT * FROM outbox WHERE position>? AND acknowledged=0 ORDER BY position LIMIT ?",
+                    (after, limit),
+                )
+            ]
+
+    def acknowledge(self, event_id):
+        with self.service.store.transaction() as db:
+            db.execute("UPDATE outbox SET acknowledged=1 WHERE event_id=?", (event_id,))
+
+
+class LocalWorkflow(_WorkflowBase):
+    """Explicit synthetic operator tooling; never a production approval issuer."""
+
+    def __init__(self, service):
         if not isinstance(service.source_authority, LocalFixtureSources):
             raise ValueError("Local workflow requires the explicit local_fixture source backend")
+        super().__init__(service)
 
     def observe_source(self, source, scope, *, reality="real", state="active"):
         self.service.contracts.validate("common#source", source)
@@ -191,206 +434,7 @@ class LocalWorkflow:
             return result
 
     def commit_candidate(self, job_id, drafts):
-        """Commit complete reviewed groups, or [] to skip. No LLM call or auto-confirmation.
-
-        A job is atomic and single-consumption. Source-version ledger deduplicates overlapping
-        events/turns, including relationship effects. Any stale dependency rejects the entire job.
-        """
-        digest = fingerprint(drafts)
-        with self.service.store.transaction() as db:
-            job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-            require(job is not None, "not_found", 404)
-            old = db.execute("SELECT * FROM write_ledger WHERE job_id=?", (job_id,)).fetchone()
-            if old:
-                require(old["digest"] == digest, "idempotency_conflict", 409)
-                return json.loads(old["result"])
-            event, snapshot = json.loads(job["event"]), json.loads(job["source_snapshot"])
-            if event["scope_version"] != self.service._scope_version(db, event["scope"]):
-                raise Fault("scope_changed", 409)
-            rows = self.service._source_rows(
-                db, event["sources"], event["scope"], reality=event["reality"]
-            )
-            require(
-                snapshot == {r["key"]: [r["revision"], r["epoch"]] for r in rows},
-                "version_conflict",
-                409,
-            )
-            source_map = {r["key"]: r for r in rows}
-            # An already-accounted source cannot be re-used under a new turn id or job id.
-            duplicate = any(
-                db.execute(
-                    "SELECT job_id FROM source_writes WHERE source_key=? AND revision=? AND scope=?",
-                    (r["key"], r["revision"], canonical(event["scope"])),
-                ).fetchone()
-                for r in rows
-            )
-            if duplicate:
-                result = {"state": "duplicate_source", "record_ids": [], "group_ids": []}
-            else:
-                require(isinstance(drafts, list) and len(drafts) <= 32, "invalid_input", 400)
-                record_ids, group_ids = [], []
-                for draft in drafts:
-                    result_group = self._write_group(db, draft, event, source_map)
-                    group_ids.append(result_group[0])
-                    record_ids.extend(result_group[1])
-                for row in rows:
-                    db.execute(
-                        "INSERT INTO source_writes VALUES (?,?,?,?)",
-                        (
-                            row["key"],
-                            row["revision"],
-                            canonical(event["scope"]),
-                            job_id,
-                        ),
-                    )
-                result = {
-                    "state": "committed" if drafts else "skipped",
-                    "record_ids": record_ids,
-                    "group_ids": group_ids,
-                }
-            db.execute(
-                "INSERT INTO write_ledger VALUES (?,?,?)", (job_id, digest, canonical(result))
-            )
-            db.execute("UPDATE jobs SET state=? WHERE id=?", (result["state"], job_id))
-            self.service._emit(
-                db, "memory.candidate_completed", {"candidate_job_ref": job_id, **result}
-            )
-            return result
-
-    def _write_group(self, db, draft, event, source_map):
-        require(
-            set(draft)
-            <= {"scope", "category", "field_key", "item_key", "units", "relationship_delta"},
-            "invalid_input",
-            400,
-        )
-        scope = draft["scope"]
-        self.service.contracts.validate("common#scope", scope)
-        require(draft["category"] in CATEGORIES, "invalid_input", 400)
-        require(
-            scope["actor_id"] == event["scope"]["actor_id"]
-            and scope["person_id"] == event["scope"]["person_id"]
-        )
-        shared = scope["audience"] == "group"
-        # Publishing a projection is an explicit reviewed draft, not a change in the source scope.
-        if not shared:
-            require(scope == event["scope"])
-        require(
-            isinstance(draft["units"], list) and 0 < len(draft["units"]) <= self.service.max_units,
-            "invalid_input",
-            400,
-        )
-        group_id = new_id("group")
-        ids = [new_id("record") for _ in draft["units"]]
-        db.execute(
-            "INSERT INTO groups VALUES (?,?,'active',?,?,?,?)",
-            (
-                group_id,
-                canonical(scope),
-                canonical(ids),
-                draft["category"],
-                draft.get("field_key"),
-                draft.get("item_key"),
-            ),
-        )
-        lineage = set()
-        for record_id, draft_unit in zip(ids, draft["units"], strict=True):
-            require(
-                set(draft_unit)
-                == {
-                    "statement",
-                    "conditions",
-                    "negations",
-                    "valid_time",
-                    "uncertainty",
-                    "reality",
-                    "sources",
-                },
-                "invalid_input",
-                400,
-            )
-            require(bool(draft_unit["sources"]), "invalid_input", 400)
-            for source in draft_unit["sources"]:
-                key = source_key(source)
-                require(key in source_map and json.loads(source_map[key]["payload"]) == source)
-                require(source_map[key]["reality"] == draft_unit["reality"], "invalid_input", 400)
-                lineage.add(key)
-            unit = {k: v for k, v in draft_unit.items() if k != "sources"}
-            unit.update(
-                record_id=record_id,
-                record_version=1,
-                semantic_group_id=group_id,
-                subject_person_id=scope["person_id"],
-                visibility="shared_projection" if shared else "self_private",
-            )
-            if shared:
-                ref = new_id("projection")
-                unit["sources"] = [
-                    {
-                        "kind": "shareable_projection",
-                        "owner": "memory",
-                        "projection_ref": ref,
-                        "projection_version": 1,
-                    }
-                ]
-            else:
-                unit["sources"] = [
-                    {"kind": "raw_message", "source": s} for s in draft_unit["sources"]
-                ]
-            self.service.contracts.validate("identity-memory#unit", unit)
-            self._store_unit(
-                db, unit, group_id, scope, draft.get("field_key"), draft.get("item_key")
-            )
-        for key in lineage:
-            row = source_map[key]
-            db.execute(
-                "INSERT INTO lineage VALUES (?,?,?,?)",
-                (group_id, key, row["revision"], row["epoch"]),
-            )
-        delta = draft.get("relationship_delta")
-        if delta is not None:
-            require(
-                draft["category"] == "relationship" and type(delta) is int and -100 <= delta <= 100,
-                "invalid_input",
-                400,
-            )
-            db.execute("INSERT INTO relationship_entries VALUES (?,?)", (group_id, delta))
-        return group_id, ids
-
-    def _store_unit(self, db, unit, group_id, scope, field, item):
-        record_id = unit["record_id"]
-        db.execute(
-            "INSERT INTO records VALUES (?,?,1,'active',?)", (record_id, group_id, canonical(unit))
-        )
-        db.execute("INSERT INTO history VALUES (?,1,'active',?)", (record_id, canonical(unit)))
-        for source in unit["sources"]:
-            if source["kind"] == "shareable_projection":
-                db.execute(
-                    "INSERT INTO projections VALUES (?,?,1,'active')",
-                    (source["projection_ref"], record_id),
-                )
-        self._index(db, unit, scope, field, item)
-
-    def _index(self, db, unit, scope, field, item):
-        text = " ".join(
-            [
-                unit["statement"],
-                *unit["conditions"],
-                *unit["negations"],
-                unit["valid_time"],
-                field or "",
-                item or "",
-            ]
-        )
-        db.execute(
-            "INSERT INTO search_index VALUES (?,?,?,?)",
-            (
-                unit["record_id"],
-                unit["record_version"],
-                canonical(scope),
-                " ".join(terms(text)),
-            ),
-        )
+        return self._commit_candidate(job_id, drafts)
 
     def rebuild_index(self):
         with self.service.store.transaction() as db:
@@ -410,10 +454,6 @@ class LocalWorkflow:
                     count += 1
             return {"indexed_records": count}
 
-    def jobs(self):
-        with self.service.store.transaction() as db:
-            return [dict(r) for r in db.execute("SELECT id,state FROM jobs ORDER BY rowid")]
-
     def relationship_value(self, scope):
         with self.service.store.transaction() as db:
             return sum(
@@ -425,17 +465,124 @@ class LocalWorkflow:
                 if self.service._group_current(db, r["group_id"])
             )
 
-    def outbox(self, after=0, limit=100):
-        require(0 < limit <= 1000, "invalid_input", 400)
-        with self.service.store.transaction() as db:
-            return [
-                dict(r, payload=json.loads(r["payload"]))
-                for r in db.execute(
-                    "SELECT * FROM outbox WHERE position>? AND acknowledged=0 ORDER BY position LIMIT ?",
-                    (after, limit),
-                )
-            ]
 
-    def acknowledge(self, event_id):
-        with self.service.store.transaction() as db:
-            db.execute("UPDATE outbox SET acknowledged=1 WHERE event_id=?", (event_id,))
+class TrustedWorkflow(_WorkflowBase):
+    """Internal application ports backed by owner synchronization and real approval.
+
+    The injected adapter must authenticate the approving user and verify their approval of
+    the whole input. A schema-valid context, service credential or model field is no proof.
+    No such user confirmation or profile approval issuer is shipped with this service.
+    """
+
+    def __init__(self, service, confirmation_adapter=None, profile_approval_adapter=None):
+        from .source_authority import SourceAuthority
+
+        if not isinstance(service.source_authority, SourceAuthority):
+            raise ValueError("Trusted workflow requires the production SourceAuthority")
+        super().__init__(service)
+        self.confirmation_adapter = confirmation_adapter
+        self.profile_approval_adapter = profile_approval_adapter
+
+    def commit_candidate(self, input):
+        self.service.contracts.validate("sync-workflow#candidate_commit", input)
+        result = self._commit_candidate(input["job_id"], input["drafts"], exact_scope=True)
+        self.service.contracts.validate("sync-workflow#candidate_result", result)
+        return result
+
+    def confirm_revision(self, input):
+        self.service.contracts.validate("sync-workflow#confirmation_input", input)
+        # Retain our own immutable value across the external approval call. The adapter may
+        # not change what is bound into the durable confirmation after approving a copy.
+        input = json.loads(canonical(input))
+        verifier = getattr(self.confirmation_adapter, "verify_approval", None)
+        require(callable(verifier), "dependency_unavailable", 503)
+        try:
+            approved = verifier(json.loads(canonical(input)))
+        except Fault:
+            raise
+        except Exception:
+            raise Fault("dependency_unavailable", 503) from None
+        require(approved is True)
+        request, context = input["request"], input["verified_context"]
+        scope = context["allowed_scope"]
+        with self.service.operation(
+            scope=scope, sources=request["evidence_refs"], context=context
+        ) as db:
+            require(
+                context["issuer"] == "platform"
+                and context["authenticated_service"] == "companion"
+                and context["audience_service"] == "memory"
+                and context["assertion_ref"] == request["command"]["origin"]["assertion_ref"]
+            )
+            binding = self.service._authorize(db, context, scope=scope)
+            require(binding is not None and binding["version"] == input["binding_version"])
+            require(parse_time(input["expires_at"]) > self.service.clock(), "invalid_input", 400)
+            row = db.execute(
+                "SELECT r.*,g.scope FROM records r JOIN groups g ON g.id=r.group_id WHERE r.id=?",
+                (request["record_id"],),
+            ).fetchone()
+            require(
+                row is not None
+                and "profile_subject" not in json.loads(row["scope"])
+                and row["scope"] == canonical(scope),
+                "not_found",
+                404,
+            )
+            if row["version"] != request["expected_version"]:
+                raise Fault("version_conflict", 409, row["version"])
+            proof = {
+                "confirmation_ref": request["confirmation_ref"],
+                "record_id": request["record_id"],
+                "semantic_digest": fingerprint(semantic_request(request)),
+                "account": context["verified_account"],
+                "scope": scope,
+                "binding_version": binding["version"],
+                "expected_version": request["expected_version"],
+                "expires_at": input["expires_at"],
+                "consumed": False,
+            }
+            self.service.contracts.validate("sync-shared#confirmation_record", proof)
+            old = db.execute(
+                "SELECT * FROM confirmations WHERE ref=?", (proof["confirmation_ref"],)
+            ).fetchone()
+            if old:
+                require(
+                    old["digest"] == proof["semantic_digest"]
+                    and old["account_key"] == canonical(proof["account"])
+                    and old["scope"] == canonical(scope)
+                    and old["binding_version"] == proof["binding_version"]
+                    and old["record_id"] == proof["record_id"]
+                    and old["expected_version"] == proof["expected_version"]
+                    and old["expires_at"] == proof["expires_at"],
+                    "idempotency_conflict",
+                    409,
+                )
+                return dict(proof, consumed=bool(old["consumed"]))
+            db.execute(
+                "INSERT INTO confirmations"
+                "(ref,digest,account_key,scope,expires_at,binding_version,record_id,expected_version) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    proof["confirmation_ref"],
+                    proof["semantic_digest"],
+                    canonical(proof["account"]),
+                    canonical(scope),
+                    proof["expires_at"],
+                    proof["binding_version"],
+                    proof["record_id"],
+                    proof["expected_version"],
+                ),
+            )
+            return proof
+
+    def approve_profile(self, draft, context, expires_at):
+        # Source admissions do not authorize publication. No real subject/curator issuer
+        # exists yet, so even an injected unimplemented profile adapter cannot issue consent.
+        raise Fault("dependency_unavailable", 503)
+
+    def publish_profile(self, draft, approval_ref, context):
+        raise Fault("dependency_unavailable", 503)
+
+    def rebuild_index(self):
+        # Whole-store maintenance needs independently bounded coverage for every scope.
+        raise Fault("dependency_unavailable", 503)

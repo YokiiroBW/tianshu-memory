@@ -1,12 +1,14 @@
 # 天枢记忆
 
-TS-030 首个可运行人物与记忆服务，绑定文字合同 **1.0.0**。已实现 Python HTTP 端点、SQLite/WAL 持久化、精确字段/事项与 FTS5 全文检索、完整语义组预算选择、权威修订/遗忘、候选工作和幂等账本。这里只支持本人 subject；跨人物与全群画像属于 TS-031。
+Python 人物与记忆服务，绑定已发布 text-dialogue/v1、profile-memory/v1 与 source-sync/v1 **1.0.0**。提供 SQLite/WAL、完整语义组预算检索、画像查询、修订/遗忘与候选幂等账本。TS-033 增加角色来源账本、物理否定传播、双 owner 读取屏障与真实 HTTPS 来源客户端。
 
-本服务组件可使用明确的合成来源后端运行。生产来源核验、确认签发、Chat Audit、跨平台账号证明、PostgreSQL 和嵌入检索尚未实现或验收；未配置依赖返回不可用。候选受理不自动生成或确认记忆。
+`source_sync` 模式经配置的 Core/Platform HTTPS 接口核验来源；`local_fixture` 保留隔离合成演示。实际测试包含合成 owner 经真实 HTTPS、Memory HTTP 与 SQLite 重启，不代表真实 Core/Platform 产品联合通过。真实用户确认签发方、画像批准签发方、Chat Audit、跨平台账号证明、PostgreSQL 与嵌入检索仍未接入；缺失能力明确不可用。候选受理不自动生成记忆。
+
+正式来源配置、schema 3 迁移、独立恢复检查点和容量边界见 [来源同步运行说明](docs/source-sync-runtime.md)。旧演示脚本继续使用 schema 1/2；不要用 fixture-action 向 schema 3 登记来源或批准。
 
 ## 安装与验证
 
-Python 3.12+，本次实际使用 uv 管理的 Python 3.13。所有命令在本仓库任务检出运行：
+Python 3.12+，TS-033 实际使用 CPython 3.12.14。所有命令在本仓库任务检出运行：
 
 ```powershell
 uv sync --locked --group dev
@@ -14,6 +16,7 @@ uv run ruff check .
 uv run ruff format --check .
 uv run python -m compileall -q src tests scripts
 uv run pytest tests/test_identity_auth.py tests/test_recall.py tests/test_recall_regressions.py tests/test_revisions_events.py -q
+uv run pytest tests/test_source_transport.py tests/test_source_migration.py tests/test_trusted_workflow.py tests/test_source_sync.py -q
 uv run pytest -q
 ```
 

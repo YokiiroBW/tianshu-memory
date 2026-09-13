@@ -10,7 +10,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .auth import Authenticator
 from .contracts import Contracts
-from .domain import Fault, fingerprint, now
+from .domain import Fault, fingerprint, now, strict_json
 from .service import MemoryService
 from .sources import LocalFixtureSources
 from .store import Store
@@ -37,7 +37,9 @@ def create_app(*, service=None, auth=None):
                 "state": "ready" if ready else "unavailable",
                 "contract_version": "1.0.0",
                 "profile_contract_version": service.contracts.profile_version if service else None,
-                "source_backend": "local_fixture"
+                "source_backend": "source_sync_https"
+                if ready and service.synchronized
+                else "local_fixture"
                 if ready and isinstance(service.source_authority, LocalFixtureSources)
                 else "unconfigured",
                 "retrieval": "sqlite_fts5_and_exact" if ready else "unavailable",
@@ -65,12 +67,12 @@ def create_app(*, service=None, auth=None):
                     body.extend(chunk)
                     if len(body) > 262144:
                         raise Fault("invalid_input", 400)
-                payload = json.loads(body)
+                payload = strict_json(body)
                 if not isinstance(payload, dict):
                     raise Fault("invalid_input", 400)
                 header = (
                     payload
-                    if operation == "consume"
+                    if operation in {"consume", "check_sources"}
                     else payload.get("command", payload.get("query", {}))
                 )
                 if (
@@ -80,7 +82,9 @@ def create_app(*, service=None, auth=None):
                 ):
                     raise Fault("unsupported_version", 400)
                 schema = (
-                    f"conversation#{input_type}"
+                    f"sync-shared#{input_type}"
+                    if operation == "check_sources"
+                    else f"conversation#{input_type}"
                     if operation == "consume"
                     else f"profiles#{input_type}"
                     if operation == "select_profiles"
@@ -88,7 +92,7 @@ def create_app(*, service=None, auth=None):
                 )
                 service.contracts.validate(schema, payload)
                 request_id = payload["event_id"] if operation == "consume" else header["request_id"]
-                if operation == "consume":
+                if operation in {"consume", "check_sources"}:
                     context = {
                         "authenticated_service": authenticated_service,
                         "allowed_scopes": caller.get("event_scopes", []),
@@ -107,7 +111,13 @@ def create_app(*, service=None, auth=None):
                 ):
                     raise Fault("dependency_unavailable", 503)
                 result = await run_in_threadpool(getattr(service, operation), payload, context)
-                module = "profiles" if operation == "select_profiles" else "identity-memory"
+                module = (
+                    "sync-shared"
+                    if operation == "check_sources"
+                    else "profiles"
+                    if operation == "select_profiles"
+                    else "identity-memory"
+                )
                 service.contracts.validate(f"{module}#{output_type}", result)
                 return JSONResponse(
                     result,
@@ -150,6 +160,13 @@ def create_app(*, service=None, auth=None):
             methods=["POST"],
             name="select_profiles",
         )
+    if service is not None and service.contracts.source_version is not None:
+        app.add_api_route(
+            "/internal/v1/memory/source-sync/check",
+            endpoint_for("check_sources", "check_request", "check_response"),
+            methods=["POST"],
+            name="check_sources",
+        )
     return app
 
 
@@ -165,8 +182,16 @@ def configured_app():
         for caller in config.get("callers", {}).values()
     ):
         contracts.load_profiles()
-    store = Store(config["database_path"])
+    store = Store(
+        config["database_path"], recovery_path=config.get("source_sync", {}).get("recovery_path")
+    )
     sources = LocalFixtureSources() if config.get("mode") == "local_fixture" else None
+    if config.get("mode") == "source_sync":
+        from .source_authority import SourceAuthority
+        from .source_transport import SourceTransport
+
+        contracts.load_sources()
+        sources = SourceAuthority(SourceTransport(config_path, contracts), contracts)
     service = MemoryService(store, contracts, source_authority=sources)
     auth = Authenticator(config_path, contracts, now)
     return create_app(service=service, auth=auth)

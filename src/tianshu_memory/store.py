@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -81,19 +82,22 @@ CREATE TABLE profile_approvals (
 class Store:
     """Local-file SQLite only. Each operation uses one atomic authority snapshot."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, recovery_path=None):
         path = Path(path).resolve()
         if str(path).startswith("\\\\"):
             raise ValueError("SQLite requires a local file, not a network share")
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = str(path)
+        self.recovery_path = Path(recovery_path or (str(path) + ".source-guard.json")).resolve()
+        if self.recovery_path == path or str(self.recovery_path).startswith("\\\\"):
+            raise ValueError("Recovery checkpoint must be a distinct local file")
         with self.transaction() as db:
             existing = db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='metadata'"
             ).fetchone()
             if existing:
                 version = db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()
-                if not version or version[0] not in {"1", "2"}:
+                if not version or version[0] not in {"1", "2", "3"}:
                     raise ValueError("Database schema mismatch; explicit migration required")
             # Statements are fixed, no user SQL and no executescript implicit transaction commit.
             for statement in SCHEMA.split(";"):
@@ -131,25 +135,47 @@ class Store:
 
     @staticmethod
     def require_profiles(db):
-        if db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0] != "2":
+        if db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0] not in {
+            "2",
+            "3",
+        }:
             from .domain import Fault
 
             raise Fault("dependency_unavailable", 503)
 
+    def migrate_sources(self, backup_path, contracts):
+        from .source_migration import migrate
+
+        return migrate(self, backup_path, contracts)
+
     @contextmanager
     def transaction(self):
+        from . import source_recovery
+
         db = sqlite3.connect(self.path, isolation_level=None, timeout=5)
         db.row_factory = sqlite3.Row
+        prepared = False
         try:
             db.execute("PRAGMA foreign_keys=ON")
             if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
                 raise RuntimeError("SQLite WAL unavailable")
             db.execute("PRAGMA synchronous=FULL")
             db.execute("BEGIN IMMEDIATE")
+            before = source_recovery.checkpoint(db)
+            if before is not None:
+                source_recovery.verify(self.recovery_path, before)
             yield db
+            after = source_recovery.checkpoint(db)
+            if after is not None and after != before:
+                prepared = True
+                source_recovery.persist(self.recovery_path, after, initialize=before is None)
             db.commit()
         except BaseException:
             db.rollback()
+            if prepared:
+                logging.getLogger(__name__).error(
+                    "source_checkpoint_commit_interrupted: checkpoint may be ahead; recovery review required"
+                )
             raise
         finally:
             db.close()

@@ -138,7 +138,7 @@ def snapshot(sources):
 
 def select(service, request, context):
     scope, target = request["requester_scope"], request["target"]
-    with service.store.transaction() as db:
+    with service.operation(scope=scope, context=context, profile=True) as db:
         service._authorize(db, context, scope=scope)
         service.store.require_profiles(db)
         kind = target["kind"]

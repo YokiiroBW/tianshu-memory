@@ -7,7 +7,9 @@ from datetime import UTC, datetime
 
 
 def canonical(value) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
 
 
 def fingerprint(value) -> str:
@@ -37,6 +39,33 @@ def semantic_request(request: dict) -> dict:
 def source_key(source: dict) -> str:
     key = source["message_key"]
     return fingerprint({"channel": key["channel"], "message_id": key["message_id"]})
+
+
+def source_selector(source, scope):
+    key = source["message_key"]
+    return {
+        "key": {"channel": key["channel"], "message_id": key["message_id"]},
+        "actor_id": scope["actor_id"],
+    }
+
+
+def admission_key(source, scope):
+    return fingerprint(source_selector(source, scope))
+
+
+def strict_json(value):
+    def pairs(items):
+        result = {}
+        for key, item in items:
+            if key in result:
+                raise ValueError("Duplicate JSON key")
+            result[key] = item
+        return result
+
+    def invalid(value):
+        raise ValueError("Non-finite JSON number")
+
+    return json.loads(value, object_pairs_hook=pairs, parse_constant=invalid)
 
 
 def terms(value: str) -> list[str]:
