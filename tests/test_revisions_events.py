@@ -298,3 +298,50 @@ def test_mixed_reality_preserved_per_source_and_group(h):
     ]
     h.workflow.commit_candidate(job, drafts)
     assert {u["reality"] for u in h.select()["selected_units"]} == {"real", "fictional"}
+
+
+def test_tombstone_cannot_be_corrected_even_with_fresh_evidence_and_confirmation(h):
+    seeded, _, _ = h.seed()
+    forgotten_request = h.revision(seeded["record_ids"][0], "forget")
+    forgotten = h.post("memory/revise", forgotten_request)
+    assert forgotten.status_code == 200 and forgotten.json()["authoritative_state"] == "tombstoned"
+    evidence = h.source("fresh-correction-evidence")
+    h.workflow.observe_source(evidence, h.private)
+    correction = dict(
+        forgotten_request,
+        command=h.command(),
+        expected_version=2,
+        revision_kind="correct",
+        confirmation_ref="fresh-correction-confirmation",
+        evidence_refs=[evidence],
+        replacement_statement="新的咖啡表述",
+    )
+    h.workflow.confirm_revision(correction, h.account, h.private, "2027-01-01T00:00:00Z")
+    with h.store.transaction() as db:
+        before = tuple(
+            db.execute(
+                "SELECT version,state,payload FROM records WHERE id=?", (seeded["record_ids"][0],)
+            ).fetchone()
+        )
+        history_count = db.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+    rejected = h.post("memory/revise", correction)
+    assert rejected.status_code == 400 and rejected.json()["code"] == "invalid_input"
+    with h.store.transaction() as db:
+        assert (
+            tuple(
+                db.execute(
+                    "SELECT version,state,payload FROM records WHERE id=?",
+                    (seeded["record_ids"][0],),
+                ).fetchone()
+            )
+            == before
+        )
+        assert db.execute("SELECT COUNT(*) FROM history").fetchone()[0] == history_count
+        assert (
+            db.execute(
+                "SELECT consumed FROM confirmations WHERE ref=?", (correction["confirmation_ref"],)
+            ).fetchone()[0]
+            == 0
+        )
+    assert h.post("memory/revise", forgotten_request).json() == forgotten.json()
+    assert h.select()["selected_units"] == []

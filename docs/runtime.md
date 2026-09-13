@@ -15,6 +15,8 @@
 
 所有内部接口使用 `Authorization: Bearer <每调用服务独立令牌>`。请求格式来自 1.0.0。错误是 common.error，不包含私有记录存在性或请求正文。限制请求体 262144 字节。未配置启动可用 `uv run uvicorn tianshu_memory.app:configured_app --factory --host 127.0.0.1 --port 8130`；/health 与业务均返回 503，无默认成功。
 
+select 任一预算维度为零时，只核验当前账号/范围元数据和 known_scope_version，不读正文、不建立 FTS。来源会话尚未绑定为 503、明确错配为 403、旧 scope_version 为 409。field:/item: 精确查询在 SQL 内先缩小组范围并跳过 FTS。对已 tombstoned 的记录提交 correct 为 invalid_input/400；v1 无恢复操作，新的证据或确认不能改变这条规则，原幂等 forget 仍可重放。
+
 运行配置由 TIANSHU_MEMORY_CONFIG 或 CLI --config 显式指向，属于服务端私有文件。支持字段：
 
 - `database_path`：明确本地 SQLite 文件；不支持 PostgreSQL DSN 或网络共享。

@@ -1,71 +1,270 @@
 {
-  "scope": "six annotated synthetic queries; no embedding/semantic benchmark",
+  "scope": "18 annotated lexical cases, including adverse neighbors and budgets; no embedding or semantic benchmark",
   "samples": [
     {
       "sample": "private-full-clause",
+      "query": "咖啡",
+      "required_statements": [
+        "晚上不喝咖啡，白天偶尔可以"
+      ],
       "required_units": 1,
       "selected_units": 1,
       "required_evidence_coverage": 1.0,
       "irrelevant_units": 0,
       "subject_condition_negation_preserved": true,
       "private_source_leaks": 0,
+      "request_byte_cap": 4096,
       "injection_utf8_bytes": 902,
       "token_estimate": 902
     },
     {
       "sample": "group-projection",
+      "query": "咖啡",
+      "required_statements": [
+        "晚上不喝咖啡，白天偶尔可以"
+      ],
       "required_units": 1,
       "selected_units": 1,
       "required_evidence_coverage": 1.0,
       "irrelevant_units": 0,
       "subject_condition_negation_preserved": true,
       "private_source_leaks": 0,
+      "request_byte_cap": 4096,
       "injection_utf8_bytes": 747,
       "token_estimate": 747
     },
     {
       "sample": "exact-field",
+      "query": "field:coffee",
+      "required_statements": [
+        "晚上不喝咖啡，白天偶尔可以"
+      ],
       "required_units": 1,
       "selected_units": 1,
       "required_evidence_coverage": 1.0,
       "irrelevant_units": 0,
       "subject_condition_negation_preserved": true,
       "private_source_leaks": 0,
+      "request_byte_cap": 4096,
       "injection_utf8_bytes": 902,
       "token_estimate": 902
     },
     {
       "sample": "greeting-zero-history",
+      "query": "你好",
+      "required_statements": [],
       "required_units": 0,
       "selected_units": 0,
       "required_evidence_coverage": null,
       "irrelevant_units": 0,
       "subject_condition_negation_preserved": true,
       "private_source_leaks": 0,
+      "request_byte_cap": 4096,
       "injection_utf8_bytes": 0,
       "token_estimate": 0
     },
     {
       "sample": "unrelated-topic",
+      "query": "音乐",
+      "required_statements": [],
       "required_units": 0,
       "selected_units": 0,
       "required_evidence_coverage": null,
       "irrelevant_units": 0,
       "subject_condition_negation_preserved": true,
       "private_source_leaks": 0,
+      "request_byte_cap": 4096,
       "injection_utf8_bytes": 0,
       "token_estimate": 0
     },
     {
       "sample": "zero-budget",
+      "query": "咖啡",
+      "required_statements": [],
       "required_units": 0,
       "selected_units": 0,
       "required_evidence_coverage": null,
       "irrelevant_units": 0,
       "subject_condition_negation_preserved": true,
       "private_source_leaks": 0,
+      "request_byte_cap": 0,
       "injection_utf8_bytes": 0,
       "token_estimate": 0
+    },
+    {
+      "sample": "common-context-negative-1",
+      "query": "今天天气怎么样",
+      "required_statements": [],
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 4096,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "common-context-negative-2",
+      "query": "晚上天气怎么样",
+      "required_statements": [],
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 4096,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "common-context-negative-3",
+      "query": "今天穿什么好",
+      "required_statements": [],
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 4096,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "common-context-negative-4",
+      "query": "白天穿什么",
+      "required_statements": [],
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 4096,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "common-context-negative-5",
+      "query": "晚上好呀",
+      "required_statements": [],
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 4096,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "common-context-negative-6",
+      "query": "今天过得怎么样",
+      "required_statements": [],
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 4096,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "common-context-negative-7",
+      "query": "晚上吃什么",
+      "required_statements": [],
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 4096,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "common-context-negative-8",
+      "query": "现在可以聊聊吗",
+      "required_statements": [],
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 4096,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "common-context-negative-9",
+      "query": "晚上有什么电影推荐",
+      "required_statements": [],
+      "required_units": 0,
+      "selected_units": 0,
+      "required_evidence_coverage": null,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 4096,
+      "injection_utf8_bytes": 0,
+      "token_estimate": 0
+    },
+    {
+      "sample": "topic-over-time-one-group-budget",
+      "query": "晚上咖啡",
+      "required_statements": [
+        "晚上不喝咖啡，白天偶尔可以"
+      ],
+      "required_units": 1,
+      "selected_units": 1,
+      "required_evidence_coverage": 1.0,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 903,
+      "injection_utf8_bytes": 903,
+      "token_estimate": 903
+    },
+    {
+      "sample": "coverage-rank-with-complete-dependency-budget",
+      "query": "咖啡口味",
+      "required_statements": [
+        "咖啡口味偏清淡",
+        "晚上不喝咖啡"
+      ],
+      "required_units": 2,
+      "selected_units": 2,
+      "required_evidence_coverage": 1.0,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 1590,
+      "injection_utf8_bytes": 1590,
+      "token_estimate": 1590
+    },
+    {
+      "sample": "fts-score-on-equal-topic-coverage",
+      "query": "咖啡",
+      "required_statements": [
+        "喜欢咖啡"
+      ],
+      "required_units": 1,
+      "selected_units": 1,
+      "required_evidence_coverage": 1.0,
+      "irrelevant_units": 0,
+      "subject_condition_negation_preserved": true,
+      "private_source_leaks": 0,
+      "request_byte_cap": 834,
+      "injection_utf8_bytes": 834,
+      "token_estimate": 834
     }
   ]
 }

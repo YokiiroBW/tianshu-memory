@@ -8,10 +8,10 @@ from .domain import (
     new_id,
     now,
     parse_time,
+    query_terms,
     require,
     semantic_request,
     source_key,
-    terms,
     utc,
 )
 
@@ -246,6 +246,12 @@ class MemoryService:
             def apply():
                 if row["version"] != request["expected_version"]:
                     raise Fault("version_conflict", 409, row["version"])
+                # v1 has no restore operation. Do not return corrected for a retained tombstone.
+                require(
+                    not (row["state"] == "tombstoned" and request["revision_kind"] == "correct"),
+                    "invalid_input",
+                    400,
+                )
                 proof = db.execute(
                     "SELECT * FROM confirmations WHERE ref=?", (request["confirmation_ref"],)
                 ).fetchone()
@@ -307,11 +313,44 @@ class MemoryService:
             version = self._scope_version(db, scope)
             if request["known_scope_version"] not in (None, version):
                 raise Fault("scope_changed", 409, version)
+            if self.source_authority is None:
+                raise Fault("dependency_unavailable", 503)
+            verified = self.clock()
+            response = {
+                "schema_version": 1,
+                "request_id": request["query"]["request_id"],
+                "effective_scope": scope,
+                "scope_version": version,
+                "verified_at": utc(verified),
+                "valid_until": utc(
+                    min(verified + timedelta(seconds=30), parse_time(context["expires_at"]))
+                ),
+                "selected_units": [],
+                "dependency_groups": [],
+                "budget_used": {"tokens": 0, "bytes": 0},
+                "omissions": [],
+            }
+            if not request["budget"]["tokens"] or not request["budget"]["bytes"]:
+                # Scope authority is updated atomically by source/revision invalidation. A probe
+                # reads identity/scope metadata only, regardless of matching or hidden content.
+                response["omissions"] = ["budget"]
+                return response
+
+            exact_kind, separator, exact_value = request["query_text"].partition(":")
+            exact = separator and exact_kind in {"field", "item"}
+            search_terms = [] if exact else query_terms(request["query_text"])
+            if not exact and not search_terms:
+                response["omissions"] = ["no_match"]
+                return response
             # Materialize only authorized, current groups BEFORE any lexical/FTS matching.
             placeholders = ",".join("?" for _ in request["selection"])
+            exact_filter = f" AND {exact_kind}_key=?" if exact else ""
+            parameters = [canonical(scope), *request["selection"]]
+            if exact:
+                parameters.append(exact_value)
             groups = db.execute(
-                f"SELECT * FROM groups WHERE scope=? AND state='active' AND category IN ({placeholders}) ORDER BY id",
-                (canonical(scope), *request["selection"]),
+                f"SELECT * FROM groups WHERE scope=? AND state='active' AND category IN ({placeholders}){exact_filter} ORDER BY id",
+                parameters,
             ).fetchall()
             eligible = []
             for group in groups:
@@ -336,43 +375,42 @@ class MemoryService:
                 if not self._projections_current(db, units):
                     continue
                 eligible.append((group, rows, units))
-            # Temporary index copies only authorized/current rows; stale global index cannot disclose
-            # private ranking/counts or resurrect content. No silent Python search fallback.
-            db.execute(
-                "CREATE VIRTUAL TABLE temp.allowed_search USING fts5(record_id UNINDEXED,text)"
-            )
-            for _, rows, _ in eligible:
-                for row in rows:
-                    db.execute(
-                        "INSERT INTO temp.allowed_search SELECT record_id,text FROM search_index "
-                        "WHERE record_id=? AND record_version=? AND scope=?",
-                        (row["id"], row["version"], canonical(scope)),
-                    )
-            query = request["query_text"]
-            exact_kind, separator, exact_value = query.partition(":")
-            exact = separator and exact_kind in {"field", "item"}
-            matches = set()
             if not exact:
-                query_terms = terms(query)[:64]
-                if query_terms:
-                    expression = " OR ".join('"' + t.replace('"', '""') + '"' for t in query_terms)
-                    matches = {
-                        r[0]
-                        for r in db.execute(
-                            "SELECT record_id FROM temp.allowed_search WHERE allowed_search MATCH ?",
-                            (expression,),
-                        )
-                    }
+                # One FTS document per complete authorized group: qualifiers/members contribute
+                # to relevance together. Neither private nor stale rows influence corpus scores.
+                db.execute(
+                    "CREATE VIRTUAL TABLE temp.allowed_search USING fts5(group_id UNINDEXED,text)"
+                )
+                for group, rows, _ in eligible:
+                    texts = []
+                    for row in rows:
+                        index = db.execute(
+                            "SELECT text FROM search_index WHERE record_id=? AND record_version=? AND scope=?",
+                            (row["id"], row["version"], canonical(scope)),
+                        ).fetchone()
+                        if index:
+                            texts.append(index[0])
+                    db.execute(
+                        "INSERT INTO temp.allowed_search VALUES (?,?)",
+                        (group["id"], " ".join(texts)),
+                    )
+                expression = " OR ".join(
+                    '"' + term.replace('"', '""') + '"' for term in search_terms
+                )
+                matches = {}
+                for match in db.execute(
+                    "SELECT group_id,text,bm25(allowed_search) AS relevance FROM temp.allowed_search WHERE allowed_search MATCH ?",
+                    (expression,),
+                ):
+                    coverage = len(set(search_terms).intersection(match["text"].split()))
+                    matches[match["group_id"]] = (-coverage, match["relevance"], match["group_id"])
+                eligible = sorted(
+                    (entry for entry in eligible if entry[0]["id"] in matches),
+                    key=lambda entry: matches[entry[0]["id"]],
+                )
             units, dependencies, omissions = [], [], []
             used = {"tokens": 0, "bytes": 0}
             for group, rows, group_units in eligible:
-                hit = (
-                    group[f"{exact_kind}_key"] == exact_value
-                    if exact
-                    else any(r["id"] in matches for r in rows)
-                )
-                if not hit:
-                    continue
                 dependency = {
                     "semantic_group_id": group["id"],
                     "record_ids": [u["record_id"] for u in group_units],
@@ -402,21 +440,13 @@ class MemoryService:
                 )
             if not units and not omissions:
                 omissions.append("no_match")
-            verified = self.clock()
-            return {
-                "schema_version": 1,
-                "request_id": request["query"]["request_id"],
-                "effective_scope": scope,
-                "scope_version": version,
-                "verified_at": utc(verified),
-                "valid_until": utc(
-                    min(verified + timedelta(seconds=30), parse_time(context["expires_at"]))
-                ),
-                "selected_units": units,
-                "dependency_groups": dependencies,
-                "budget_used": used,
-                "omissions": list(dict.fromkeys(omissions)),
-            }
+            response.update(
+                selected_units=units,
+                dependency_groups=dependencies,
+                budget_used=used,
+                omissions=list(dict.fromkeys(omissions)),
+            )
+            return response
 
     def _projections_current(self, db, units):
         for unit in units:

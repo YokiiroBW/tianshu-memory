@@ -13,7 +13,7 @@ uv sync --locked --group dev
 uv run ruff check .
 uv run ruff format --check .
 uv run python -m compileall -q src tests scripts
-uv run pytest tests/test_identity_auth.py tests/test_recall.py tests/test_revisions_events.py -q
+uv run pytest tests/test_identity_auth.py tests/test_recall.py tests/test_recall_regressions.py tests/test_revisions_events.py -q
 uv run pytest -q
 ```
 
@@ -32,7 +32,7 @@ uv run python scripts/create_local_fixture.py --contracts $env:TIANSHU_CONTRACT_
 uv run tianshu-memory --config .runtime/demo/config.json serve --port 8130
 ```
 
-用生成的合成数据运行六个标注检索样本：`uv run python scripts/evaluate_fixture.py --fixture .runtime/demo`。报告在该目录 `evaluation.json`，不包含原文或身份 ID；这只是精确/关键词样本，不是通用语义检索成绩。
+用生成的合成数据运行 18 个标注检索样本：`uv run python scripts/evaluate_fixture.py --fixture .runtime/demo`。报告在该目录 `evaluation.json`，包含明确的合成表述与长度，不含真实原文或身份 ID。评估使用隔离数据库副本，包含常见字干扰、多主题近邻和仅够一组的预算；这只是精确/关键词样本，不是通用语义检索成绩。
 
 初始化脚本只创建合成账号、来源与经显式审核的结构化记忆，并生成演示请求与私有令牌。拒绝覆盖已有配置；服务只监听 `127.0.0.1`，退出终端即可关闭。没有 QQ/TG、模型、生产库或设备连接。HTTP `/health` 明确显示 `local_fixture` 与未接入能力。
 

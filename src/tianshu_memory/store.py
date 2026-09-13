@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS groups (
   id TEXT PRIMARY KEY, scope TEXT NOT NULL, state TEXT NOT NULL, members TEXT NOT NULL,
   category TEXT NOT NULL, field_key TEXT, item_key TEXT);
 CREATE INDEX IF NOT EXISTS groups_scope ON groups(scope,state,category);
+CREATE INDEX IF NOT EXISTS groups_field ON groups(scope,field_key,state,category);
+CREATE INDEX IF NOT EXISTS groups_item ON groups(scope,item_key,state,category);
 CREATE TABLE IF NOT EXISTS records (
   id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id),
   version INTEGER NOT NULL, state TEXT NOT NULL, payload TEXT NOT NULL);

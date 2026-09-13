@@ -10,7 +10,7 @@
 
 语法/静态：`uv run ruff check .`；`uv run ruff format --check .`；`uv run python -m compileall -q src tests scripts`。
 
-受影响组件：`uv run pytest tests/test_identity_auth.py tests/test_recall.py tests/test_revisions_events.py -q`。
+受影响组件：`uv run pytest tests/test_identity_auth.py tests/test_recall.py tests/test_recall_regressions.py tests/test_revisions_events.py -q`。
 
 完整本产品：`uv run pytest -q`，包含独立本地 HTTP 子进程启动、停止、重启验证。来源/身份 issuer 使用明确测试替身，不声称跨产品 L0 或真实外部验收。
 
