@@ -1,10 +1,12 @@
 import argparse
 import json
 import os
+from pathlib import Path
 
 import uvicorn
 
 from .app import configured_app
+from .store import Store
 from .workflow import LocalWorkflow
 
 
@@ -23,7 +25,16 @@ def main():
     sub.add_parser("jobs")
     sub.add_parser("rebuild-index")
     sub.add_parser("outbox")
+    migrate = sub.add_parser(
+        "migrate-profiles", help="Stop writers; explicitly migrate schema 1 to 2 with a backup"
+    )
+    migrate.add_argument("--backup", required=True, help="New local backup path; never overwritten")
     args = parser.parse_args()
+    if args.operation == "migrate-profiles":
+        config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        result = Store(config["database_path"]).migrate_profiles(args.backup)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     os.environ["TIANSHU_MEMORY_CONFIG"] = args.config
     app = configured_app()
     if args.operation == "serve":
@@ -31,10 +42,15 @@ def main():
         return
     workflow = LocalWorkflow(app.state.memory)
     if args.operation == "fixture-action":
-        from pathlib import Path
-
         data = json.loads(Path(args.file).read_text(encoding="utf-8"))
-        allowed = {"observe_source", "confirm_revision", "commit_candidate", "acknowledge"}
+        allowed = {
+            "observe_source",
+            "confirm_revision",
+            "commit_candidate",
+            "acknowledge",
+            "approve_profile",
+            "publish_profile",
+        }
         if data["operation"] not in allowed:
             parser.error("Unsupported fixture operation")
         result = getattr(workflow, data["operation"])(**data["arguments"])

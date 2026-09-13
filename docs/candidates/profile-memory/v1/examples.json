@@ -1,0 +1,574 @@
+[
+  {
+    "id": "A-asks-B",
+    "definition": "select_request",
+    "valid": true,
+    "document": {
+      "query": {
+        "schema_version": 1,
+        "request_id": "query-1",
+        "origin": {
+          "assertion_ref": "origin-A-G"
+        }
+      },
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "person",
+        "person_id": "person-B"
+      },
+      "query_text": "field:interest.coffee",
+      "selection": [
+        "interest"
+      ],
+      "known_scope_version": null,
+      "budget": {
+        "tokens": 4096,
+        "bytes": 4096
+      }
+    }
+  },
+  {
+    "id": "current-group-topic",
+    "definition": "select_request",
+    "valid": true,
+    "document": {
+      "query": {
+        "schema_version": 1,
+        "request_id": "query-1",
+        "origin": {
+          "assertion_ref": "origin-A-G"
+        }
+      },
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "group",
+        "conversation_id": "group-G"
+      },
+      "query_text": "field:topic.technology",
+      "selection": [
+        "topic"
+      ],
+      "known_scope_version": null,
+      "budget": {
+        "tokens": 4096,
+        "bytes": 4096
+      }
+    }
+  },
+  {
+    "id": "approved-public-interest",
+    "definition": "select_response",
+    "valid": true,
+    "document": {
+      "schema_version": 1,
+      "version_domain": "profile-memory/v1",
+      "request_id": "query-1",
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "person",
+        "person_id": "person-B"
+      },
+      "scope_version": 2,
+      "verified_at": "2026-09-14T01:00:00Z",
+      "valid_until": "2026-09-14T01:00:30Z",
+      "selected_units": [
+        {
+          "record_id": "record-1",
+          "record_version": 1,
+          "semantic_group_id": "semantic-1",
+          "subject": {
+            "kind": "person",
+            "person_id": "person-B"
+          },
+          "field_key": "interest.coffee",
+          "sharing": "public_preference",
+          "statement": "B白天偶尔喝咖啡",
+          "conditions": [
+            "仅白天偶尔"
+          ],
+          "negations": [
+            "晚上不喝咖啡"
+          ],
+          "valid_time": "current",
+          "uncertainty": "confirmed",
+          "reality": "real",
+          "visibility": "shared_projection",
+          "sources": [
+            {
+              "kind": "shareable_projection",
+              "owner": "memory",
+              "projection_ref": "projection-1",
+              "projection_version": 1
+            }
+          ]
+        }
+      ],
+      "dependency_groups": [
+        {
+          "semantic_group_id": "semantic-1",
+          "record_ids": [
+            "record-1"
+          ],
+          "complete": true
+        }
+      ],
+      "budget_used": {
+        "bytes": 627,
+        "tokens": 627
+      },
+      "omissions": []
+    }
+  },
+  {
+    "id": "group-topic-observation",
+    "definition": "select_response",
+    "valid": true,
+    "document": {
+      "schema_version": 1,
+      "version_domain": "profile-memory/v1",
+      "request_id": "query-1",
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "group",
+        "conversation_id": "group-G"
+      },
+      "scope_version": 2,
+      "verified_at": "2026-09-14T01:00:00Z",
+      "valid_until": "2026-09-14T01:00:30Z",
+      "selected_units": [
+        {
+          "record_id": "record-1",
+          "record_version": 1,
+          "semantic_group_id": "semantic-1",
+          "subject": {
+            "kind": "group",
+            "conversation_id": "group-G"
+          },
+          "field_key": "topic.technology",
+          "sharing": "group_only",
+          "statement": "本群讨论技术",
+          "conditions": [],
+          "negations": [],
+          "valid_time": "current",
+          "uncertainty": "inferred",
+          "reality": "real",
+          "visibility": "shared_projection",
+          "sources": [
+            {
+              "kind": "shareable_projection",
+              "owner": "memory",
+              "projection_ref": "projection-1",
+              "projection_version": 1
+            }
+          ]
+        }
+      ],
+      "dependency_groups": [
+        {
+          "semantic_group_id": "semantic-1",
+          "record_ids": [
+            "record-1"
+          ],
+          "complete": true
+        }
+      ],
+      "budget_used": {
+        "bytes": 583,
+        "tokens": 583
+      },
+      "omissions": []
+    }
+  },
+  {
+    "id": "unknown-or-private-only",
+    "definition": "select_response",
+    "valid": true,
+    "document": {
+      "schema_version": 1,
+      "version_domain": "profile-memory/v1",
+      "request_id": "query-1",
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "person",
+        "person_id": "person-B"
+      },
+      "scope_version": 2,
+      "verified_at": "2026-09-14T01:00:00Z",
+      "valid_until": "2026-09-14T01:00:30Z",
+      "selected_units": [],
+      "dependency_groups": [],
+      "budget_used": {
+        "bytes": 0,
+        "tokens": 0
+      },
+      "omissions": [
+        "no_match"
+      ]
+    }
+  },
+  {
+    "id": "zero-budget-probe",
+    "definition": "select_request",
+    "valid": true,
+    "document": {
+      "query": {
+        "schema_version": 1,
+        "request_id": "query-1",
+        "origin": {
+          "assertion_ref": "origin-A-G"
+        }
+      },
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "person",
+        "person_id": "person-B"
+      },
+      "query_text": "field:interest.coffee",
+      "selection": [
+        "interest"
+      ],
+      "known_scope_version": 2,
+      "budget": {
+        "tokens": 0,
+        "bytes": 0
+      }
+    }
+  },
+  {
+    "id": "nickname-target",
+    "definition": "select_request",
+    "valid": false,
+    "document": {
+      "query": {
+        "schema_version": 1,
+        "request_id": "query-1",
+        "origin": {
+          "assertion_ref": "origin-A-G"
+        }
+      },
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "person",
+        "display_name": "B"
+      },
+      "query_text": "field:interest.coffee",
+      "selection": [
+        "interest"
+      ],
+      "known_scope_version": null,
+      "budget": {
+        "tokens": 4096,
+        "bytes": 4096
+      }
+    }
+  },
+  {
+    "id": "group-disguised-as-person",
+    "definition": "select_request",
+    "valid": false,
+    "document": {
+      "query": {
+        "schema_version": 1,
+        "request_id": "query-1",
+        "origin": {
+          "assertion_ref": "origin-A-G"
+        }
+      },
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "group",
+        "person_id": "group-G"
+      },
+      "query_text": "field:topic.technology",
+      "selection": [
+        "topic"
+      ],
+      "known_scope_version": null,
+      "budget": {
+        "tokens": 4096,
+        "bytes": 4096
+      }
+    }
+  },
+  {
+    "id": "group-global-interest",
+    "definition": "select_request",
+    "valid": false,
+    "document": {
+      "query": {
+        "schema_version": 1,
+        "request_id": "query-1",
+        "origin": {
+          "assertion_ref": "origin-A-G"
+        }
+      },
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "group",
+        "conversation_id": "group-G"
+      },
+      "query_text": "field:topic.technology",
+      "selection": [
+        "interest"
+      ],
+      "known_scope_version": null,
+      "budget": {
+        "tokens": 4096,
+        "bytes": 4096
+      }
+    }
+  },
+  {
+    "id": "wrong-version-domain",
+    "definition": "select_response",
+    "valid": false,
+    "document": {
+      "schema_version": 1,
+      "version_domain": "text-dialogue/v1",
+      "request_id": "query-1",
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "person",
+        "person_id": "person-B"
+      },
+      "scope_version": 2,
+      "verified_at": "2026-09-14T01:00:00Z",
+      "valid_until": "2026-09-14T01:00:30Z",
+      "selected_units": [
+        {
+          "record_id": "record-1",
+          "record_version": 1,
+          "semantic_group_id": "semantic-1",
+          "subject": {
+            "kind": "person",
+            "person_id": "person-B"
+          },
+          "field_key": "interest.coffee",
+          "sharing": "public_preference",
+          "statement": "B白天偶尔喝咖啡",
+          "conditions": [
+            "仅白天偶尔"
+          ],
+          "negations": [
+            "晚上不喝咖啡"
+          ],
+          "valid_time": "current",
+          "uncertainty": "confirmed",
+          "reality": "real",
+          "visibility": "shared_projection",
+          "sources": [
+            {
+              "kind": "shareable_projection",
+              "owner": "memory",
+              "projection_ref": "projection-1",
+              "projection_version": 1
+            }
+          ]
+        }
+      ],
+      "dependency_groups": [
+        {
+          "semantic_group_id": "semantic-1",
+          "record_ids": [
+            "record-1"
+          ],
+          "complete": true
+        }
+      ],
+      "budget_used": {
+        "bytes": 627,
+        "tokens": 627
+      },
+      "omissions": []
+    }
+  },
+  {
+    "id": "hidden-count",
+    "definition": "select_response",
+    "valid": false,
+    "document": {
+      "schema_version": 1,
+      "version_domain": "profile-memory/v1",
+      "request_id": "query-1",
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "person",
+        "person_id": "person-B"
+      },
+      "scope_version": 2,
+      "verified_at": "2026-09-14T01:00:00Z",
+      "valid_until": "2026-09-14T01:00:30Z",
+      "selected_units": [
+        {
+          "record_id": "record-1",
+          "record_version": 1,
+          "semantic_group_id": "semantic-1",
+          "subject": {
+            "kind": "person",
+            "person_id": "person-B"
+          },
+          "field_key": "interest.coffee",
+          "sharing": "public_preference",
+          "statement": "B白天偶尔喝咖啡",
+          "conditions": [
+            "仅白天偶尔"
+          ],
+          "negations": [
+            "晚上不喝咖啡"
+          ],
+          "valid_time": "current",
+          "uncertainty": "confirmed",
+          "reality": "real",
+          "visibility": "shared_projection",
+          "sources": [
+            {
+              "kind": "shareable_projection",
+              "owner": "memory",
+              "projection_ref": "projection-1",
+              "projection_version": 1
+            }
+          ]
+        }
+      ],
+      "dependency_groups": [
+        {
+          "semantic_group_id": "semantic-1",
+          "record_ids": [
+            "record-1"
+          ],
+          "complete": true
+        }
+      ],
+      "budget_used": {
+        "bytes": 627,
+        "tokens": 627
+      },
+      "omissions": [],
+      "hidden_count": 1
+    }
+  },
+  {
+    "id": "raw-private-source",
+    "definition": "select_response",
+    "valid": false,
+    "document": {
+      "schema_version": 1,
+      "version_domain": "profile-memory/v1",
+      "request_id": "query-1",
+      "requester_scope": {
+        "actor_id": "actor-1",
+        "person_id": "person-A",
+        "audience": "group",
+        "conversation_id": "group-G"
+      },
+      "target": {
+        "kind": "person",
+        "person_id": "person-B"
+      },
+      "scope_version": 2,
+      "verified_at": "2026-09-14T01:00:00Z",
+      "valid_until": "2026-09-14T01:00:30Z",
+      "selected_units": [
+        {
+          "record_id": "record-1",
+          "record_version": 1,
+          "semantic_group_id": "semantic-1",
+          "subject": {
+            "kind": "person",
+            "person_id": "person-B"
+          },
+          "field_key": "interest.coffee",
+          "sharing": "public_preference",
+          "statement": "B白天偶尔喝咖啡",
+          "conditions": [
+            "仅白天偶尔"
+          ],
+          "negations": [
+            "晚上不喝咖啡"
+          ],
+          "valid_time": "current",
+          "uncertainty": "confirmed",
+          "reality": "real",
+          "visibility": "shared_projection",
+          "sources": [
+            {
+              "kind": "raw_message",
+              "source": {
+                "message_key": "private"
+              }
+            }
+          ]
+        }
+      ],
+      "dependency_groups": [
+        {
+          "semantic_group_id": "semantic-1",
+          "record_ids": [
+            "record-1"
+          ],
+          "complete": true
+        }
+      ],
+      "budget_used": {
+        "bytes": 581,
+        "tokens": 581
+      },
+      "omissions": []
+    }
+  }
+]

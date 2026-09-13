@@ -43,6 +43,8 @@ class MemoryService:
         return row[0] if row else 1
 
     def _bump(self, db, scope):
+        if "profile_subject" in scope:
+            scope = {k: v for k, v in scope.items() if k != "profile_subject"}
         db.execute(
             "INSERT INTO scopes VALUES (?,2) ON CONFLICT(key) DO UPDATE SET version=version+1",
             (canonical(scope),),
@@ -235,6 +237,7 @@ class MemoryService:
             ).fetchone()
             require(row is not None and binding is not None, "not_found", 404)
             scope = json.loads(row["scope"])
+            require("profile_subject" not in scope, "not_found", 404)
             try:
                 self._authorize(db, context, scope=scope)
             except Fault as error:
@@ -376,77 +379,80 @@ class MemoryService:
                     continue
                 eligible.append((group, rows, units))
             if not exact:
-                # One FTS document per complete authorized group: qualifiers/members contribute
-                # to relevance together. Neither private nor stale rows influence corpus scores.
-                db.execute(
-                    "CREATE VIRTUAL TABLE temp.allowed_search USING fts5(group_id UNINDEXED,text)"
-                )
-                for group, rows, _ in eligible:
-                    texts = []
-                    for row in rows:
-                        index = db.execute(
-                            "SELECT text FROM search_index WHERE record_id=? AND record_version=? AND scope=?",
-                            (row["id"], row["version"], canonical(scope)),
-                        ).fetchone()
-                        if index:
-                            texts.append(index[0])
-                    db.execute(
-                        "INSERT INTO temp.allowed_search VALUES (?,?)",
-                        (group["id"], " ".join(texts)),
-                    )
-                expression = " OR ".join(
-                    '"' + term.replace('"', '""') + '"' for term in search_terms
-                )
-                matches = {}
-                for match in db.execute(
-                    "SELECT group_id,text,bm25(allowed_search) AS relevance FROM temp.allowed_search WHERE allowed_search MATCH ?",
-                    (expression,),
-                ):
-                    coverage = len(set(search_terms).intersection(match["text"].split()))
-                    matches[match["group_id"]] = (-coverage, match["relevance"], match["group_id"])
-                eligible = sorted(
-                    (entry for entry in eligible if entry[0]["id"] in matches),
-                    key=lambda entry: matches[entry[0]["id"]],
-                )
-            units, dependencies, omissions = [], [], []
-            used = {"tokens": 0, "bytes": 0}
-            for group, rows, group_units in eligible:
-                dependency = {
-                    "semantic_group_id": group["id"],
-                    "record_ids": [u["record_id"] for u in group_units],
-                    "complete": True,
-                }
-                proposed_units, proposed_groups = units + group_units, dependencies + [dependency]
-                # Unknown tokenizer: conservative UTF-8 byte charge in token field, not usage.
-                cost = len(
-                    canonical(
-                        {
-                            "selected_units": proposed_units,
-                            "dependency_groups": proposed_groups,
-                        }
-                    ).encode("utf-8")
-                )
-                if (
-                    len(proposed_units) > self.max_units
-                    or cost > request["budget"]["bytes"]
-                    or cost > request["budget"]["tokens"]
-                ):
-                    omissions.append("budget")
-                    continue
-                units, dependencies, used = (
-                    proposed_units,
-                    proposed_groups,
-                    {"tokens": cost, "bytes": cost},
-                )
-            if not units and not omissions:
-                omissions.append("no_match")
-            response.update(
-                selected_units=units,
-                dependency_groups=dependencies,
-                budget_used=used,
-                omissions=list(dict.fromkeys(omissions)),
-            )
+                eligible = self._rank_groups(db, eligible, search_terms)
+            response.update(self._fit_groups(eligible, request["budget"]))
             return response
+
+    def _rank_groups(self, db, eligible, search_terms):
+        # One FTS document per complete authorized group: qualifiers/members contribute
+        # to relevance together. Neither private nor stale rows influence corpus scores.
+        db.execute("CREATE VIRTUAL TABLE temp.allowed_search USING fts5(group_id UNINDEXED,text)")
+        for group, rows, _ in eligible:
+            texts = []
+            for row in rows:
+                index = db.execute(
+                    "SELECT text FROM search_index WHERE record_id=? AND record_version=? AND scope=?",
+                    (row["id"], row["version"], group["scope"]),
+                ).fetchone()
+                if index:
+                    texts.append(index[0])
+            db.execute(
+                "INSERT INTO temp.allowed_search VALUES (?,?)",
+                (group["id"], " ".join(texts)),
+            )
+        expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in search_terms)
+        matches = {}
+        for match in db.execute(
+            "SELECT group_id,text,bm25(allowed_search) AS relevance FROM temp.allowed_search WHERE allowed_search MATCH ?",
+            (expression,),
+        ):
+            coverage = len(set(search_terms).intersection(match["text"].split()))
+            matches[match["group_id"]] = (-coverage, match["relevance"], match["group_id"])
+        eligible = sorted(
+            (entry for entry in eligible if entry[0]["id"] in matches),
+            key=lambda entry: matches[entry[0]["id"]],
+        )
+        return eligible
+
+    def _fit_groups(self, eligible, budget):
+        units, dependencies, omissions = [], [], []
+        used = {"tokens": 0, "bytes": 0}
+        for group, rows, group_units in eligible:
+            dependency = {
+                "semantic_group_id": group["id"],
+                "record_ids": [u["record_id"] for u in group_units],
+                "complete": True,
+            }
+            proposed_units, proposed_groups = units + group_units, dependencies + [dependency]
+            # Unknown tokenizer: conservative UTF-8 byte charge in token field, not usage.
+            cost = len(
+                canonical(
+                    {
+                        "selected_units": proposed_units,
+                        "dependency_groups": proposed_groups,
+                    }
+                ).encode("utf-8")
+            )
+            if (
+                len(proposed_units) > self.max_units
+                or cost > budget["bytes"]
+                or cost > budget["tokens"]
+            ):
+                omissions.append("budget")
+                continue
+            units, dependencies, used = (
+                proposed_units,
+                proposed_groups,
+                {"tokens": cost, "bytes": cost},
+            )
+        if not units and not omissions:
+            omissions.append("no_match")
+        return {
+            "selected_units": units,
+            "dependency_groups": dependencies,
+            "budget_used": used,
+            "omissions": list(dict.fromkeys(omissions)),
+        }
 
     def _projections_current(self, db, units):
         for unit in units:
@@ -463,6 +469,13 @@ class MemoryService:
                     ):
                         return False
         return True
+
+    def select_profiles(self, request, context):
+        from . import profiles
+
+        if self.contracts.profile_version is None:
+            raise Fault("dependency_unavailable", 503)
+        return profiles.select(self, request, context)
 
     def consume(self, event, publisher):
         require(publisher["authenticated_service"] == "companion")

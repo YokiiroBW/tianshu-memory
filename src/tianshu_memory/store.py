@@ -65,6 +65,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
   record_id UNINDEXED, record_version UNINDEXED, scope UNINDEXED, text);
 """
 
+PROFILE_SCHEMA = """
+CREATE TABLE profile_shares (
+  group_id TEXT PRIMARY KEY REFERENCES groups(id), actor_id TEXT NOT NULL,
+  subject_kind TEXT NOT NULL, subject_id TEXT NOT NULL, sharing TEXT NOT NULL,
+  conversation_id TEXT, approval_ref TEXT NOT NULL UNIQUE);
+CREATE INDEX profile_audience ON profile_shares(
+  actor_id,subject_kind,subject_id,sharing,conversation_id);
+CREATE TABLE profile_approvals (
+  ref TEXT PRIMARY KEY, digest TEXT NOT NULL, source_snapshot TEXT NOT NULL,
+  expires_at TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0, result TEXT);
+"""
+
 
 class Store:
     """Local-file SQLite only. Each operation uses one atomic authority snapshot."""
@@ -81,13 +93,45 @@ class Store:
             ).fetchone()
             if existing:
                 version = db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()
-                if not version or version[0] != "1":
+                if not version or version[0] not in {"1", "2"}:
                     raise ValueError("Database schema mismatch; explicit migration required")
             # Statements are fixed, no user SQL and no executescript implicit transaction commit.
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     db.execute(statement)
             db.execute("INSERT OR IGNORE INTO metadata VALUES ('schema','1')")
+
+    def migrate_profiles(self, backup_path):
+        """Explicit additive migration. Stop writers; retain the complete pre-migration DB.
+
+        Rollback requires restoring this backup after stopping all writers. Never downgrade
+        schema 2 in place: doing so would discard subsequently approved profile projections.
+        """
+        backup = Path(backup_path).resolve()
+        if str(backup).startswith("\\\\") or backup == Path(self.path):
+            raise ValueError("Backup must be a distinct local file")
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        # Exclusive reservation prevents accidental overwrite of a prior rollback artifact.
+        with backup.open("xb"):
+            pass
+        with self.transaction() as db:
+            if db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0] != "1":
+                raise ValueError("Profile migration requires schema 1")
+            # A separate reader sees the committed snapshot while BEGIN IMMEDIATE blocks writers.
+            with sqlite3.connect(self.path) as reader, sqlite3.connect(backup) as destination:
+                reader.backup(destination)
+            for statement in PROFILE_SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            db.execute("UPDATE metadata SET value='2' WHERE key='schema'")
+        return {"schema": 2, "backup": str(backup)}
+
+    @staticmethod
+    def require_profiles(db):
+        if db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0] != "2":
+            from .domain import Fault
+
+            raise Fault("dependency_unavailable", 503)
 
     @contextmanager
     def transaction(self):

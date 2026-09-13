@@ -36,6 +36,7 @@ def create_app(*, service=None, auth=None):
             {
                 "state": "ready" if ready else "unavailable",
                 "contract_version": "1.0.0",
+                "profile_contract_version": service.contracts.profile_version if service else None,
                 "source_backend": "local_fixture"
                 if ready and isinstance(service.source_authority, LocalFixtureSources)
                 else "unconfigured",
@@ -81,6 +82,8 @@ def create_app(*, service=None, auth=None):
                 schema = (
                     f"conversation#{input_type}"
                     if operation == "consume"
+                    else f"profiles#{input_type}"
+                    if operation == "select_profiles"
                     else f"identity-memory#{input_type}"
                 )
                 service.contracts.validate(schema, payload)
@@ -99,12 +102,13 @@ def create_app(*, service=None, auth=None):
                         request_id,
                     )
                 if (
-                    operation in {"select", "consume", "revise"}
+                    operation in {"select", "select_profiles", "consume", "revise"}
                     and service.source_authority is None
                 ):
                     raise Fault("dependency_unavailable", 503)
                 result = await run_in_threadpool(getattr(service, operation), payload, context)
-                service.contracts.validate(f"identity-memory#{output_type}", result)
+                module = "profiles" if operation == "select_profiles" else "identity-memory"
+                service.contracts.validate(f"{module}#{output_type}", result)
                 return JSONResponse(
                     result,
                     headers={
@@ -138,6 +142,14 @@ def create_app(*, service=None, auth=None):
         app.add_api_route(
             path, endpoint_for(operation, input_type, output_type), methods=["POST"], name=operation
         )
+    # Cannot load or expose the extension until a coordinator-published package is pinned.
+    if service is not None and service.contracts.profile_version is not None:
+        app.add_api_route(
+            "/internal/v1/memory/profiles/select",
+            endpoint_for("select_profiles", "select_request", "select_response"),
+            methods=["POST"],
+            name="select_profiles",
+        )
     return app
 
 
@@ -148,6 +160,11 @@ def configured_app():
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     # All paths and credentials are explicit; no production database or remote service defaults.
     contracts = Contracts(config["contract_directory"])
+    if any(
+        "select_profiles" in caller.get("operations", [])
+        for caller in config.get("callers", {}).values()
+    ):
+        contracts.load_profiles()
     store = Store(config["database_path"])
     sources = LocalFixtureSources() if config.get("mode") == "local_fixture" else None
     service = MemoryService(store, contracts, source_authority=sources)

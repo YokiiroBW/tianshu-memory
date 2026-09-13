@@ -1,4 +1,4 @@
-# TS-030 实现决定与正确性边界
+# 记忆服务实现决定与正确性边界
 
 ## 技术选择
 
@@ -46,4 +46,41 @@ scope 是 actor/person/audience/conversation 四元组，首切片仅本人。�
 
 ## 尚未通过的范围
 
-来源/确认实际生产签发及撤销、Chat Audit 原文读取、真实 PostgreSQL、语义检索/嵌入评测、自动候选提炼/完整重建、跨平台账号证明、跨人物/全群主题、多服务 L0 与真实渠道 L1 均未完成。当前来源原文读取明确 unavailable；不冒充已归档。outbox 采用持久 at-least-once 读取/确认应用层，尚无生产投递器和已发布 memory.revised wire，不能直接把内部通知当共享合同发布。
+来源/确认实际生产签发及撤销、Chat Audit 原文读取、真实 PostgreSQL、语义检索/嵌入评测、自动候选提炼/完整重建、跨平台账号证明、多服务 L0 与真实渠道 L1 均未完成。当前来源原文读取明确 unavailable；不冒充已归档。outbox 采用持久 at-least-once 读取/确认应用层，尚无生产投递器和已发布 memory.revised wire，不能直接把内部通知当共享合同发布。
+
+## TS-031 共享画像领域
+
+上文本人限制描述已发布文字合同 1.0.0；新画像领域保留这一限制。共享查询把请求人的
+可信 scope 与目标 person/group 分开。群用核心已核验会话编号，存储中带 `profile_subject`
+标记和独立授权投影索引，不向旧 v1 查询器提供 subject union 记录。重建索引和来源失效仍
+共用现有 groups/records/lineage/history/projections，不另设服务、图库或向量实现。
+
+本人私有记录、仅精确群可见/适用的 group_only 投影、同 actor 获准场景中可用的
+public_preference 分开保存。响应含显式 category，且与本次 selection 和授权元数据一致。第三人读取不查询目标私人目录；目标不存在和只有私密内容
+返回相同空选择/no_match。来源只返回新签发的投影引用，原文血缘留在服务端。完整语义、
+精确字段候选缩小、词项覆盖+BM25和整组预算直接复用 TS-030；共享查询不包含关系数值。
+
+本地 workflow 的 approve_profile/publish_profile 只在 LocalFixtureSources 下可用，
+批准绑定完整主体、字段、共享范围、正文、来源 revision/epoch 和到期时间；发布前重查
+当前来源与请求人。不能用已批准 group_only 的凭据发布 public_preference。
+本人在群里主动披露的兴趣，也可在单独明确批准公共范围后生成公开投影；仅来源在群内
+不构成全局授权。group/style 不能按 public_preference 发布，群主题不得取个人私聊来源。
+人物场景观察可标 inferred；观察、条件和不确定性按原字段保存。
+
+生产可使用已确认的类别/范围共享策略和获准群整理策略，不要求逐项弹窗；本任务没有
+实现生产同意/策略 issuer，也没有把合成批准当真实用户同意。群批准在这里是夹具整理，
+不是让任意真实成员代表群授权。真实来源适配必须在同一权威事务里传播修订和撤销。
+
+版本域为 profile-memory/v1，与 text-dialogue/v1 的 scope_version 独立。
+共享版本是 actor 公开 epoch 加当前群 epoch（初始偏移去重）；私聊仅用公开 epoch。
+私人记录变更不影响共享版本，除非它使已批准共享投影失效；其他群独有变化不影响当前群。
+发布、修订、遗忘和来源撤销事务内更新对应 epoch。无响应缓存；复核必须用本版本域端点，
+相等整数不代表可替换旧 v1 探针。发送前校验与渠道发送之间仍非分布式原子。
+
+数据库 schema 1→2 由显式 migrate-profiles 执行，事务前留完整 SQLite 备份；新增两张小表，
+不改写原有记录。新版程序可继续开 schema 1 提供 v1；共享查询需要 schema 2。
+旧版程序拒绝 schema 2。回滚需要停写并恢复备份，迁移后新增数据应另行保留，不提供会
+丢弃它们的原地降级。现有私有数据不会在迁移时自动生成共享批准或投影。
+
+组件测试通过不等于 BOT 消费新画像；陪伴核心客户端、生产策略/来源、PostgreSQL、
+embedding、真实 L0/L1 均留待各自任务联合验收。
