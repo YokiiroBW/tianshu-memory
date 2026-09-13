@@ -62,6 +62,11 @@ class MemoryService:
             require(allowed["person_id"] == binding["person_id"])
         if scope is not None:
             require(binding is not None and binding["person_id"] == scope["person_id"])
+            require(
+                allowed["actor_id"] == scope["actor_id"]
+                and allowed["audience"] == scope["audience"]
+            )
+            require(allowed["conversation_id"] is not None, "dependency_unavailable", 503)
             # Only person null from first registration may resolve via current account binding.
             effective = dict(allowed, person_id=binding["person_id"])
             require(effective == scope)
@@ -232,8 +237,10 @@ class MemoryService:
             scope = json.loads(row["scope"])
             try:
                 self._authorize(db, context, scope=scope)
-            except Fault:
-                raise Fault("not_found", 404) from None
+            except Fault as error:
+                if error.code == "forbidden":
+                    raise Fault("not_found", 404) from None
+                raise
 
             # Replays still need current authority but may reference already consumed confirmation.
             def apply():

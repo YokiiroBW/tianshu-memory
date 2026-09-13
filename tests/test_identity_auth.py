@@ -106,3 +106,26 @@ def test_unconfigured_app_and_source_backend_fail_closed(h):
             headers={"Authorization": "Bearer test-only-companion-secret"},
         )
         assert response.status_code == 503
+
+
+def test_first_select_waits_for_issuer_conversation_mapping_without_widening_scope(h):
+    h.seed()
+    h.add_origin("origin-private", dict(h.private, person_id=None, conversation_id=None))
+    h.save_config()
+    request = h.selection(budget=0)
+    unresolved = h.post("memory/select", request)
+    assert unresolved.status_code == 503
+    assert unresolved.json()["code"] == "dependency_unavailable"
+    assert "selected_units" not in unresolved.json()
+    wrong_actor = h.selection(budget=0)
+    wrong_actor["requested_scope"]["actor_id"] = "actor-other"
+    assert h.post("memory/select", wrong_actor).status_code == 403
+    # Synthetic issuer models a trusted ingest receipt binding its verified channel.
+    h.add_origin("origin-private", dict(h.private, person_id=None))
+    h.save_config()
+    resolved = h.post("memory/select", h.selection())
+    assert resolved.status_code == 200 and len(resolved.json()["selected_units"]) == 1
+    h.add_origin("origin-private", dict(h.private, conversation_id="wrong-known-conversation"))
+    h.save_config()
+    mismatch = h.post("memory/select", request)
+    assert mismatch.status_code == 403 and mismatch.json()["code"] == "forbidden"

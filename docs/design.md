@@ -10,7 +10,7 @@ FastAPI 提供小型 JSON HTTP 边界；jsonschema 从主发布目录装载 Draf
 
 人物按 namespace/immutable_account_id 唯一登记；昵称是展示字段，不参与归并。同平台群私使用同 person_id，不自动关联跨平台账号。账号关联端点保留合同，因真实双账号证明流程未实现而返回 503。
 
-首次 register 接受来源中尚未生成的 person/conversation null。select 的本人 person null 可由当前账号绑定补足，但 conversation 必须由来源解析提供精确 ID；memory 不拥有 companion 的渠道会话映射，不把来源中的 null 当任意会话授权。首次查询前的来源补足或可信渠道映射适配是 L0 接入前置，尚未联合验证。
+首次 register 接受来源中尚未生成的 person/conversation null。select 的本人 person null 可由当前账号绑定补足，但 conversation 必须由来源解析提供精确 ID；memory 不拥有 companion 的渠道会话映射，不把来源中的 null 当任意会话授权。尚未解析出会话时返回 dependency_unavailable/503，不执行查询；非空而不匹配则 forbidden/403。协调的现有合同闭环是接入方仅在收到可信核心 ingest_response 后记录 verified channel→conversation，issuer 后续 resolve 返回精确 ID，无新增共享 wire。测试覆盖 null→可信 issuer 补足→成功与明确不匹配拒绝；跨产品真实闭环仍待 L0。
 
 有 origin 的注册、查询、更正每次先验证独立服务令牌，再按服务固定 issuer 解析来源，与当前绑定、允许角色与精确 scope 取交集。过期或撤销来源不能凭幂等回放绕过授权。幂等键按 service/operation/key 持久化，payload 与 expected_version 不变；request_id、deadline 和 origin 可以更新。隐藏记录更正统一 404。
 
