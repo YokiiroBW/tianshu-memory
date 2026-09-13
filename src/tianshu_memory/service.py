@@ -196,7 +196,12 @@ class MemoryService:
             group = db.execute("SELECT * FROM groups WHERE id=?", (group_id,)).fetchone()
             if not group:
                 continue
-            scopes.add(group["scope"])
+            # Shared visibility changes only on the active -> invalidated transition. Later
+            # private source revisions still update retained history/tombstones below, but
+            # cannot signal their existence through a previously withdrawn profile's epoch.
+            # Preserve v1's own scope/history behavior; its versions are a separate domain.
+            if "profile_subject" not in json.loads(group["scope"]) or group["state"] == "active":
+                scopes.add(group["scope"])
             db.execute("UPDATE groups SET state='invalidated' WHERE id=?", (group_id,))
             for record in db.execute("SELECT * FROM records WHERE group_id=?", (group_id,)):
                 payload = json.loads(record["payload"])

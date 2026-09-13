@@ -1,5 +1,5 @@
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 SCHEMA = """
@@ -118,7 +118,10 @@ class Store:
             if db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0] != "1":
                 raise ValueError("Profile migration requires schema 1")
             # A separate reader sees the committed snapshot while BEGIN IMMEDIATE blocks writers.
-            with sqlite3.connect(self.path) as reader, sqlite3.connect(backup) as destination:
+            with (
+                closing(sqlite3.connect(self.path)) as reader,
+                closing(sqlite3.connect(backup)) as destination,
+            ):
                 reader.backup(destination)
             for statement in PROFILE_SCHEMA.split(";"):
                 if statement.strip():

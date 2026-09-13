@@ -208,3 +208,41 @@ def test_migration_failure_rolls_back_ddl_and_keeps_backup(h, monkeypatch):
     with sqlite3.connect(backup) as db:
         assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 1
     assert h.select()["selected_units"]
+
+
+@pytest.mark.parametrize("outcome", ["success", "backup_failure", "ddl_failure"])
+def test_migration_closes_connections_and_releases_backup_file(h, monkeypatch, outcome):
+    from tianshu_memory import store
+
+    h.seed()
+    opened = []  # Keep strong references so garbage collection cannot mask missing close().
+    connect = sqlite3.connect
+
+    class FailingBackup(sqlite3.Connection):
+        def backup(self, *args, **kwargs):
+            raise sqlite3.OperationalError("injected backup failure")
+
+    def tracked_connect(*args, **kwargs):
+        if outcome == "backup_failure":
+            kwargs["factory"] = FailingBackup
+        connection = connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    backup = h.directory / "connection-release.sqlite"
+    with monkeypatch.context() as patch:
+        patch.setattr(store.sqlite3, "connect", tracked_connect)
+        if outcome == "ddl_failure":
+            patch.setattr(store, "PROFILE_SCHEMA", store.PROFILE_SCHEMA + "INVALID SQL;")
+        if outcome == "success":
+            h.store.migrate_profiles(backup)
+        else:
+            with pytest.raises(sqlite3.OperationalError):
+                h.store.migrate_profiles(backup)
+    assert len(opened) == 3
+    for connection in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
+    released = h.directory / "released-backup.sqlite"
+    backup.rename(released)  # Also exercises immediate Windows file-handle release.
+    assert released.is_file()

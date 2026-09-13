@@ -114,3 +114,52 @@ def test_profile_local_http_restart_rebuild_and_atomic_revision(p, kind):
         assert (
             client.post("/internal/v1/memory/revise", json=revision).json()["record_version"] == 2
         )
+
+
+@pytest.mark.parametrize("withdrawal", ["withdrawn", "correct", "forget"])
+def test_withdrawn_profiles_do_not_leak_later_private_source_versions(p, withdrawal):
+    h = p
+    publish(
+        h,
+        profile_draft(h, sharing="group_only", conversation=h.group["conversation_id"]),
+        "origin-group",
+    )
+    requests = [
+        profile_request(h, origin=origin)
+        for origin in ("reader-group", "reader-other", "reader-private")
+    ]
+    before = [h.post("memory/profiles/select", request).json() for request in requests]
+    assert all(result["selected_units"] for result in before)
+    private_id = h.select()["selected_units"][0]["record_id"]
+    if withdrawal == "withdrawn":
+        h.workflow.observe_source(h.source(), h.private, state="withdrawn")
+    else:
+        assert h.post("memory/revise", h.revision(private_id, withdrawal)).status_code == 200
+    versions = []
+    for request, previous in zip(requests, before, strict=True):
+        result = h.post("memory/profiles/select", request).json()
+        assert result["selected_units"] == []
+        assert result["scope_version"] > previous["scope_version"]
+        versions.append(result["scope_version"])
+    # Fresh private revisions restore/change the source ledger, not its old sharing approvals.
+    for revision in (2, 3):
+        h.workflow.observe_source(h.source(revision=revision), h.private)
+        for request, version in zip(requests, versions, strict=True):
+            result = h.post("memory/profiles/select", request).json()
+            assert result["selected_units"] == [] and result["scope_version"] == version
+            probe = dict(request, known_scope_version=version, budget={"tokens": 0, "bytes": 0})
+            response = h.post("memory/profiles/select", probe)
+            assert response.status_code == 200, response.text
+            assert response.json()["budget_used"] == {"tokens": 0, "bytes": 0}
+    with h.store.transaction() as db:
+        # Retain authoritative source/history updates and a prior forget's tombstone.
+        assert db.execute("SELECT MAX(revision) FROM sources").fetchone()[0] == 3
+        record = db.execute(
+            "SELECT version,state FROM records WHERE id=?", (private_id,)
+        ).fetchone()
+        assert record["version"] == 4
+        assert record["state"] == ("tombstoned" if withdrawal == "forget" else "invalidated")
+    publish(h, profile_draft(h, units=[h.unit(h.source(revision=3))]))
+    for request, version in zip(requests, versions, strict=True):
+        result = h.post("memory/profiles/select", request).json()
+        assert len(result["selected_units"]) == 1 and result["scope_version"] > version
