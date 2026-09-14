@@ -22,6 +22,34 @@ from .store import Store
 
 READ = {"query", "recover", "check", "status"}
 WRITE = {"import", "delete", "write_state"}
+# The lesson book and the promoted experience book live in the same project domain but in
+# a separate module. Global promotion/review is its own explicit permission.
+LESSON_WRITE = {"lesson_record", "lesson_revise", "lesson_retire", "experience_withdraw"}
+PROMOTE = {"experience_promote"}
+EVIDENCE_OPERATIONS = {
+    "lesson_record": "write",
+    "lesson_revise": "write",
+    "lesson_retire": "write",
+    "lesson_query": "read",
+    "lesson_recover": "read",
+    "lesson_check": "read",
+    "experience_withdraw": "withdraw",
+    "experience_promote": "write",
+    "experience_query": "read",
+    "experience_check": "review",
+    "experience_revoke": "review",
+}
+# Every operation that carries an idempotency key and records its result.
+IDEMPOTENT = WRITE | LESSON_WRITE | PROMOTE
+# Global promotion and review need an independent explicit permission in addition to their
+# own operation permission. Reusing a project's write permission is never enough.
+EXTRA_PERMISSION = {
+    "experience_promote": "promote",
+    "experience_query": "review",
+    "experience_check": "review",
+    "experience_revoke": "review",
+    "experience_withdraw": "review",
+}
 
 
 def exact(value, fields):
@@ -79,11 +107,209 @@ def blocks(text, groups):
     return result
 
 
+class Evidence:
+    """Per-operation proof that a referenced project object is still current.
+
+    Reuses the project-scoped document lookup, state check and double file hash of the
+    knowledge operations, so lesson evidence is exactly the evidence a project query
+    returns. It never inspects another project's rows.
+    """
+
+    def __init__(self, application, db, project_id, project, read):
+        self.application = application
+        self.db = db
+        self.project_id = project_id
+        self.project = project
+        self.read = read
+
+    def reference(self, reference):
+        require(isinstance(reference, dict), "invalid_input", 400)
+        require(len(canonical(reference).encode()) <= 2048, "request_too_large", 413)
+        document = self.application._document(self.db, self.project_id, reference["document_id"])
+        current = self.application._current(self.db, self.project, document, self.read)
+        require(
+            document["version"] == reference["version"] and current,
+            "stale_evidence",
+            409,
+        )
+        row = self.db.execute(
+            "SELECT b.payload,v.hash,v.provenance FROM knowledge_blocks b "
+            "JOIN knowledge_versions v ON v.document_id=b.document_id "
+            "AND v.version=b.version WHERE b.id=? AND b.document_id=? AND b.version=?",
+            (reference["block_id"], document["id"], document["version"]),
+        ).fetchone()
+        require(row is not None and row["hash"] == reference["hash"], "stale_evidence", 409)
+        return {
+            "reference": reference,
+            **json.loads(row["payload"]),
+            "source_id": document["source_id"],
+            "provenance": json.loads(row["provenance"]),
+        }
+
+
+class FileReader:
+    """Phase-aware file validation for the project-knowledge operations.
+
+    `capture` runs inside the transaction and performs no I/O: it records the expectation.
+    `read` runs outside the transaction and reads the file. `serve` runs inside the final
+    transaction and only compares the recorded expectation with that result, so a file
+    changed in between can never look current.
+    """
+
+    def __init__(self, project):
+        self.project = project
+        self.expected = {}
+        self.cache = {}
+
+    def capture(self, document, expected):
+        self.expected.setdefault(document["locator"], expected)
+        return True
+
+    def read(self, document, expected):
+        return self.read_locator(document["locator"]) == expected
+
+    def read_locator(self, locator):
+        if locator not in self.cache:
+            try:
+                first = content_hash(read_file(self.project, locator)[0])
+                second = content_hash(read_file(self.project, locator)[0])
+                self.cache[locator] = first if first == second else None
+            except (Fault, OSError, ValueError):
+                self.cache[locator] = None
+        return self.cache[locator]
+
+    def serve(self, document, expected):
+        return self.cache.get(document["locator"]) == expected
+
+
+class Sources:
+    """Owns one dispatch's evidence readers so every phase shares the same caches.
+
+    Each phase installs its own bound method as the reader, because `Evidence` captures the
+    callable rather than looking it up per call.
+    """
+
+    READERS = {"knowledge": FileReader, "lessons": None}
+
+    def __init__(self, application, first_id, project):
+        self.application = application
+        self.first_id = first_id
+        self.project = project
+        self.readers = {}
+
+    def reader(self, project_id):
+        if project_id not in self.readers:
+            # The envelope's own project comes from the authorized context; any other project
+            # named as evidence must be separately registered before it is read.
+            source = self.project if project_id == self.first_id else None
+            if source is None:
+                source = self.application.projects.get(project_id)
+                require(isinstance(source, dict), "project_unregistered", 403)
+            self.readers[project_id] = self._new_reader(source)
+        return self.readers[project_id]
+
+    def _new_reader(self, project):
+        if self.application.lesson_domain:
+            from .lessons import LessonReader
+
+            return LessonReader(project)
+        return FileReader(project)
+
+    def bind(self, project_id, phase):
+        """The reader callable for one phase of one project."""
+        return getattr(self.reader(project_id), phase)
+
+    def context(self, db, project_id, phase):
+        """The lesson evidence context for one phase of one project."""
+        from .lessons import SourceContext
+
+        return SourceContext(self.application, db, project_id, reader=self.bind(project_id, phase))
+
+
+class Plan:
+    """One dispatch, expressed as three phases over the same evidence readers."""
+
+    @classmethod
+    def build(cls, application, operation, project_id, project, args, sources):
+        return cls(application, operation, project_id, project, args, sources)
+
+    def __init__(self, application, operation, project_id, project, args, sources):
+        self.application = application
+        self.operation = operation
+        self.project_id = project_id
+        self.project = project
+        self.args = args
+        self.sources = sources
+        self.pending = {}
+
+    def __call__(self, db, phase, seal_key=None, *, prepared=None, client=None):
+        try:
+            if self.application.lesson_domain:
+                return self._lessons(db, phase, seal_key)
+            return self.application._dispatch(
+                db,
+                self.operation,
+                self.project_id,
+                self.project,
+                self.args,
+                seal_key,
+                self.sources.bind(self.project_id, phase),
+                prepared=prepared,
+                preview=phase == "capture",
+            )
+        finally:
+            # The captured expectations are what the external phase must read.
+            reader = self.sources.reader(self.project_id)
+            self.pending.update(getattr(reader, "expected", {}))
+
+    def _lessons(self, db, phase, seal_key):
+        from .lessons import dispatch as lessons_dispatch
+
+        return lessons_dispatch(
+            self.application,
+            db,
+            self.operation,
+            self.project_id,
+            self.project,
+            self.args,
+            seal_key,
+            None,
+            sources=self.sources,
+            phase=phase,
+        )
+
+    def external(self, project):
+        """Read every referenced evidence file outside the transaction.
+
+        An import has already fetched its source in `_prepare_import`, so its reader has no
+        captured expectations and this is a no-op.
+        """
+        for reader in self.sources.readers.values():
+            for locator in set(self.pending) | set(getattr(reader, "expected", {})):
+                reader.read_locator(locator)
+
+
 class KnowledgeApplication:
     def __init__(self, config_path):
         self.config_path = Path(config_path).resolve()
+        self.project_id = None
+        self.client = None
+        self.projects = {}
+        self.authorized_projects = []
+        self.lesson_domain = False
 
-    def _context(self, client, credential, project_id, operation):
+    def string(self, value, maximum):
+        string(value, maximum)
+
+    @staticmethod
+    def integer(value, minimum=0, maximum=2**31):
+        integer(value, minimum, maximum)
+
+    @staticmethod
+    def bump(db, project_id):
+        KnowledgeApplication._bump(db, project_id)
+
+    def _context(self, client, credential, project_id, operation, evidence_projects=()):
         config = strict_json(self.config_path.read_bytes())
         knowledge = config.get("knowledge", {})
         principal = knowledge.get("clients", {}).get(client, {})
@@ -96,10 +322,17 @@ class KnowledgeApplication:
             "unauthorized",
             401,
         )
+        permissions = principal.get("permissions", [])
+        projects = principal.get("projects", [])
+        # Global promotion and review carry their own explicit permission on top of read
+        # access, and every project whose data is read must be separately registered here.
+        extra = EXTRA_PERMISSION.get(operation)
         require(
-            operation in READ | WRITE
-            and operation in principal.get("permissions", [])
-            and project_id in principal.get("projects", [])
+            operation in (READ | WRITE | set(EVIDENCE_OPERATIONS))
+            and operation in permissions
+            and (extra is None or extra in permissions)
+            and project_id in projects
+            and set(evidence_projects) <= set(projects)
         )
         project = knowledge.get("projects", {}).get(project_id)
         require(isinstance(project, dict), "project_unregistered", 403)
@@ -114,10 +347,32 @@ class KnowledgeApplication:
             "invalid_configuration",
             503,
         )
+        for evidence_project in evidence_projects:
+            registered = knowledge.get("projects", {}).get(evidence_project)
+            require(isinstance(registered, dict), "project_unregistered", 403)
+            exact(registered, "root host default_branch urls")
+            require(
+                Path(registered["root"]).is_absolute() and Path(registered["root"]).is_dir(),
+                "project_unavailable",
+                503,
+            )
+            require(
+                isinstance(registered["urls"], list) and len(registered["urls"]) <= 256,
+                "invalid_configuration",
+                503,
+            )
         store = Store(
             config["database_path"],
             recovery_path=config.get("source_sync", {}).get("recovery_path"),
         )
+        # Bound to this dispatch only: the lesson and experience modules read exactly the
+        # projects, permissions and registered roots that were just authorized.
+        from .lessons import authorized_projects
+
+        self.project_id = project_id
+        self.client = client
+        self.projects = knowledge.get("projects", {})
+        self.authorized_projects = authorized_projects(principal)
         return store, project, secret
 
     def execute(self, request, *, client, credential):
@@ -131,16 +386,20 @@ class KnowledgeApplication:
             request["project_id"],
             request["arguments"],
         )
-        store, project, secret = self._context(client, credential, project_id, operation)
-        pending = {}
+        # Evidence projects named by the caller are authorized before any project data is
+        # read, so a refused operation cannot disclose whether a project or lesson exists.
+        snapshot, factory, evidence = self._planner(operation)
+        evidence_projects = tuple(evidence(args))
+        store, project, secret = self._context(
+            client, credential, project_id, operation, evidence_projects
+        )
+        sources = Sources(self, project_id, project)
+        plan = factory(self, operation, project_id, project, args, sources)
 
-        def collect(locator, digest):
-            pending[locator] = digest
-            return True
-
-        # Phase 1 captures only project-related state. No source I/O under the DB lock.
+        # Phase 1 captures only project-related state, inside the transaction. No source I/O,
+        # because that would hold the shared writer lock across the filesystem.
         with store.transaction() as db:
-            revision, seal_key = self._snapshot(db, project_id, project, client, secret, operation)
+            revision, seal_key = snapshot(db, project_id, project, client, secret, operation)
             replay = self._replay(db, request, client)
             if replay is not None:
                 return replay
@@ -154,31 +413,16 @@ class KnowledgeApplication:
                 ).fetchone()
                 require(row is not None, "not_found", 404)
                 return json.loads(row[0])
-            self._dispatch(
-                db,
-                operation,
-                project_id,
-                project,
-                args,
-                seal_key,
-                collect,
-                prepared=None,
-                preview=True,
-            )
+            plan(db, "capture", seal_key, client=client)
 
+        # Phase 2 does all slow work outside any transaction: imports fetch their source, and
+        # every referenced evidence file is re-read. No lock is held here.
         prepared = self._prepare_import(project, args) if operation == "import" else None
-        checked = {}
-        for locator in pending:
-            try:
-                first = content_hash(read_file(project, locator)[0])
-                second = content_hash(read_file(project, locator)[0])
-                checked[locator] = first if first == second else None
-            except (Fault, OSError, ValueError):
-                checked[locator] = None
+        plan.external(project)
 
         # Re-read permissions/config outside the lock, then compare project state atomically.
         current_store, current_project, current_secret = self._context(
-            client, credential, project_id, operation
+            client, credential, project_id, operation, evidence_projects
         )
         require(
             current_store.path == store.path
@@ -189,7 +433,7 @@ class KnowledgeApplication:
             409,
         )
         with store.transaction() as db:
-            current_revision, current_key = self._snapshot(
+            current_revision, current_key = snapshot(
                 db, project_id, project, client, secret, operation
             )
             replay = self._replay(db, request, client)
@@ -203,21 +447,16 @@ class KnowledgeApplication:
                     "INSERT INTO knowledge_projects(id,registration) VALUES (?,?)",
                     (project_id, canonical(project)),
                 )
-            result = self._dispatch(
-                db,
-                operation,
-                project_id,
-                project,
-                args,
-                seal_key,
-                lambda locator, digest: checked.get(locator) == digest,
-                prepared=prepared,
-                preview=False,
-            )
-            if operation in WRITE:
+            result = plan(db, "serve", seal_key, prepared=prepared)
+            if operation in IDEMPOTENT:
                 db.execute(
                     "INSERT INTO knowledge_operations VALUES (?,?,?,?)",
-                    (client, args["key"], fingerprint(request), canonical(result)),
+                    (
+                        client,
+                        args.get("dedupe") if "dedupe" in args else args["key"],
+                        fingerprint(request),
+                        canonical(result),
+                    ),
                 )
                 if operation == "import":
                     db.execute(
@@ -225,6 +464,24 @@ class KnowledgeApplication:
                         (client, args["key"], project_id, result["status"], canonical(result)),
                     )
             return result
+
+    def _planner(self, operation):
+        """Select the domain module, snapshot routine and evidence-project resolver."""
+        from . import lessons
+
+        if operation in EVIDENCE_OPERATIONS:
+            self.lesson_domain = True
+            return (
+                lessons.snapshot,
+                Plan.build,
+                lessons.lesson_projects
+                if operation == "experience_promote"
+                else lessons.evidence_projects
+                if operation in {"lesson_check", "experience_check"}
+                else lambda args: (),
+            )
+        self.lesson_domain = False
+        return self._snapshot, Plan.build, lambda args: ()
 
     @staticmethod
     def _snapshot(db, project_id, project, client, secret, operation):
@@ -250,13 +507,15 @@ class KnowledgeApplication:
 
     @staticmethod
     def _replay(db, request, client):
-        if request["operation"] not in WRITE:
+        if request["operation"] not in IDEMPOTENT:
             return None
         args = request["arguments"]
         require(isinstance(args, dict), "invalid_input", 400)
-        string(args.get("key"), 128)
+        # A revision names its lesson with `key`, so its own idempotency key is `dedupe`.
+        key = args.get("dedupe") if "dedupe" in args else args.get("key")
+        string(key, 128)
         old = db.execute(
-            "SELECT * FROM knowledge_operations WHERE client=? AND key=?", (client, args["key"])
+            "SELECT * FROM knowledge_operations WHERE client=? AND key=?", (client, key)
         ).fetchone()
         if old:
             require(old["digest"] == fingerprint(request), "idempotency_conflict", 409)
@@ -264,22 +523,22 @@ class KnowledgeApplication:
         return None
 
     def _dispatch(
-        self, db, operation, project_id, project, args, seal_key, files, *, prepared, preview
+        self, db, operation, project_id, project, args, seal_key, read, *, prepared, preview
     ):
         if operation == "import":
             return self._import(db, project_id, project, args, prepared, preview)
         if operation == "delete":
             return self._delete(db, project_id, project, args, preview)
         if operation == "write_state":
-            return self._write_state(db, project_id, project, args, files, preview)
+            return self._write_state(db, project_id, project, args, read, preview)
         if operation in {"query", "recover"}:
             exact(args, "text budget_bytes")
             if operation == "query":
-                return self._query(db, project_id, project, args, files)
-            return self._recover(db, project_id, project, args, seal_key, files)
+                return self._query(db, project_id, project, args, read)
+            return self._recover(db, project_id, project, args, seal_key, read)
         if operation == "check":
             exact(args, "package")
-            return self._check(db, project_id, project, args["package"], seal_key, files)
+            return self._check(db, project_id, project, args["package"], seal_key, read)
         raise Fault("invalid_input", 400)
 
     @staticmethod
@@ -455,7 +714,7 @@ class KnowledgeApplication:
         }
 
     @staticmethod
-    def _current(db, project, document, files):
+    def _current(db, project, document, read):
         if document["state"] != "ready":
             return False
         if document["kind"] == "url":
@@ -464,14 +723,14 @@ class KnowledgeApplication:
             "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
             (document["id"], document["version"]),
         ).fetchone()
-        return files(document["locator"], version["hash"])
+        return read(document, version["hash"])
 
-    def _reference(self, db, project_id, project, reference, files):
+    def _reference(self, db, project_id, project, reference, read):
         exact(reference, "block_id document_id version hash")
         document = self._document(db, project_id, reference["document_id"])
         require(
             document["version"] == reference["version"]
-            and self._current(db, project, document, files),
+            and self._current(db, project, document, read),
             "stale_evidence",
             409,
         )
@@ -489,7 +748,7 @@ class KnowledgeApplication:
             "provenance": json.loads(row["provenance"]),
         }
 
-    def _query(self, db, project_id, project, args, files):
+    def _query(self, db, project_id, project, args, read):
         string(args["text"], 1024)
         integer(args["budget_bytes"], 256, 32768)
         search = query_terms(args["text"])
@@ -528,7 +787,7 @@ class KnowledgeApplication:
                 "hash": row["hash"],
             }
             try:
-                unit = self._reference(db, project_id, project, reference, files)
+                unit = self._reference(db, project_id, project, reference, read)
             except Fault:
                 omitted.add("stale_source")
                 continue
@@ -542,7 +801,7 @@ class KnowledgeApplication:
         result["omissions"] = sorted(omitted)
         return result
 
-    def _write_state(self, db, project_id, project, args, files, preview):
+    def _write_state(self, db, project_id, project, args, read, preview):
         exact(args, "key expected_version state")
         integer(args["expected_version"])
         state = args["state"]
@@ -560,7 +819,7 @@ class KnowledgeApplication:
             400,
         )
         for reference in state["evidence"]:
-            self._reference(db, project_id, project, reference, files)
+            self._reference(db, project_id, project, reference, read)
         require(
             isinstance(state["pitfalls"], list) and len(state["pitfalls"]) <= 8,
             "invalid_input",
@@ -607,9 +866,9 @@ class KnowledgeApplication:
     def _seal(package, secret):
         return hmac.new(secret.encode(), canonical(package).encode(), hashlib.sha256).hexdigest()
 
-    def _recover(self, db, project_id, project, args, secret, files):
+    def _recover(self, db, project_id, project, args, secret, read):
         integer(args["budget_bytes"], 1024, 32768)
-        result = self._query(db, project_id, project, args, files)
+        result = self._query(db, project_id, project, args, read)
         result.update(
             revision=db.execute(
                 "SELECT revision FROM knowledge_projects WHERE id=?", (project_id,)
@@ -626,7 +885,7 @@ class KnowledgeApplication:
             payload = json.loads(state["payload"])
             try:
                 evidence = [
-                    self._reference(db, project_id, project, r, files) for r in payload["evidence"]
+                    self._reference(db, project_id, project, r, read) for r in payload["evidence"]
                 ]
                 candidate = dict(
                     result, state={"version": state["version"], **payload}, blocks=evidence
@@ -653,7 +912,7 @@ class KnowledgeApplication:
         result["seal"] = self._seal(result, secret)
         return result
 
-    def _check(self, db, project_id, project, package, secret, files):
+    def _check(self, db, project_id, project, package, secret, read):
         require(
             isinstance(package, dict) and len(canonical(package).encode()) <= 32768,
             "invalid_input",
@@ -675,7 +934,7 @@ class KnowledgeApplication:
         if valid:
             try:
                 for block in package["blocks"]:
-                    self._reference(db, project_id, project, block["reference"], files)
+                    self._reference(db, project_id, project, block["reference"], read)
             except Fault:
                 valid = False
         return {"valid": bool(valid), "reason": "current" if valid else "stale_or_tampered"}

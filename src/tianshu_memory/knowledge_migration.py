@@ -5,6 +5,8 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from .lessons_migration import install as install_lessons
+
 SCHEMA = """
 CREATE TABLE knowledge_projects (id TEXT PRIMARY KEY, registration TEXT NOT NULL,
   revision INTEGER NOT NULL DEFAULT 0);
@@ -62,4 +64,6 @@ def migrate(store, backup_path):
         db.execute("INSERT INTO metadata VALUES ('knowledge_schema','1')")
         db.execute("INSERT INTO metadata VALUES ('knowledge_seal_key',?)", (secrets.token_hex(32),))
         db.execute("UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'")
-    return {"schema": 3, "knowledge_schema": 1, "backup": str(backup)}
+        # The same reviewed step installs the lesson book and the promoted experience book.
+        install_lessons(db)
+    return {"schema": 3, "knowledge_schema": 1, "lessons_schema": 1, "backup": str(backup)}

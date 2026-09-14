@@ -153,6 +153,11 @@ class Store:
 
         return migrate(self, backup_path)
 
+    def migrate_lessons(self, backup_path):
+        from .lessons_migration import migrate as migrate_lessons
+
+        return migrate_lessons(self, backup_path)
+
     @staticmethod
     def require_user_actions(db):
         from .domain import require

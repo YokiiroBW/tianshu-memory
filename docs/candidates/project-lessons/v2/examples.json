@@ -1,0 +1,181 @@
+[
+  {
+    "operation": "lesson_record",
+    "project_id": "alpha",
+    "arguments": {
+      "key": "alpha-lesson-1",
+      "expected_version": 0,
+      "lesson": {
+        "trigger": "Send timed out before the receipt arrived",
+        "symptom": "The same message is delivered twice",
+        "cause": "Retry did not read the receipt table first",
+        "correction": "Read the receipt table and skip confirmed work",
+        "verification": "Isolated two-project regression run passed",
+        "scope": {
+          "platform": "windows",
+          "language": "python",
+          "framework": "stdlib",
+          "applies_to": ["idempotent delivery"],
+          "excludes": ["outbound-only notifications"]
+        },
+        "evidence": [
+          {
+            "block_id": "document:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:000",
+            "document_id": "document:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": 1,
+            "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "operation": "lesson_revise",
+    "project_id": "alpha",
+    "arguments": {
+      "key": "alpha-lesson-1",
+      "lesson_id": "lesson:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "expected_version": 1,
+      "lesson": {
+        "trigger": "Send timed out before the receipt arrived",
+        "symptom": "The same message is delivered twice",
+        "cause": "Retry did not read the receipt table first",
+        "correction": "Read the receipt table, then skip confirmed work",
+        "verification": "Isolated two-project regression run passed again",
+        "scope": {
+          "platform": "windows",
+          "language": "python",
+          "framework": "stdlib",
+          "applies_to": ["idempotent delivery"],
+          "excludes": ["outbound-only notifications"]
+        },
+        "evidence": [
+          {
+            "block_id": "document:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:000",
+            "document_id": "document:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": 1,
+            "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "operation": "lesson_retire",
+    "project_id": "alpha",
+    "arguments": {
+      "key": "alpha-lesson-retire",
+      "lesson_id": "lesson:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "expected_version": 2,
+      "reason": "superseded by the delivery contract change"
+    }
+  },
+  {
+    "operation": "lesson_query",
+    "project_id": "alpha",
+    "arguments": {
+      "text": "receipt retry",
+      "budget_bytes": 8192
+    }
+  },
+  {
+    "operation": "lesson_recover",
+    "project_id": "alpha",
+    "arguments": {
+      "text": "receipt retry",
+      "budget_bytes": 8192
+    }
+  },
+  {
+    "operation": "lesson_check",
+    "project_id": "alpha",
+    "arguments": {
+      "package": {
+        "project_id": "alpha",
+        "registration": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "revision": 3,
+        "lessons": [],
+        "omissions": [],
+        "retrieval": "lexical",
+        "trust": "operator_statement_with_source_evidence",
+        "goal": null,
+        "unfinished": [],
+        "authority": "explicit_operator_lesson",
+        "seal": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    }
+  },
+  {
+    "operation": "experience_promote",
+    "project_id": "alpha",
+    "arguments": {
+      "key": "receipt-promotion-1",
+      "expected_version": 0,
+      "entry": {
+        "title": "Check the receipt before retrying",
+        "rule": "Always read the receipt table before resending a timed-out request.",
+        "applicability": ["idempotent delivery"],
+        "excludes": ["outbound-only notifications"],
+        "counterexamples": ["Fire-and-forget telemetry"],
+        "recheck_after": "2027-01-01",
+        "evidence": [
+          {
+            "project_id": "alpha",
+            "lesson_id": "lesson:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "version": 2,
+            "hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          {
+            "project_id": "beta",
+            "lesson_id": "lesson:1111111111111111111111111111111111111111111111111111111111111111",
+            "version": 1,
+            "hash": "2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "operation": "experience_query",
+    "project_id": "alpha",
+    "arguments": {
+      "text": "receipt retry",
+      "budget_bytes": 8192,
+      "project_id": null
+    }
+  },
+  {
+    "operation": "experience_check",
+    "project_id": "alpha",
+    "arguments": {
+      "entry_id": "experience:3333333333333333333333333333333333333333333333333333333333333333",
+      "package": {
+        "entry_id": "experience:3333333333333333333333333333333333333333333333333333333333333333",
+        "version": 1,
+        "effect": "live",
+        "seal": "4444444444444444444444444444444444444444444444444444444444444444"
+      }
+    }
+  },
+  {
+    "operation": "experience_revoke",
+    "project_id": "alpha",
+    "arguments": {
+      "key": "revoke-1",
+      "entry_id": "experience:3333333333333333333333333333333333333333333333333333333333333333",
+      "expected_version": 1,
+      "reason": "no longer valid after the delivery contract change"
+    }
+  },
+  {
+    "operation": "experience_withdraw",
+    "project_id": "beta",
+    "arguments": {
+      "key": "withdraw-1",
+      "entry_id": "experience:3333333333333333333333333333333333333333333333333333333333333333",
+      "lesson_id": "lesson:1111111111111111111111111111111111111111111111111111111111111111",
+      "expected_version": 1,
+      "reason": "internal detail must not stay shared"
+    }
+  }
+]

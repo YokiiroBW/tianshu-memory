@@ -10,6 +10,7 @@ from pathlib import Path
 from .domain import Fault, strict_json
 from .knowledge import KnowledgeApplication
 from .knowledge_migration import migrate
+from .lessons_migration import migrate as migrate_lessons
 from .store import Store
 
 
@@ -19,6 +20,8 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     migration = commands.add_parser("migrate")
     migration.add_argument("--backup", required=True)
+    upgrade = commands.add_parser("migrate-lessons")
+    upgrade.add_argument("--backup", required=True)
     for name in ("action", "mcp"):
         command = commands.add_parser(name)
         command.add_argument("--client", required=True)
@@ -27,14 +30,16 @@ def main():
             command.add_argument("file")
     args = parser.parse_args()
     try:
-        if args.command == "migrate":
+        if args.command in {"migrate", "migrate-lessons"}:
             config = strict_json(Path(args.config).read_bytes())
-            result = migrate(
-                Store(
-                    config["database_path"],
-                    recovery_path=config.get("source_sync", {}).get("recovery_path"),
-                ),
-                args.backup,
+            store = Store(
+                config["database_path"],
+                recovery_path=config.get("source_sync", {}).get("recovery_path"),
+            )
+            result = (
+                migrate(store, args.backup)
+                if args.command == "migrate"
+                else migrate_lessons(store, args.backup)
             )
         elif args.command == "mcp":
             from .knowledge_mcp import create_server

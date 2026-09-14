@@ -103,4 +103,127 @@ def create_server(config_path, client, credential_env):
         """Read this registered client's recorded import outcome (not live URL freshness)."""
         return execute("status", project_id, {"key": key})
 
+    @server.tool(annotations=write)
+    def lesson_record(project_id: str, key: str, expected_version: int, lesson: dict) -> dict:
+        """Record one project lesson with current source evidence; project-only, no sharing."""
+        return execute(
+            "lesson_record",
+            project_id,
+            {"key": key, "expected_version": expected_version, "lesson": lesson},
+        )
+
+    @server.tool(annotations=write)
+    def lesson_revise(
+        project_id: str, key: str, lesson_id: str, expected_version: int, lesson: dict
+    ) -> dict:
+        """Append a new lesson version. The previous version stays in history."""
+        return execute(
+            "lesson_revise",
+            project_id,
+            {
+                "key": key,
+                "lesson_id": lesson_id,
+                "expected_version": expected_version,
+                "lesson": lesson,
+            },
+        )
+
+    @server.tool(annotations=write)
+    def lesson_retire(
+        project_id: str, key: str, lesson_id: str, expected_version: int, reason: str
+    ) -> dict:
+        """Retire a lesson. Promotions that used it stop being reusable until re-approved."""
+        return execute(
+            "lesson_retire",
+            project_id,
+            {
+                "key": key,
+                "lesson_id": lesson_id,
+                "expected_version": expected_version,
+                "reason": reason,
+            },
+        )
+
+    @server.tool(annotations=read)
+    def lesson_query(project_id: str, text: str, budget_bytes: int = 8192) -> dict:
+        """Targeted search over this project's current lessons, bounded and cited."""
+        return execute("lesson_query", project_id, {"text": text, "budget_bytes": budget_bytes})
+
+    @server.tool(annotations=read)
+    def lesson_recover(project_id: str, text: str, budget_bytes: int = 8192) -> dict:
+        """Short project recovery: goal, unfinished items and current lessons; check first."""
+        return execute("lesson_recover", project_id, {"text": text, "budget_bytes": budget_bytes})
+
+    @server.tool(annotations=read)
+    def lesson_check(project_id: str, package: dict) -> dict:
+        """Validate an issued lesson recovery package before reusing it."""
+        return execute("lesson_check", project_id, {"package": package})
+
+    @server.tool(annotations=write)
+    def experience_promote(project_id: str, key: str, expected_version: int, entry: dict) -> dict:
+        """Explicitly approve a global experience entry. Requires the promote permission and
+        current lesson evidence from at least two different authorized projects."""
+        return execute(
+            "experience_promote",
+            project_id,
+            {"key": key, "expected_version": expected_version, "entry": entry},
+        )
+
+    @server.tool(annotations=read)
+    def experience_query(
+        project_id: str, text: str, budget_bytes: int = 8192, filter_project_id: str | None = None
+    ) -> dict:
+        """Search approved global experience. Only entries whose sources this client may read."""
+        return execute(
+            "experience_query",
+            project_id,
+            {"text": text, "budget_bytes": budget_bytes, "project_id": filter_project_id},
+        )
+
+    @server.tool(annotations=read)
+    def experience_check(project_id: str, entry_id: str, package: dict) -> dict:
+        """Check a promoted entry before reuse; withdrawn or superseded sources invalidate it."""
+        return execute("experience_check", project_id, {"entry_id": entry_id, "package": package})
+
+    @server.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+        )
+    )
+    def experience_revoke(
+        project_id: str, key: str, entry_id: str, expected_version: int, reason: str
+    ) -> dict:
+        """Revoke a promoted entry. Requires the promote permission."""
+        return execute(
+            "experience_revoke",
+            project_id,
+            {
+                "key": key,
+                "entry_id": entry_id,
+                "expected_version": expected_version,
+                "reason": reason,
+            },
+        )
+
+    @server.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+        )
+    )
+    def experience_withdraw(
+        project_id: str, key: str, entry_id: str, expected_version: int, lesson_id: str, reason: str
+    ) -> dict:
+        """Withdraw this project's own lesson from a promoted entry without changing the lesson."""
+        return execute(
+            "experience_withdraw",
+            project_id,
+            {
+                "key": key,
+                "entry_id": entry_id,
+                "expected_version": expected_version,
+                "lesson_id": lesson_id,
+                "reason": reason,
+            },
+        )
+
     return server
