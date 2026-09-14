@@ -1,0 +1,65 @@
+"""Explicit local operator and stdio client entrypoints, separate from chat auth."""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+from .domain import Fault, strict_json
+from .knowledge import KnowledgeApplication
+from .knowledge_migration import migrate
+from .store import Store
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Explicit project knowledge operations")
+    parser.add_argument("--config", required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    migration = commands.add_parser("migrate")
+    migration.add_argument("--backup", required=True)
+    for name in ("action", "mcp"):
+        command = commands.add_parser(name)
+        command.add_argument("--client", required=True)
+        command.add_argument("--credential-env", required=True)
+        if name == "action":
+            command.add_argument("file")
+    args = parser.parse_args()
+    try:
+        if args.command == "migrate":
+            config = strict_json(Path(args.config).read_bytes())
+            result = migrate(
+                Store(
+                    config["database_path"],
+                    recovery_path=config.get("source_sync", {}).get("recovery_path"),
+                ),
+                args.backup,
+            )
+        elif args.command == "mcp":
+            from .knowledge_mcp import create_server
+
+            create_server(args.config, args.client, args.credential_env).run(transport="stdio")
+            return
+        else:
+            with Path(args.file).open("rb") as stream:
+                raw = stream.read(262145)
+            if len(raw) > 262144:
+                raise ValueError("Operation too large")
+            result = KnowledgeApplication(args.config).execute(
+                strict_json(raw), client=args.client, credential=os.environ.get(args.credential_env)
+            )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if result.get("status") == "failed":
+            raise SystemExit(1)
+    except (Fault, OSError, sqlite3.Error, ValueError, KeyError, TypeError, ImportError) as error:
+        code = error.code if isinstance(error, Fault) else "dependency_or_input_error"
+        print(
+            json.dumps({"status": "failed", "code": code}),
+            file=sys.stderr if args.command == "mcp" else sys.stdout,
+        )
+        raise SystemExit(1) from None
+
+
+if __name__ == "__main__":
+    main()

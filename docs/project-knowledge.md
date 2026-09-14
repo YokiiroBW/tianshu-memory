@@ -1,0 +1,83 @@
+# 项目资料与短恢复包（TS-080）
+
+这是独立项目知识域，使用同一 SQLite Store 和 schema 3 source-guard；不生成聊天 P/A、Core receipt、SourceAuthority 证明或人物画像。项目资料不依赖远端聊天来源核验；所有操作经 KnowledgeApplication 的配置授权与 Store 事务。没有模型调用、自动整理、全局踩坑晋升或项目文件写入。
+
+## 安装、迁移与配置
+
+基础 CLI 使用现有依赖；可选标准 MCP 使用官方 SDK 维护分支 `mcp>=1.28,<2`，当前锁定 1.30.0。`uv sync --locked --group dev --extra mcp` 安装可选组件。选择 v1 是为了使用已文档化的 FastMCP stdio API；不引入第二协议框架。[官方 SDK v1 文档](https://py.sdk.modelcontextprotocol.io/v1/)。
+
+停写、备份后执行：
+
+```powershell
+uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json migrate --backup C:/private/before-knowledge.sqlite
+```
+
+需要已显式迁移到 schema 3 的 Memory 数据库。迁移保留聊天历史，新增表均带 source_revision 触发器。备份路径必须不存在。失败关闭检查点不允许通过覆盖 guard 或单独还原旧 DB“修复”；恢复需另行审查。迁移前备份不含新增表，迁移后的 guard 会拒绝该旧库。不要用生产数据库试跑。
+
+在私有 Memory JSON 中添加下列配置；不是可直接用于生产的凭据。`root`、`host`、`default_branch` 和显式 URL 列表组成固定登记，首次成功写操作入库；只读调用不能隐式登记空项目。登记变化失败关闭，目录迁移另行审查；禁止自动猜测和扫描项目。
+
+```json
+{
+  "knowledge": {
+    "projects": {
+      "demo": {
+        "root": "C:/isolated/demo", "host": "local", "default_branch": "main",
+        "urls": ["https://example.com/design"]
+      }
+    },
+    "clients": {
+      "hermes-demo": {
+        "credential_sha256": "<SHA256 of an independent secret of at least 16 characters>",
+        "projects": ["demo"],
+        "permissions": ["query", "recover", "check", "write_state", "import", "delete", "status"]
+      }
+    }
+  }
+}
+```
+
+只读客户端仅登记 query/recover/check。凭据通过指定环境变量传入，启动参数绑定 client；每次工具调用重新读取配置、核验摘要和 project/operation 权限。请求体不得声明身份。配置文件必须只有可信操作者可写；同操作系统账号完全控制配置和进程的人属于本地可信边界，不提供多租户 OS 隔离。
+
+## 显式操作
+
+执行完整 JSON 文件意味着操作者授权该操作。所有路径使用绝对路径：
+
+```powershell
+uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json action --client hermes-demo --credential-env TIANSHU_PROJECT_SECRET C:/private/import.json
+```
+
+导入示例：
+
+```json
+{"operation":"import","project_id":"demo","arguments":{"key":"design-import-1","kind":"file","locator":"docs/design.md","expected_version":0,"groups":null}}
+```
+
+`kind=url` 时 locator 必须精确匹配已登记 URL。新来源 expected_version=0；后续替换必须提供当前版本。成功、内容未变和可预期读取失败均持久记录；status 通过原 key 查询历史结果。相同客户端/key 同负载返回 replayed，表示历史执行结果，**不表示来源仍当前**；变更负载拒绝。失败后的重试使用新 key。删除是逻辑 tombstone 并增加版本；原始资产文件始终只读，历史 raw 版本保留供审查，并非物理擦除 API。
+
+默认完整来源为一个原文块。初版不假称通用语义抽取：人工确认更小语义块后，groups 可给覆盖全部行、不重叠的 `{start,end,depends_on}`；行号从 1 开始、闭区间，depends_on 引用从 0 开始的组索引。依赖闭包不可拆分，不截断条件/否定/因果。过大完整块预算不足时遗漏，不切半。Markdown/代码不运行，UTF-8 文本保真；HTML 保存原字节及去 script/style/template 的可见文本，引用定位明确为可见文本行而非 HTML 原字节行。
+
+支持 txt/Markdown、所列代码扩展和 HTML；PDF、Office、图片、数据库、二进制和非 UTF-8 明确不支持。仅单文件导入，无递归扫描；目录外、隐藏目录、运行目录、模型目录及凭据名称等拒绝。允许目录必须由操作者选择为非秘密资料目录，文件名规则不是内容 DLP。文件查询/恢复会重读 hash，发现未提交变化时旧块和关联状态不再返回；不自动覆盖、提交或修改工作树。
+
+URL 只支持 HTTPS 公网 443，逐跳精确允许列表、最多 3 次重定向、1 MiB、15 秒网络总期限、identity 编码及 text/plain/markdown/html。DNS 解析采用系统解析器，其 OS 超时额外计入；TLS 连接固定到校验过的公网 IP 并保留主机名证书检查，不继承代理、不抓取链接、不执行脚本。URL 查询只代表最近显式导入快照，不在后台联网检查远端变化。URL 刷新失败立即使旧版本不可召回。抓取在 Store 串行事务内进行，首版适合小资料库，网络慢请求会占用写锁；没有大库吞吐承诺。
+
+查询：`{"operation":"query","project_id":"demo","arguments":{"text":"receipt retry","budget_bytes":8192}}`。复用 FTS5、NFKC/英文词与中文双字词检索，不是向量或 AI 语义搜索。只返回命中完整块、版本/hash、source_id、来源和行范围；预算为实际 UTF-8 JSON 字节（256–32768）。至多考察 128 个候选，没有按全项目全文装配提示词。
+
+项目写回使用 `write_state`，参数为 key、expected_version、state。state 精确包含 goal、constraints、recent_verification、unfinished、evidence、pitfalls。前三个列表与 unfinished 是明确操作者陈述；evidence 必须使用 query 返回的当前 reference（block_id/document_id/version/hash）。pitfalls 默认为项目域，项包含 trigger/symptom/cause/correction/verification/evidence。没有自动全局共享或模型生成假成功。
+
+`recover` 与 query 参数相同，预算 1024–32768；当前状态和全部证据整体放入，装不下就显式 state_budget，失效则 stale_state。包带项目 revision、登记摘要和 seal。每次缓存复用前执行 `check`，参数 `{"package": <完整原包>}`；替换、删除、项目状态更新、配置变化、当前文件变化或内容篡改均不能冒充当前有效包。无法撤回已被外部客户端复制的文本，客户端必须执行 check。
+
+## MCP 与 Hermes
+
+MCP stdio 入口：
+
+```powershell
+uv run --extra mcp python -m tianshu_memory.knowledge_cli --config C:/private/memory.json mcp --client hermes-demo --credential-env TIANSHU_PROJECT_SECRET
+```
+
+七个独立工具：knowledge_query、knowledge_recover、knowledge_check、knowledge_import_status、knowledge_import、knowledge_write_state、knowledge_delete。读写工具分开且服务端逐次验证权限；annotations 仅为客户端提示，不是授权。SDK 负责 initialize/tools/list/tools/call 和 stdio framing，stdout 只用于协议。默认未启用、不监听 HTTP、不修改任何编码体全局配置。
+
+Hermes 可作为标准 MCP stdio host，显式登记 command/args/env；示例见 `integrations/hermes/README.md`。协议契约仍为本任务 docs/candidates 下候选，未宣称跨产品冻结或 Hermes 已安装/已接通。标准 SDK 客户端测试与真实 Hermes 账号/客户端验收分开记录。
+
+## 验证命令
+
+`uv run --extra mcp pytest tests/test_knowledge.py tests/test_knowledge_transport.py -q --basetemp .runtime/tests-ts080-targeted`；全产品回归 `uv run --extra mcp pytest -q --basetemp .runtime/tests-ts080`。TLS 工具解释器配置沿用 docs/runtime.md。变更稳定后先审查完整 diff，再跑 ruff/compileall 和对应测试。运行结果见任务交接。

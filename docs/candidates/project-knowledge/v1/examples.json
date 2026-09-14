@@ -1,0 +1,58 @@
+[
+  {
+    "operation": "import",
+    "project_id": "demo",
+    "arguments": {
+      "key": "design-1",
+      "kind": "file",
+      "locator": "docs/design.md",
+      "expected_version": 0,
+      "groups": null
+    }
+  },
+  {
+    "operation": "query",
+    "project_id": "demo",
+    "arguments": {
+      "text": "receipt retry",
+      "budget_bytes": 8192
+    }
+  },
+  {
+    "operation": "recover",
+    "project_id": "demo",
+    "arguments": {
+      "text": "current retry work",
+      "budget_bytes": 8192
+    }
+  },
+  {
+    "operation": "write_state",
+    "project_id": "demo",
+    "arguments": {
+      "key": "state-1",
+      "expected_version": 0,
+      "state": {
+        "goal": "Validate receipt retries",
+        "constraints": [
+          "Never resend confirmed work"
+        ],
+        "recent_verification": [
+          "Synthetic retry scenario passed"
+        ],
+        "unfinished": [
+          "Real service validation"
+        ],
+        "evidence": [
+          {
+            "block_id": "document:synthetic:1:000",
+            "document_id": "document:synthetic",
+            "version": 1,
+            "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ],
+        "pitfalls": []
+      }
+    }
+  }
+]

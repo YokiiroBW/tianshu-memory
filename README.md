@@ -1,5 +1,7 @@
 # 天枢记忆
 
+TS-080 项目资料、显式写回、短恢复包与可选 MCP stdio 入口见 [项目知识运行说明](docs/project-knowledge.md)。独立项目域不写人物画像；默认不启用 MCP 或自动配置任何客户端。
+
 Python 人物与记忆服务，绑定已发布 text-dialogue/v1、profile-memory/v1 与 source-sync/v1 **1.0.0**。提供 SQLite/WAL、完整语义组预算检索、画像查询、修订/遗忘与候选幂等账本。TS-033 增加角色来源账本、物理否定传播、双 owner 读取屏障与真实 HTTPS 来源客户端。
 
 `source_sync` 模式经配置的 Core/Platform HTTPS 接口核验来源；`local_fixture` 保留隔离合成演示。实际测试包含合成 owner 经真实 HTTPS、Memory HTTP 与 SQLite 重启，不代表真实 Core/Platform 产品联合通过。TS-034 提供独立部署凭据认证的本地用户确认、画像批准/发布/撤销入口；未配置时仍不可用。Chat Audit、跨平台账号证明、PostgreSQL 与嵌入检索仍未接入。候选受理不自动生成记忆。
