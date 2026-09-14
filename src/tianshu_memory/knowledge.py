@@ -123,6 +123,7 @@ class KnowledgeApplication:
     def execute(self, request, *, client, credential):
         exact(request, "operation project_id arguments")
         require(len(canonical(request).encode()) <= 262144, "request_too_large", 413)
+        request = strict_json(canonical(request))
         string(request["project_id"], 128)
         string(request["operation"], 32)
         operation, project_id, args = (
@@ -131,68 +132,155 @@ class KnowledgeApplication:
             request["arguments"],
         )
         store, project, secret = self._context(client, credential, project_id, operation)
+        pending = {}
+
+        def collect(locator, digest):
+            pending[locator] = digest
+            return True
+
+        # Phase 1 captures only project-related state. No source I/O under the DB lock.
         with store.transaction() as db:
-            metadata = dict(db.execute("SELECT key,value FROM metadata"))
-            require(metadata.get("knowledge_schema") == "1", "dependency_unavailable", 503)
-            require(bool(metadata.get("knowledge_seal_key")), "dependency_unavailable", 503)
-            # A client knows its own credential; it must not also know the package signing key.
-            seal_key = hmac.new(
-                metadata["knowledge_seal_key"].encode(),
-                canonical([client, secret]).encode(),
-                hashlib.sha256,
-            ).hexdigest()
-            registered = db.execute(
-                "SELECT * FROM knowledge_projects WHERE id=?", (project_id,)
-            ).fetchone()
-            if registered:
-                require(
-                    registered["registration"] == canonical(project), "registration_changed", 409
-                )
-            else:
-                require(operation in WRITE, "project_uninitialized", 409)
+            revision, seal_key = self._snapshot(db, project_id, project, client, secret, operation)
+            replay = self._replay(db, request, client)
+            if replay is not None:
+                return replay
+            if operation == "status":
+                exact(args, "key")
+                string(args["key"], 128)
+                row = db.execute(
+                    "SELECT result FROM knowledge_imports "
+                    "WHERE client=? AND key=? AND project_id=?",
+                    (client, args["key"], project_id),
+                ).fetchone()
+                require(row is not None, "not_found", 404)
+                return json.loads(row[0])
+            self._dispatch(
+                db,
+                operation,
+                project_id,
+                project,
+                args,
+                seal_key,
+                collect,
+                prepared=None,
+                preview=True,
+            )
+
+        prepared = self._prepare_import(project, args) if operation == "import" else None
+        checked = {}
+        for locator in pending:
+            try:
+                first = content_hash(read_file(project, locator)[0])
+                second = content_hash(read_file(project, locator)[0])
+                checked[locator] = first if first == second else None
+            except (Fault, OSError, ValueError):
+                checked[locator] = None
+
+        # Re-read permissions/config outside the lock, then compare project state atomically.
+        current_store, current_project, current_secret = self._context(
+            client, credential, project_id, operation
+        )
+        require(
+            current_store.path == store.path
+            and current_store.recovery_path == store.recovery_path
+            and current_project == project
+            and current_secret == secret,
+            "registration_changed",
+            409,
+        )
+        with store.transaction() as db:
+            current_revision, current_key = self._snapshot(
+                db, project_id, project, client, secret, operation
+            )
+            replay = self._replay(db, request, client)
+            if replay is not None:
+                return replay
+            require(
+                current_revision == revision and current_key == seal_key, "project_conflict", 409
+            )
+            if revision is None:
                 db.execute(
                     "INSERT INTO knowledge_projects(id,registration) VALUES (?,?)",
                     (project_id, canonical(project)),
                 )
+            result = self._dispatch(
+                db,
+                operation,
+                project_id,
+                project,
+                args,
+                seal_key,
+                lambda locator, digest: checked.get(locator) == digest,
+                prepared=prepared,
+                preview=False,
+            )
             if operation in WRITE:
-                require(isinstance(args, dict), "invalid_input", 400)
-                string(args.get("key"), 128)
-                digest = fingerprint(request)
-                old = db.execute(
-                    "SELECT * FROM knowledge_operations WHERE client=? AND key=?",
-                    (client, args["key"]),
-                ).fetchone()
-                if old:
-                    require(old["digest"] == digest, "idempotency_conflict", 409)
-                    return dict(json.loads(old["result"]), replayed=True)
-                result = getattr(self, "_" + operation)(db, project_id, project, args)
                 db.execute(
                     "INSERT INTO knowledge_operations VALUES (?,?,?,?)",
-                    (client, args["key"], digest, canonical(result)),
+                    (client, args["key"], fingerprint(request), canonical(result)),
                 )
                 if operation == "import":
                     db.execute(
                         "INSERT INTO knowledge_imports VALUES (?,?,?,?,?)",
                         (client, args["key"], project_id, result["status"], canonical(result)),
                     )
-                return result
+            return result
+
+    @staticmethod
+    def _snapshot(db, project_id, project, client, secret, operation):
+        metadata = dict(db.execute("SELECT key,value FROM metadata"))
+        require(
+            metadata.get("knowledge_schema") == "1" and bool(metadata.get("knowledge_seal_key")),
+            "dependency_unavailable",
+            503,
+        )
+        seal_key = hmac.new(
+            metadata["knowledge_seal_key"].encode(),
+            canonical([client, secret]).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        registered = db.execute(
+            "SELECT * FROM knowledge_projects WHERE id=?", (project_id,)
+        ).fetchone()
+        if registered:
+            require(registered["registration"] == canonical(project), "registration_changed", 409)
+        else:
+            require(operation in WRITE, "project_uninitialized", 409)
+        return (registered["revision"] if registered else None), seal_key
+
+    @staticmethod
+    def _replay(db, request, client):
+        if request["operation"] not in WRITE:
+            return None
+        args = request["arguments"]
+        require(isinstance(args, dict), "invalid_input", 400)
+        string(args.get("key"), 128)
+        old = db.execute(
+            "SELECT * FROM knowledge_operations WHERE client=? AND key=?", (client, args["key"])
+        ).fetchone()
+        if old:
+            require(old["digest"] == fingerprint(request), "idempotency_conflict", 409)
+            return dict(json.loads(old["result"]), replayed=True)
+        return None
+
+    def _dispatch(
+        self, db, operation, project_id, project, args, seal_key, files, *, prepared, preview
+    ):
+        if operation == "import":
+            return self._import(db, project_id, project, args, prepared, preview)
+        if operation == "delete":
+            return self._delete(db, project_id, project, args, preview)
+        if operation == "write_state":
+            return self._write_state(db, project_id, project, args, files, preview)
+        if operation in {"query", "recover"}:
+            exact(args, "text budget_bytes")
             if operation == "query":
-                exact(args, "text budget_bytes")
-                return self._query(db, project_id, project, args)
-            if operation == "recover":
-                exact(args, "text budget_bytes")
-                return self._recover(db, project_id, project, args, seal_key)
-            if operation == "check":
-                exact(args, "package")
-                return self._check(db, project_id, project, args["package"], seal_key)
-            exact(args, "key")
-            string(args["key"], 128)
-            row = db.execute(
-                "SELECT result FROM knowledge_imports WHERE client=? AND key=? AND project_id=?",
-                (client, args["key"], project_id),
-            ).fetchone()
-            require(row is not None, "not_found", 404)
-            return json.loads(row[0])
+                return self._query(db, project_id, project, args, files)
+            return self._recover(db, project_id, project, args, seal_key, files)
+        if operation == "check":
+            exact(args, "package")
+            return self._check(db, project_id, project, args["package"], seal_key, files)
+        raise Fault("invalid_input", 400)
 
     @staticmethod
     def _bump(db, project_id):
@@ -207,16 +295,8 @@ class KnowledgeApplication:
         require(row is not None, "not_found", 404)
         return row
 
-    def _import(self, db, project_id, project, args):
-        exact(args, "key kind locator expected_version groups")
-        require(args["kind"] in {"file", "url"}, "unsupported", 415)
-        string(args["locator"])
-        integer(args["expected_version"])
-        source_id = "source:" + fingerprint([project_id, args["kind"], args["locator"]])
-        document_id = "document:" + fingerprint(source_id)
-        old = db.execute("SELECT * FROM knowledge_documents WHERE id=?", (document_id,)).fetchone()
-        version = old["version"] if old else 0
-        require(version == args["expected_version"], "version_conflict", 409)
+    @staticmethod
+    def _prepare_import(project, args):
         try:
             if args["kind"] == "file":
                 raw, media = read_file(project, args["locator"])
@@ -233,7 +313,31 @@ class KnowledgeApplication:
                     409,
                 )
         except (Fault, OSError, ValueError, http.client.HTTPException) as error:
-            code = error.code if isinstance(error, Fault) else "source_unavailable"
+            return {"error": error.code if isinstance(error, Fault) else "source_unavailable"}
+        return {
+            "raw": raw,
+            "media": media,
+            "resolved": resolved,
+            "text": text,
+            "units": units,
+            "digest": digest,
+            "index": [" ".join(terms(unit["text"])) for unit in units],
+        }
+
+    def _import(self, db, project_id, project, args, prepared, preview):
+        exact(args, "key kind locator expected_version groups")
+        require(args["kind"] in {"file", "url"}, "unsupported", 415)
+        string(args["locator"])
+        integer(args["expected_version"])
+        source_id = "source:" + fingerprint([project_id, args["kind"], args["locator"]])
+        document_id = "document:" + fingerprint(source_id)
+        old = db.execute("SELECT * FROM knowledge_documents WHERE id=?", (document_id,)).fetchone()
+        version = old["version"] if old else 0
+        require(version == args["expected_version"], "version_conflict", 409)
+        if preview:
+            return None
+        if "error" in prepared:
+            code = prepared["error"]
             if old and old["state"] != "deleted":
                 db.execute(
                     "UPDATE knowledge_documents SET state='unavailable' WHERE id=?", (document_id,)
@@ -246,6 +350,9 @@ class KnowledgeApplication:
                 "source_id": source_id,
                 "version": version,
             }
+        raw, media, resolved, text, units, digest = (
+            prepared[k] for k in ("raw", "media", "resolved", "text", "units", "digest")
+        )
         if old and old["state"] == "ready":
             previous = db.execute(
                 "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
@@ -310,7 +417,7 @@ class KnowledgeApplication:
             )
             db.execute(
                 "INSERT INTO knowledge_index VALUES (?,?,?)",
-                (block_id, project_id, " ".join(terms(unit["text"]))),
+                (block_id, project_id, prepared["index"][index]),
             )
         self._bump(db, project_id)
         return {
@@ -323,12 +430,14 @@ class KnowledgeApplication:
             "processing": "verbatim",
         }
 
-    def _delete(self, db, project_id, project, args):
+    def _delete(self, db, project_id, project, args, preview):
         exact(args, "key document_id expected_version")
         document = self._document(db, project_id, args["document_id"])
         integer(args["expected_version"])
         require(document["version"] == args["expected_version"], "version_conflict", 409)
         require(document["state"] != "deleted", "already_deleted", 409)
+        if preview:
+            return None
         db.execute(
             "UPDATE knowledge_documents SET state='deleted',version=version+1 WHERE id=?",
             (document["id"],),
@@ -346,7 +455,7 @@ class KnowledgeApplication:
         }
 
     @staticmethod
-    def _current(db, project, document):
+    def _current(db, project, document, files):
         if document["state"] != "ready":
             return False
         if document["kind"] == "url":
@@ -355,16 +464,14 @@ class KnowledgeApplication:
             "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
             (document["id"], document["version"]),
         ).fetchone()
-        try:
-            return content_hash(read_file(project, document["locator"])[0]) == version["hash"]
-        except (Fault, OSError, ValueError):
-            return False
+        return files(document["locator"], version["hash"])
 
-    def _reference(self, db, project_id, project, reference):
+    def _reference(self, db, project_id, project, reference, files):
         exact(reference, "block_id document_id version hash")
         document = self._document(db, project_id, reference["document_id"])
         require(
-            document["version"] == reference["version"] and self._current(db, project, document),
+            document["version"] == reference["version"]
+            and self._current(db, project, document, files),
             "stale_evidence",
             409,
         )
@@ -382,7 +489,7 @@ class KnowledgeApplication:
             "provenance": json.loads(row["provenance"]),
         }
 
-    def _query(self, db, project_id, project, args):
+    def _query(self, db, project_id, project, args, files):
         string(args["text"], 1024)
         integer(args["budget_bytes"], 256, 32768)
         search = query_terms(args["text"])
@@ -421,7 +528,7 @@ class KnowledgeApplication:
                 "hash": row["hash"],
             }
             try:
-                unit = self._reference(db, project_id, project, reference)
+                unit = self._reference(db, project_id, project, reference, files)
             except Fault:
                 omitted.add("stale_source")
                 continue
@@ -435,7 +542,7 @@ class KnowledgeApplication:
         result["omissions"] = sorted(omitted)
         return result
 
-    def _write_state(self, db, project_id, project, args):
+    def _write_state(self, db, project_id, project, args, files, preview):
         exact(args, "key expected_version state")
         integer(args["expected_version"])
         state = args["state"]
@@ -453,7 +560,7 @@ class KnowledgeApplication:
             400,
         )
         for reference in state["evidence"]:
-            self._reference(db, project_id, project, reference)
+            self._reference(db, project_id, project, reference, files)
         require(
             isinstance(state["pitfalls"], list) and len(state["pitfalls"]) <= 8,
             "invalid_input",
@@ -476,6 +583,8 @@ class KnowledgeApplication:
         ).fetchone()
         version = old["version"] if old else 0
         require(version == args["expected_version"], "version_conflict", 409)
+        if preview:
+            return None
         db.execute(
             "INSERT INTO knowledge_states VALUES (?,?,?) ON CONFLICT(project_id) "
             "DO UPDATE SET version=excluded.version,payload=excluded.payload",
@@ -498,9 +607,9 @@ class KnowledgeApplication:
     def _seal(package, secret):
         return hmac.new(secret.encode(), canonical(package).encode(), hashlib.sha256).hexdigest()
 
-    def _recover(self, db, project_id, project, args, secret):
+    def _recover(self, db, project_id, project, args, secret, files):
         integer(args["budget_bytes"], 1024, 32768)
-        result = self._query(db, project_id, project, args)
+        result = self._query(db, project_id, project, args, files)
         result.update(
             revision=db.execute(
                 "SELECT revision FROM knowledge_projects WHERE id=?", (project_id,)
@@ -517,7 +626,7 @@ class KnowledgeApplication:
             payload = json.loads(state["payload"])
             try:
                 evidence = [
-                    self._reference(db, project_id, project, r) for r in payload["evidence"]
+                    self._reference(db, project_id, project, r, files) for r in payload["evidence"]
                 ]
                 candidate = dict(
                     result, state={"version": state["version"], **payload}, blocks=evidence
@@ -544,7 +653,7 @@ class KnowledgeApplication:
         result["seal"] = self._seal(result, secret)
         return result
 
-    def _check(self, db, project_id, project, package, secret):
+    def _check(self, db, project_id, project, package, secret, files):
         require(
             isinstance(package, dict) and len(canonical(package).encode()) <= 32768,
             "invalid_input",
@@ -566,7 +675,7 @@ class KnowledgeApplication:
         if valid:
             try:
                 for block in package["blocks"]:
-                    self._reference(db, project_id, project, block["reference"])
+                    self._reference(db, project_id, project, block["reference"], files)
             except Fault:
                 valid = False
         return {"valid": bool(valid), "reason": "current" if valid else "stale_or_tampered"}

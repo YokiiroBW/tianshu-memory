@@ -1,6 +1,6 @@
 # 天枢记忆开发约定
 
-TS-080 项目知识域通过独立 `KnowledgeApplication` + Store 事务处理，不伪造聊天 SourceAuthority。知识表迁移只能在 schema 3 显式备份后执行，所有权威表继续受 source-guard 跟踪。配置与命令见 `docs/project-knowledge.md`；专项 `uv run --extra mcp pytest tests/test_knowledge.py tests/test_knowledge_transport.py -q --basetemp .runtime/tests-ts080-targeted`，跨迁移完整验证 `uv run --extra mcp pytest -q --basetemp .runtime/tests-ts080`。MCP 是官方可选 extra，不默认启用、不自动登记客户端。
+TS-080 项目知识域通过独立 `KnowledgeApplication` + Store 事务处理，不伪造聊天 SourceAuthority。知识表迁移只能在 schema 3 显式备份后执行，所有权威表继续受 source-guard 跟踪。配置与命令见 `docs/project-knowledge.md`；专项 `uv run --extra mcp pytest tests/test_knowledge.py tests/test_knowledge_transport.py tests/test_knowledge_concurrency.py -q --basetemp .runtime/tests-ts080-targeted`，跨迁移完整验证 `uv run --extra mcp pytest -q --basetemp .runtime/tests-ts080`。MCP 是官方可选 extra，不默认启用、不自动登记客户端。
 
 先读主工作区 `docs/development/CURRENT.md`、当前任务卡和已发布合同。本仓库任务检出上下文见 `.runtime/workspace-context.json`。只改已分配范围；`projects/` 协调检出、根任务板与共享 schema 由协调者维护。
 

@@ -3,6 +3,7 @@
 import hashlib
 import http.client
 import ipaddress
+import os
 import socket
 import ssl
 import time
@@ -68,7 +69,24 @@ def file_path(project, locator):
 def read_file(project, locator):
     target = file_path(project, locator)
     with target.open("rb") as stream:
+        before = os.fstat(stream.fileno())
         raw = stream.read(MAX_BYTES + 1)
+        after = os.fstat(stream.fileno())
+    current_target = file_path(project, locator)
+    current = current_target.stat()
+
+    def signature(value):
+        # Windows CPython 3.12 stat/ fstat expose different ctime meanings.
+        # Compare ctime only between observations from the same open handle.
+        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+    require(
+        current_target == target
+        and signature(before) == signature(after) == signature(current)
+        and before.st_ctime_ns == after.st_ctime_ns,
+        "source_changed",
+        409,
+    )
     require(len(raw) <= MAX_BYTES, "source_too_large", 413)
     return raw, "text/html" if target.suffix.lower() in {".html", ".htm"} else "text/plain"
 

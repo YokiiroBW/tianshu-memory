@@ -58,7 +58,7 @@ uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json ac
 
 支持 txt/Markdown、所列代码扩展和 HTML；PDF、Office、图片、数据库、二进制和非 UTF-8 明确不支持。仅单文件导入，无递归扫描；目录外、隐藏目录、运行目录、模型目录及凭据名称等拒绝。允许目录必须由操作者选择为非秘密资料目录，文件名规则不是内容 DLP。文件查询/恢复会重读 hash，发现未提交变化时旧块和关联状态不再返回；不自动覆盖、提交或修改工作树。
 
-URL 只支持 HTTPS 公网 443，逐跳精确允许列表、最多 3 次重定向、1 MiB、15 秒网络总期限、identity 编码及 text/plain/markdown/html。DNS 解析采用系统解析器，其 OS 超时额外计入；TLS 连接固定到校验过的公网 IP 并保留主机名证书检查，不继承代理、不抓取链接、不执行脚本。URL 查询只代表最近显式导入快照，不在后台联网检查远端变化。URL 刷新失败立即使旧版本不可召回。抓取在 Store 串行事务内进行，首版适合小资料库，网络慢请求会占用写锁；没有大库吞吐承诺。
+URL 只支持 HTTPS 公网 443，逐跳精确允许列表、最多 3 次重定向、1 MiB、15 秒网络总期限、identity 编码及 text/plain/markdown/html。DNS 解析采用系统解析器，其 OS 超时额外计入；TLS 连接固定到校验过的公网 IP 并保留主机名证书检查，不继承代理、不抓取链接、不执行脚本。URL 查询只代表最近显式导入快照，不在后台联网检查远端变化。URL 刷新失败立即使旧版本不可召回。导入先在短事务捕获项目状态，再在事务外抓取、解析、hash 和构建索引文本，提交前重读授权和登记，原子复核项目修订、文档版本与幂等结果。查询/恢复/写回证据也在事务外读取文件，之后短事务复核一致性；文件读取前后核验文件标识/大小/时间，双次内容校验不一致时拒绝旧证据。并发项目变更返回 project_conflict，不自动覆盖或无限重试；无关聊天写入不使项目操作冲突。OS DNS 阻塞及取消均不占用数据库写锁。仍无大库吞吐承诺。
 
 查询：`{"operation":"query","project_id":"demo","arguments":{"text":"receipt retry","budget_bytes":8192}}`。复用 FTS5、NFKC/英文词与中文双字词检索，不是向量或 AI 语义搜索。只返回命中完整块、版本/hash、source_id、来源和行范围；预算为实际 UTF-8 JSON 字节（256–32768）。至多考察 128 个候选，没有按全项目全文装配提示词。
 
@@ -80,4 +80,4 @@ Hermes 可作为标准 MCP stdio host，显式登记 command/args/env；示例�
 
 ## 验证命令
 
-`uv run --extra mcp pytest tests/test_knowledge.py tests/test_knowledge_transport.py -q --basetemp .runtime/tests-ts080-targeted`；全产品回归 `uv run --extra mcp pytest -q --basetemp .runtime/tests-ts080`。TLS 工具解释器配置沿用 docs/runtime.md。变更稳定后先审查完整 diff，再跑 ruff/compileall 和对应测试。运行结果见任务交接。
+`uv run --extra mcp pytest tests/test_knowledge.py tests/test_knowledge_transport.py tests/test_knowledge_concurrency.py -q --basetemp .runtime/tests-ts080-targeted`；全产品回归 `uv run --extra mcp pytest -q --basetemp .runtime/tests-ts080`。TLS 工具解释器配置沿用 docs/runtime.md。变更稳定后先审查完整 diff，再跑 ruff/compileall 和对应测试。运行结果见任务交接。
