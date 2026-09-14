@@ -272,11 +272,13 @@ class SourceContext:
         return self.evidence.reference(reference)
 
     def current_hash(self, document_id, version):
-        """The current on-disk hash of one referenced document version.
+        """The current hash of one referenced document version, by source kind.
 
-        The caller must already have validated that version in this phase. This refuses a
-        tombstoned, replaced or unavailable document and a changed file, so a fingerprint
-        built from it never claims evidence that is no longer current.
+        A `file` document is re-read from disk and refused if the bytes changed. A `url`
+        document is a snapshot taken at the last explicit import: its authority is the stored
+        version plus the caller's project still registering that exact URL. Its locator is
+        never handed to the file reader and no network request is made here, so composing or
+        reading an experience never becomes an unrequested fetch.
         """
         document = self.application._document(self.db, self.project_id, document_id)
         require(document["version"] == version, "stale_evidence", 409)
@@ -285,6 +287,13 @@ class SourceContext:
             (document["id"], document["version"]),
         ).fetchone()
         require(stored is not None, "stale_evidence", 409)
+        if document["kind"] == "url":
+            require(
+                isinstance(self.project, dict) and document["locator"] in self.project["urls"],
+                "stale_evidence",
+                409,
+            )
+            return stored["hash"]
         require(self.read(document, stored["hash"]), "stale_evidence", 409)
         return self.reader.hash_of(document["locator"])
 

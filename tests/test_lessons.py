@@ -146,6 +146,82 @@ def imported(harness, project="alpha", key=None, expected_version=0):
     return result
 
 
+def allow_urls(harness, url, *projects):
+    """Register an exact source URL for the listed projects before any import."""
+    for project in projects or ("alpha", "beta"):
+        harness.config["knowledge"]["projects"][project]["urls"] = [url]
+    harness.path.write_text(canonical(harness.config), encoding="utf-8")
+    return url
+
+
+def forbid_file_read(*args):
+    """Guard used by the URL tests: a URL locator must never reach the file reader."""
+    pytest.fail("a URL locator must not reach the file reader")
+
+
+def imported_url(harness, project="alpha", url=None, key=None, expected_version=0):
+    """Import a registered URL snapshot. The caller must stub `fetch_url`; no network runs."""
+    result = harness.run(
+        "import",
+        dict(
+            key=key or f"{project}-url",
+            kind="url",
+            locator=url,
+            expected_version=expected_version,
+            groups=None,
+        ),
+        project=project,
+        client=f"{project}-writer",
+    )
+    assert result["status"] == "imported", result
+    return result
+
+
+def url_references(harness, url, *projects):
+    """Record one URL-evidenced lesson per project and return the promotion evidence list."""
+    names = projects or ("alpha", "beta")
+    for project in names:
+        imported_url(harness, project, url)
+    recorded = [
+        record(
+            harness,
+            project,
+            key=f"{project}-lesson",
+            op=f"{project}-url-lesson",
+            evidence=[reference(harness, project)],
+        )
+        for project in names
+    ]
+    return sorted(
+        (
+            {
+                "project_id": project,
+                "lesson_id": item["lesson_id"],
+                "version": item["version"],
+                "hash": item["hash"],
+            }
+            for project, item in zip(names, recorded, strict=True)
+        ),
+        key=lambda item: item["lesson_id"],
+    )
+
+
+def status(harness, client="operator", project="alpha"):
+    return harness.run(
+        "experience_query",
+        dict(text="receipt", budget_bytes=8192, project_id=None),
+        project=project,
+        client=client,
+    )
+
+
+def check_effect(harness, entry_id, version=1, client="operator", project="alpha"):
+    package = {"entry_id": entry_id, "version": version, "seal": "0" * 64}
+    return harness.run(
+        "experience_check", dict(entry_id=entry_id, package=package), project=project, client=client
+    )
+
+
 def reference(harness, project="alpha", text="receipt"):
     hit = harness.run(
         "query", dict(text=text, budget_bytes=8192), project=project, client=f"{project}-writer"
@@ -1287,3 +1363,193 @@ def test_candidate_schema_and_examples_cover_new_operations():
         "experience_revoke",
         "experience_withdraw",
     } <= set(schema["properties"]["operation"]["enum"])
+
+
+# -- URL source kind: snapshot semantics, never a fetch on read ----------------
+
+
+def test_two_url_sources_promote_and_read_without_fetching(lessons, monkeypatch):
+    """A registered URL is a snapshot: promotion and reads need no network access."""
+    url = allow_urls(lessons, "https://example.com/design")
+    calls = []
+    monkeypatch.setattr(
+        "tianshu_memory.knowledge.fetch_url",
+        lambda target, allowed: (
+            calls.append(target) or b"Receipt evidence: do not resend before checking receipt.",
+            "text/plain",
+            target,
+        ),
+    )
+    references = url_references(lessons, url)
+    assert calls == [url, url]
+    promoted = promote(lessons, references)
+    assert promoted["status"] == "promoted" and promoted["evidence_projects"] == ["alpha", "beta"]
+    calls.clear()
+    result = status(lessons)
+    assert [entry["effect"] for entry in result["entries"]] == ["live"]
+    assert result["omissions"] == []
+    assert check_effect(lessons, promoted["entry_id"])["effect"] == "live"
+    assert calls == []
+    # A URL locator is never handed to the file reader.
+    with monkeypatch.context() as patch:
+        patch.setattr("tianshu_memory.lessons.read_file", forbid_file_read)
+        assert check_effect(lessons, promoted["entry_id"])["effect"] == "live"
+        assert [entry["effect"] for entry in status(lessons)["entries"]] == ["live"]
+
+
+def test_mixed_url_and_file_sources_promote_and_read(lessons, monkeypatch):
+    """One project cites a URL snapshot and the other a file; both stay live."""
+    url = allow_urls(lessons, "https://example.com/design")
+    monkeypatch.setattr(
+        "tianshu_memory.knowledge.fetch_url",
+        lambda target, allowed: (
+            b"Receipt evidence: check before resending.",
+            "text/plain",
+            target,
+        ),
+    )
+    imported_url(lessons, "alpha", url)
+    imported(lessons, "beta")
+    first = record(
+        lessons,
+        "alpha",
+        key="alpha-lesson",
+        op="alpha-mixed",
+        evidence=[reference(lessons, "alpha")],
+    )
+    second = record(lessons, "beta", key="beta-lesson", op="beta-mixed")
+    references = sorted(
+        [
+            {
+                "project_id": "alpha",
+                "lesson_id": first["lesson_id"],
+                "version": first["version"],
+                "hash": first["hash"],
+            },
+            {
+                "project_id": "beta",
+                "lesson_id": second["lesson_id"],
+                "version": second["version"],
+                "hash": second["hash"],
+            },
+        ],
+        key=lambda item: item["lesson_id"],
+    )
+    promoted = promote(lessons, references)
+    assert promoted["status"] == "promoted"
+    assert [entry["effect"] for entry in status(lessons)["entries"]] == ["live"]
+    assert check_effect(lessons, promoted["entry_id"])["effect"] == "live"
+    # The file half still follows the file rules: changing it invalidates the entry.
+    (lessons.roots["beta"] / "notes.md").write_text("Beta text replaced.", encoding="utf-8")
+    after = status(lessons)
+    assert after["entries"] == [] and after["omissions"] == ["stale_source"]
+
+
+def test_url_refresh_and_delete_invalidate_promoted_experience(lessons, monkeypatch):
+    """A refreshed snapshot or a URL tombstone stops reuse of the promoted entry."""
+    url = allow_urls(lessons, "https://example.com/design")
+    body = {"bytes": b"Receipt evidence: check before resending."}
+
+    def fetch(target, allowed):
+        return body["bytes"], "text/plain", target
+
+    monkeypatch.setattr("tianshu_memory.knowledge.fetch_url", fetch)
+    references = url_references(lessons, url)
+    promoted = promote(lessons, references)
+    assert check_effect(lessons, promoted["entry_id"])["effect"] == "live"
+    # The alpha snapshot is refreshed to new bytes: the old approval no longer holds.
+    body["bytes"] = b"Refreshed receipt evidence: always check the receipt first."
+    refreshed = imported_url(lessons, "alpha", url, key="alpha-refresh", expected_version=1)
+    assert refreshed["version"] == 2
+    after = status(lessons)
+    assert after["entries"] == [] and after["omissions"] == ["stale_source"]
+    checked = check_effect(lessons, promoted["entry_id"])
+    assert not checked["valid"] and checked["effect"] == "stale_source"
+    # The beta snapshot is tombstoned: still not reusable.
+    imported_url(lessons, "beta", url, key="beta-refresh", expected_version=1)
+    document_id = reference(lessons, "beta")["document_id"]
+    deleted = lessons.run(
+        "delete",
+        dict(key="beta-delete", document_id=document_id, expected_version=2),
+        project="beta",
+        client="beta-writer",
+    )
+    assert deleted["status"] == "deleted"
+    after_delete = status(lessons)
+    assert after_delete["entries"] == [] and after_delete["omissions"] == ["stale_source"]
+    assert check_effect(lessons, promoted["entry_id"])["effect"] == "stale_source"
+
+
+def test_failed_url_refresh_invalidates_promoted_experience(lessons, monkeypatch):
+    """A failed explicit refresh marks the snapshot unavailable, so the entry is not live."""
+    url = allow_urls(lessons, "https://example.com/design")
+
+    def fetch(target, allowed):
+        return b"Receipt evidence: check before resending.", "text/plain", target
+
+    monkeypatch.setattr("tianshu_memory.knowledge.fetch_url", fetch)
+    references = url_references(lessons, url)
+    promoted = promote(lessons, references)
+    assert check_effect(lessons, promoted["entry_id"])["effect"] == "live"
+
+    def broken(*args):
+        raise OSError("synthetic transport failure")
+
+    monkeypatch.setattr("tianshu_memory.knowledge.fetch_url", broken)
+    failed = lessons.run(
+        "import",
+        dict(key="alpha-failed", kind="url", locator=url, expected_version=1, groups=None),
+        project="alpha",
+        client="alpha-writer",
+    )
+    assert failed["status"] == "failed" and failed["code"] == "source_unavailable"
+    result = status(lessons)
+    assert result["entries"] == [] and result["omissions"] == ["stale_source"]
+    assert check_effect(lessons, promoted["entry_id"])["effect"] == "stale_source"
+
+
+def test_experience_reads_never_fetch_the_url(lessons, monkeypatch):
+    """Reading an approved rule must not become an unrequested network call."""
+    url = allow_urls(lessons, "https://example.com/design")
+    monkeypatch.setattr(
+        "tianshu_memory.knowledge.fetch_url",
+        lambda target, allowed: (
+            b"Receipt evidence: check before resending.",
+            "text/plain",
+            target,
+        ),
+    )
+    references = url_references(lessons, url)
+    promoted = promote(lessons, references)
+
+    def forbidden(*args):
+        pytest.fail("experience reads must not fetch a URL snapshot")
+
+    monkeypatch.setattr("tianshu_memory.knowledge.fetch_url", forbidden)
+    assert [entry["effect"] for entry in status(lessons)["entries"]] == ["live"]
+    assert check_effect(lessons, promoted["entry_id"])["effect"] == "live"
+    assert lessons.run(
+        "lesson_query", dict(text="receipt", budget_bytes=8192), project="alpha", client="operator"
+    )["lessons"]
+
+
+def test_url_deregistration_invalidates_promoted_experience(lessons, monkeypatch):
+    """Dropping the registered URL revokes that snapshot, so reuse stops."""
+    url = allow_urls(lessons, "https://example.com/design")
+    monkeypatch.setattr(
+        "tianshu_memory.knowledge.fetch_url",
+        lambda target, allowed: (
+            b"Receipt evidence: check before resending.",
+            "text/plain",
+            target,
+        ),
+    )
+    references = url_references(lessons, url)
+    promoted = promote(lessons, references)
+    assert check_effect(lessons, promoted["entry_id"])["effect"] == "live"
+    lessons.config["knowledge"]["projects"]["beta"]["urls"] = []
+    lessons.path.write_text(canonical(lessons.config))
+    after = status(lessons)
+    assert after["entries"] == [] and after["omissions"] == ["stale_source"]
+    checked = check_effect(lessons, promoted["entry_id"])
+    assert not checked["valid"] and checked["effect"] == "stale_source"
