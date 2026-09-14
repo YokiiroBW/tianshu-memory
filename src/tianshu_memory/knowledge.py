@@ -223,7 +223,9 @@ class Sources:
         """The lesson evidence context for one phase of one project."""
         from .lessons import SourceContext
 
-        return SourceContext(self.application, db, project_id, reader=self.bind(project_id, phase))
+        return SourceContext(
+            self.application, db, project_id, reader=self.reader(project_id), phase=phase
+        )
 
 
 class Plan:

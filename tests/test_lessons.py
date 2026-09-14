@@ -129,14 +129,14 @@ def lessons(tmp_path, contracts):
     )
 
 
-def imported(harness, project="alpha", key=None):
+def imported(harness, project="alpha", key=None, expected_version=0):
     result = harness.run(
         "import",
         dict(
             key=key or f"{project}-import",
             kind="file",
             locator="notes.md",
-            expected_version=0,
+            expected_version=expected_version,
             groups=None,
         ),
         project=project,
@@ -738,14 +738,23 @@ def test_global_retrieval_never_leaks_unauthorized_projects(lessons):
     two_projects(lessons)
     references = shared_references(lessons)
     promoted = promote(lessons, references)
-    # The reviewer may read alpha only, so an entry that also cites beta stays invisible.
+    # The reviewer may read alpha only, so an entry that also cites beta is not a candidate at
+    # all: it must not appear, must not add an omission and must not displace a legal entry.
     hidden = lessons.run(
         "experience_query",
         dict(text="receipt", budget_bytes=8192, project_id=None),
         project="alpha",
         client="reviewer",
     )
-    assert hidden["entries"] == [] and hidden["omissions"] == ["unavailable_source"]
+    assert hidden["entries"] == [] and hidden["omissions"] == []
+    # The same query issued by a caller who may read both projects reports the real state.
+    visible = lessons.run(
+        "experience_query",
+        dict(text="receipt", budget_bytes=8192, project_id=None),
+        project="alpha",
+        client="operator",
+    )
+    assert [entry["entry_id"] for entry in visible["entries"]] == [promoted["entry_id"]]
     with pytest.raises(Fault, match="forbidden"):
         lessons.run(
             "experience_query",
@@ -813,7 +822,7 @@ def test_source_withdrawal_invalidates_experience_and_its_cached_check(lessons):
         project="alpha",
         client="operator",
     )
-    assert queries["entries"] == [] and queries["omissions"] == ["unavailable_source"]
+    assert queries["entries"] == [] and queries["omissions"] == ["withdrawn"]
     # Another project's lesson is not resolvable from here at all, and a project writer
     # lacks the review permission needed to change global sharing.
     with pytest.raises(Fault, match="not_found"):
@@ -908,6 +917,235 @@ def test_deleted_source_makes_the_lesson_unrecallable(lessons):
         "lesson_query", dict(text="receipt", budget_bytes=8192), project="beta", client="operator"
     )
     assert recall["lessons"] == [] and recall["omissions"] == ["stale_source"]
+
+
+# -- current evidence validation for promoted experience -----------------------
+
+
+def test_current_file_change_stops_experience_reuse(lessons):
+    """A replaced source file must invalidate the promoted entry, not stay reported live."""
+    two_projects(lessons)
+    references = shared_references(lessons)
+    promoted = promote(lessons, references)
+    package, seal = live_check(lessons, promoted["entry_id"], promoted["version"])
+    package["seal"] = seal
+    assert lessons.run(
+        "experience_check",
+        dict(entry_id=promoted["entry_id"], package=package),
+        project="alpha",
+        client="operator",
+    )["valid"]
+    (lessons.roots["alpha"] / "notes.md").write_text(
+        "The receipt guidance was replaced.", encoding="utf-8"
+    )
+    after = lessons.run(
+        "experience_query",
+        dict(text="receipt", budget_bytes=8192, project_id=None),
+        project="alpha",
+        client="operator",
+    )
+    assert after["entries"] == []
+    assert after["omissions"] == ["stale_source"]
+    stale = lessons.run(
+        "experience_check",
+        dict(entry_id=promoted["entry_id"], package=package),
+        project="alpha",
+        client="operator",
+    )
+    assert not stale["valid"] and stale["effect"] == "stale_source"
+    # A package whose seal and claimed effect no longer match the entry is refused too.
+    assert not lessons.run(
+        "experience_check",
+        dict(entry_id=promoted["entry_id"], package=dict(package, effect="live")),
+        project="alpha",
+        client="operator",
+    )["valid"]
+
+
+def test_reimported_document_version_stops_experience_reuse(lessons):
+    """A new document version invalidates the entry even when the text only grew."""
+    two_projects(lessons)
+    references = shared_references(lessons)
+    promoted = promote(lessons, references)
+    (lessons.roots["beta"] / "notes.md").write_text(
+        "Beta evidence: check the receipt table before any retry.\nSecond beta line.\nExtra line.\n",
+        encoding="utf-8",
+    )
+    replacement = imported(lessons, "beta", key="beta-reimport", expected_version=1)
+    assert replacement["status"] == "imported" and replacement["version"] == 2
+    check = lessons.run(
+        "experience_check",
+        dict(
+            entry_id=promoted["entry_id"], package=live_check(lessons, promoted["entry_id"], 1)[0]
+        ),
+        project="alpha",
+        client="operator",
+    )
+    assert not check["valid"] and check["effect"] in {"stale_source", "superseded"}
+    assert (
+        lessons.run(
+            "experience_query",
+            dict(text="receipt", budget_bytes=8192, project_id=None),
+            project="alpha",
+            client="operator",
+        )["entries"]
+        == []
+    )
+
+
+def test_deleted_or_tombstoned_source_stops_experience_reuse(lessons):
+    """Deleting the evidence document must not leave the entry reported as live."""
+    two_projects(lessons)
+    references = shared_references(lessons)
+    promoted = promote(lessons, references)
+    document_id = reference(lessons, "alpha")["document_id"]
+    deleted = lessons.run(
+        "delete",
+        dict(key="delete-alpha", document_id=document_id, expected_version=1),
+        project="alpha",
+        client="alpha-writer",
+    )
+    assert deleted["status"] == "deleted"
+    after = lessons.run(
+        "experience_query",
+        dict(text="receipt", budget_bytes=8192, project_id=None),
+        project="alpha",
+        client="operator",
+    )
+    assert after["entries"] == []
+    assert after["omissions"] == ["stale_source"]
+    assert (
+        lessons.run(
+            "experience_check",
+            dict(
+                entry_id=promoted["entry_id"],
+                package=live_check(lessons, promoted["entry_id"], 1)[0],
+            ),
+            project="alpha",
+            client="operator",
+        )["effect"]
+        == "stale_source"
+    )
+
+
+def test_project_permission_revocation_stops_experience_reuse(lessons):
+    """Losing read access to a source project makes the entry invisible and checked invalid."""
+    two_projects(lessons)
+    references = shared_references(lessons)
+    promoted = promote(lessons, references)
+    package, seal = live_check(lessons, promoted["entry_id"], promoted["version"])
+    package["seal"] = seal
+    assert lessons.run(
+        "experience_check",
+        dict(entry_id=promoted["entry_id"], package=package),
+        project="alpha",
+        client="operator",
+    )["valid"]
+    # The caller keeps beta but loses alpha, so the entry is no longer fully readable.
+    lessons.config["knowledge"]["clients"]["operator"]["projects"] = ["beta"]
+    lessons.path.write_text(canonical(lessons.config))
+    checked = lessons.run(
+        "experience_check",
+        dict(entry_id=promoted["entry_id"], package=package),
+        project="beta",
+        client="operator",
+    )
+    assert not checked["valid"] and checked["effect"] == "unavailable"
+    assert checked["version"] is None
+    queried = lessons.run(
+        "experience_query",
+        dict(text="receipt", budget_bytes=8192, project_id=None),
+        project="beta",
+        client="operator",
+    )
+    assert queried["entries"] == [] and queried["omissions"] == []
+    # The lost project itself is refused outright, before anything is read.
+    with pytest.raises(Fault, match="forbidden"):
+        lessons.run(
+            "experience_query",
+            dict(text="receipt", budget_bytes=8192, project_id="alpha"),
+            project="alpha",
+            client="operator",
+        )
+
+
+def test_unauthorized_entry_cannot_shift_omissions_or_displace_candidates(lessons):
+    """Global retrieval must not let an unreadable entry be observed through its hits."""
+    two_projects(lessons)
+    references = shared_references(lessons)
+    hidden = promote(lessons, references)
+    # The operator owns a legal entry whose text also matches "receipt".
+    visible = promote(
+        lessons,
+        references,
+        key="visible-promotion",
+        op="visible@1",
+        title="Alpha only receipt rule",
+    )
+    operator = lessons.run(
+        "experience_query",
+        dict(text="receipt", budget_bytes=8192, project_id=None),
+        project="alpha",
+        client="operator",
+    )
+    assert {entry["entry_id"] for entry in operator["entries"]} == {
+        hidden["entry_id"],
+        visible["entry_id"],
+    }
+    assert operator["omissions"] == []
+    # The reviewer may read alpha only: the entry citing beta is not a candidate at all.
+    reviewer = lessons.run(
+        "experience_query",
+        dict(text="receipt", budget_bytes=8192, project_id=None),
+        project="alpha",
+        client="reviewer",
+    )
+    assert reviewer["entries"] == []
+    assert reviewer["omissions"] == []
+    miss = lessons.run(
+        "experience_query",
+        dict(text="zzzznonexistent", budget_bytes=8192, project_id=None),
+        project="alpha",
+        client="reviewer",
+    )
+    assert miss["entries"] == [] and miss["omissions"] == []
+
+
+def test_unauthorized_expired_entry_reports_nothing(lessons):
+    """An unreadable entry that also expired must not be observable in any form."""
+    two_projects(lessons)
+    references = shared_references(lessons)
+    promote(lessons, references)
+    (lessons.roots["beta"] / "notes.md").write_text("Beta text replaced.", encoding="utf-8")
+    reviewer = lessons.run(
+        "experience_query",
+        dict(text="receipt", budget_bytes=8192, project_id=None),
+        project="alpha",
+        client="reviewer",
+    )
+    assert reviewer["entries"] == [] and reviewer["omissions"] == []
+
+
+def test_authorized_expiry_is_explained_while_unreadable_is_not(lessons):
+    """A caller who may read the sources gets the real reason; a partial caller gets none."""
+    two_projects(lessons)
+    references = shared_references(lessons)
+    promote(lessons, references)
+    (lessons.roots["beta"] / "notes.md").write_text("Beta text replaced.", encoding="utf-8")
+    operator = lessons.run(
+        "experience_query",
+        dict(text="receipt", budget_bytes=8192, project_id=None),
+        project="alpha",
+        client="operator",
+    )
+    assert operator["entries"] == [] and operator["omissions"] == ["stale_source"]
+    reviewer = lessons.run(
+        "experience_query",
+        dict(text="receipt", budget_bytes=8192, project_id=None),
+        project="alpha",
+        client="reviewer",
+    )
+    assert reviewer["entries"] == [] and reviewer["omissions"] == []
 
 
 def test_revoke_requires_explicit_review_permission_and_blocks_reuse(lessons):

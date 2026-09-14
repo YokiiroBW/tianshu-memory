@@ -243,7 +243,7 @@ class SourceContext:
     holds the callable rather than looking it up per call.
     """
 
-    def __init__(self, application, db, project_id, *, reader):
+    def __init__(self, application, db, project_id, *, reader, phase):
         from .knowledge import Evidence
 
         self.application = application
@@ -256,7 +256,8 @@ class SourceContext:
             "invalid_configuration",
             503,
         )
-        self.read = reader
+        self.reader = reader
+        self.read = getattr(reader, phase)
         self.evidence = Evidence(application, db, project_id, self.project, self.read)
         self.revision = self._revision()
 
@@ -270,6 +271,23 @@ class SourceContext:
     def blocks(self, reference):
         return self.evidence.reference(reference)
 
+    def current_hash(self, document_id, version):
+        """The current on-disk hash of one referenced document version.
+
+        The caller must already have validated that version in this phase. This refuses a
+        tombstoned, replaced or unavailable document and a changed file, so a fingerprint
+        built from it never claims evidence that is no longer current.
+        """
+        document = self.application._document(self.db, self.project_id, document_id)
+        require(document["version"] == version, "stale_evidence", 409)
+        stored = self.db.execute(
+            "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
+            (document["id"], document["version"]),
+        ).fetchone()
+        require(stored is not None, "stale_evidence", 409)
+        require(self.read(document, stored["hash"]), "stale_evidence", 409)
+        return self.reader.hash_of(document["locator"])
+
     def verify(self, references):
         """Verify source blocks and re-check that the project did not change meanwhile."""
         verified = [self.blocks(reference) for reference in references]
@@ -277,24 +295,27 @@ class SourceContext:
         return verified
 
     def lesson(self, reference):
-        """Load and verify one lesson version, returning the row and its content hash."""
+        """Load and verify one lesson version, returning the row and its content hash.
+
+        Verification covers the current document version, the tombstone state and the current
+        file content, because the fingerprint is built from the hashes that are current now.
+        """
         row = self.db.execute(
             "SELECT * FROM lessons WHERE id=? AND project_id=?",
             (reference["lesson_id"], self.project_id),
         ).fetchone()
         require(row is not None and row["version"] == reference["version"], "stale_evidence", 409)
         payload = json.loads(row["payload"])
-        hashes = []
-        for block in payload["evidence"]:
-            stored = self.db.execute(
-                "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
-                (block["document_id"], block["version"]),
-            ).fetchone()
-            require(stored is not None, "stale_evidence", 409)
-            hashes.append(stored["hash"])
-        self.verify(payload["evidence"])
+        views = self.verify(payload["evidence"])
+        hashes = [
+            self.current_hash(view["reference"]["document_id"], view["reference"]["version"])
+            for view in views
+        ]
         require(payload["project_id"] == self.project_id, "stale_evidence", 409)
-        return row, payload, lesson_hash(payload, hashes)
+        if self.reader.read_results:
+            # Only a phase that actually read the files can confirm the recorded fingerprint.
+            require(lesson_hash(payload, hashes) == reference["hash"], "stale_evidence", 409)
+        return row, payload
 
 
 class LessonReader:
@@ -327,6 +348,15 @@ class LessonReader:
             except (Fault, OSError, ValueError):
                 self.cache[locator] = None
         return self.cache[locator]
+
+    def hash_of(self, locator):
+        """The hash this phase established for one file. Phase 1 has none: it reads nothing."""
+        return self.cache.get(locator)
+
+    @property
+    def read_results(self):
+        """True once the external phase has read files, so hashes are authoritative here."""
+        return bool(self.cache)
 
     def serve(self, document, expected):
         return self.cache.get(document["locator"]) == expected
@@ -692,11 +722,10 @@ class ExperienceBook:
             ]
             require(stored == references, "evidence_changed", 409)
         for reference in references:
-            row, _, digest = LessonBook.lesson_view(
+            row, _ = LessonBook.lesson_view(
                 sources, db, reference["project_id"], reference, phase=phase
             )
             require(row["state"] == "ready", "stale_evidence", 409)
-            require(digest == reference["hash"], "stale_evidence", 409)
         if phase == "capture":
             return None
         return self._approve(
@@ -847,58 +876,74 @@ class ExperienceBook:
 
     # -- reads -------------------------------------------------------------------
 
-    def effect(self, db, authorized, entry_id):
-        """Recompute whether a promoted entry is still reusable.
+    def effect(self, db, application, sources, entry_id, *, phase):
+        """Recompute whether a promoted entry is still reusable, in one dispatch phase.
 
-        Nothing is copied into global text and nothing is background-rewritten: the effect
-        is derived from the registered project lesson and the caller's permission state at
-        read time, so withdrawing a source or changing a lesson takes effect immediately.
+        Nothing is copied into global text and nothing is background-rewritten: the effect is
+        derived at read time from the registered project lessons, the **current** document
+        versions, tombstones and file contents, and the caller's permission state. Phase 1
+        records the expectations of every source file and reads nothing; phase 2 reads those
+        files outside any transaction; phase 3 answers from the recorded results, so a source
+        changed in between is reported as stale rather than as a live fact.
         """
         references = self._references(db, entry_id)
         if not references:
             return "unavailable"
-        if not {reference["project_id"] for reference in references} <= set(authorized):
-            return "unavailable"
         if any(reference["state"] == "withdrawn" for reference in references):
+            if not {reference["project_id"] for reference in references} <= set(
+                application.authorized_projects
+            ):
+                return "unavailable"
             return "withdrawn"
+        if not {reference["project_id"] for reference in references} <= set(
+            application.authorized_projects
+        ):
+            # Never disclose which source project is missing.
+            return "unavailable"
         for reference in references:
-            lesson = db.execute(
+            stored = db.execute(
                 "SELECT * FROM lessons WHERE id=?", (reference["lesson_id"],)
             ).fetchone()
             if (
-                lesson is None
-                or lesson["state"] != "ready"
-                or lesson["version"] != reference["version"]
+                stored is None
+                or stored["state"] != "ready"
+                or stored["version"] != reference["version"]
             ):
+                # The lesson this entry was approved for was retired or revised.
                 return "superseded"
-            if self._content_hash(db, lesson) != reference["hash"]:
+            try:
+                row, _ = LessonBook.lesson_view(
+                    sources,
+                    db,
+                    reference["project_id"],
+                    {
+                        "lesson_id": reference["lesson_id"],
+                        "version": reference["version"],
+                        "hash": reference["hash"],
+                    },
+                    phase=phase,
+                )
+                require(row["state"] == "ready", "stale_evidence", 409)
+            except Fault as error:
+                # A replaced or deleted document, a changed file and a moved project revision
+                # all stop reuse; none of them may report a live fact.
+                if error.code == "project_conflict":
+                    return "unavailable"
                 return "stale_source"
         return "live"
 
-    @staticmethod
-    def _content_hash(db, lesson):
-        payload = json.loads(lesson["payload"])
-        hashes = []
-        for block in payload["evidence"]:
-            stored = db.execute(
-                "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
-                (block["document_id"], block["version"]),
-            ).fetchone()
-            hashes.append(stored["hash"] if stored else "")
-        return lesson_hash(payload, hashes)
-
-    def status(self, db, authorized, entry_id):
+    def status(self, db, application, sources, entry_id, *, phase):
         row = db.execute("SELECT * FROM experience_entries WHERE id=?", (entry_id,)).fetchone()
         if row is None:
             return "unavailable", None
         if not {reference["project_id"] for reference in self._references(db, entry_id)} <= set(
-            authorized
+            application.authorized_projects
         ):
             # Never disclose which source project is missing.
             return "unavailable", None
         if row["state"] == "revoked":
             return "revoked", row
-        return self.effect(db, authorized, entry_id), row
+        return self.effect(db, application, sources, entry_id, phase=phase), row
 
     def view(self, db, row, effect, scoped_project):
         """Render an entry. Only references from projects the caller asked about are shown."""
@@ -929,7 +974,7 @@ class ExperienceBook:
             "evidence": evidence,
         }
 
-    def query(self, db, authorized, args):
+    def query(self, db, application, sources, args, *, phase):
         exact_fields(args, "text budget_bytes project_id")
         text(args["text"], 1024)
         require(
@@ -939,7 +984,7 @@ class ExperienceBook:
         )
         if args["project_id"] is not None:
             text(args["project_id"], 128)
-            require(args["project_id"] in set(authorized), "forbidden", 403)
+            require(args["project_id"] in set(application.authorized_projects), "forbidden", 403)
         result = {
             "entries": [],
             "omissions": [],
@@ -948,8 +993,7 @@ class ExperienceBook:
             "sharing": "explicit_operator_approval",
         }
         require(
-            len(canonical(dict(result, omissions=["budget", "unavailable_source"])).encode())
-            <= args["budget_bytes"],
+            len(canonical(dict(result, omissions=["budget"])).encode()) <= args["budget_bytes"],
             "budget_too_small",
             400,
         )
@@ -957,32 +1001,35 @@ class ExperienceBook:
         if not search:
             return result
         expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in search)
+        # Scope filtering happens in SQL, before ranking, budget accounting and omission
+        # bookkeeping: an entry whose sources this caller may not read is never a candidate,
+        # so its own keyword hits can neither change the result nor displace a legal candidate.
         rows = db.execute(
             "SELECT e.id,e.version,e.state FROM experience_index "
             "JOIN experience_entries e ON e.id=experience_index.entry_id "
-            "WHERE experience_index MATCH ? AND e.state='active' ORDER BY rank,e.id LIMIT ?",
-            (expression, MAX_CANDIDATES),
+            "WHERE experience_index MATCH ? AND e.state='active' "
+            "AND NOT EXISTS(SELECT 1 FROM experience_lesson_refs r WHERE r.entry_id=e.id "
+            "AND r.project_id NOT IN (SELECT value FROM json_each(?))) "
+            "ORDER BY rank,e.id LIMIT ?",
+            (expression, canonical(sorted(application.authorized_projects)), MAX_CANDIDATES),
         ).fetchall()
         omitted = set()
         for row in rows:
-            effect = self.effect(db, authorized, row["id"])
-            if effect == "unavailable":
-                # Entries sourced from projects this caller may not read stay invisible, so
-                # global retrieval never becomes a project-existence oracle.
-                omitted.add("unavailable_source")
-                continue
-            if effect != "live":
-                omitted.add("unavailable_source")
-                continue
             if args["project_id"] is not None and args["project_id"] not in {
                 reference["project_id"] for reference in self._references(db, row["id"])
             }:
+                continue
+            effect = self.effect(db, application, sources, row["id"], phase=phase)
+            if effect != "live":
+                # The caller may read every source of this entry: reporting why it is no
+                # longer reusable is a statement about data it is allowed to see.
+                omitted.add(effect)
                 continue
             view = self.view(db, row, effect, args["project_id"])
             candidate = dict(
                 result,
                 entries=[*result["entries"], view],
-                omissions=["budget", "unavailable_source"],
+                omissions=sorted({"budget", *omitted}),
             )
             if len(canonical(candidate).encode()) > args["budget_bytes"]:
                 omitted.add("budget")
@@ -991,14 +1038,14 @@ class ExperienceBook:
         result["omissions"] = sorted(omitted)
         return result
 
-    def check(self, db, authorized, package, seal_key, entry_id):
+    def check(self, db, application, sources, package, seal_key, entry_id, *, phase):
         require(
             isinstance(package, dict) and len(canonical(package).encode()) <= 32768,
             "invalid_input",
             400,
         )
         body = {key: value for key, value in package.items() if key != "seal"}
-        effect, row = self.status(db, authorized, entry_id)
+        effect, row = self.status(db, application, sources, entry_id, phase=phase)
         references = self._references(db, entry_id) if row is not None else []
         valid = isinstance(package.get("seal"), str) and row is not None
         if valid:
@@ -1039,10 +1086,16 @@ def dispatch(
     """
     experience = ExperienceBook()
     if operation == "experience_query":
-        return experience.query(db, application.authorized_projects, args)
+        return experience.query(db, application, sources, args, phase=phase)
     if operation == "experience_check":
         return experience.check(
-            db, application.authorized_projects, args["package"], seal_key, args["entry_id"]
+            db,
+            application,
+            sources,
+            args["package"],
+            seal_key,
+            args["entry_id"],
+            phase=phase,
         )
     book = LessonBook()
     if operation == "experience_promote":
