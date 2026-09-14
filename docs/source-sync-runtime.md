@@ -73,9 +73,11 @@ committed_event 比较 owner 持久事件除 event_id 外的全部字段、turn/
 
 `TrustedWorkflow.commit_candidate({job_id,drafts})` 使用正式 workflow schema；后台 worker 必须是进程内受信调用者，且草稿精确等于来源事件 scope。候选受理不调用模型，不自动生成草稿；写入、关系累计和 A+revision+scope 去重在一个事务中。拒绝整批超出 256 个返回 record 的草稿，不部分提交。
 
-`TrustedWorkflow.confirm_revision(input)` 需要注入真实 `confirmation_adapter.verify_approval(input)`，由该适配器认证真实批准者并确认具体操作，返回字面 `True` 才能登记。无适配器为 503；schema、token、payload confirmed 或模型提议都不是批准。确认绑定 semantic_request、account、精确 scope、binding_version、record/expected_version 和期限，一次消费，重试不得重置 consumed。HTTP 没有签发确认入口。当前测试使用明确的合成批准适配器，真实签发方未接入。
+`TrustedWorkflow.confirm_revision(input)` 保留正式 confirmation_input，但真实批准通过 TS-034 的 `LocalUserApplication`/`user-action` 进入；只接受其具体认证适配器，任意 verify_approval 返回 True 不再有效。无配置为 503。身份来自平台实时 resolve 与部署独立用户凭据，精确绑定 semantic_request、account、scope、binding_version、record/expected_version 和期限，一次消费，同 HTTP 幂等重试不重置 consumed。HTTP 没有签发确认入口。
 
-correct 只禁用旧值，返回 corrected/invalidated/pending；replacement 不进入可读新组，不承诺自动补全。新的可信 replacement 来源及原子新组由后续任务完成。生产画像批准/发布与无界全库索引重建明确 503；现有已批准画像可迁移并通过正式屏障查询，真实画像签发方另接。
+画像 approve/publish/revoke 复用完整草稿和 SQL 业务规则，增加明确主体/类别/群或公开范围以及来源/绑定/部署权限快照。需显式 `migrate-users --backup`，配置和操作见 [本地用户操作](local-user-actions.md)。fixture 来源/批准不进入真实批准链。无界全库索引重建仍为 503。
+
+correct 只禁用旧值，返回 corrected/invalidated/pending；replacement 不进入可读新组，不承诺自动补全。新的可信 replacement 来源及原子新组由后续任务完成。
 
 ## 迁移、备份、异常和恢复
 

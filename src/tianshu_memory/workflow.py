@@ -245,6 +245,68 @@ class _WorkflowBase:
             ),
         )
 
+    def _publish_profile(self, db, draft, approval_ref, sources):
+        scope = profiles.storage_scope(draft)
+        group_id, ids = new_id("group"), [new_id("record") for _ in draft["units"]]
+        db.execute(
+            "INSERT INTO groups VALUES (?,?,'active',?,?,?,NULL)",
+            (group_id, canonical(scope), canonical(ids), draft["category"], draft["field_key"]),
+        )
+        subject = draft["subject"]
+        subject_id = (
+            subject["person_id"] if subject["kind"] == "person" else subject["conversation_id"]
+        )
+        db.execute(
+            "INSERT INTO profile_shares VALUES (?,?,?,?,?,?,?)",
+            (
+                group_id,
+                scope["actor_id"],
+                subject["kind"],
+                subject_id,
+                draft["sharing"],
+                draft["conversation_id"],
+                approval_ref,
+            ),
+        )
+        for record_id, unit_draft in zip(ids, draft["units"], strict=True):
+            unit = dict(
+                unit_draft,
+                record_id=record_id,
+                record_version=1,
+                semantic_group_id=group_id,
+                subject=subject,
+                field_key=draft["field_key"],
+                category=draft["category"],
+                sharing=draft["sharing"],
+                visibility="shared_projection",
+                sources=[
+                    {
+                        "kind": "shareable_projection",
+                        "owner": "memory",
+                        "projection_ref": new_id("projection"),
+                        "projection_version": 1,
+                    }
+                ],
+            )
+            if self.service.contracts.profile_version is not None:
+                self.service.contracts.validate("profiles#unit", unit)
+            self._store_unit(db, unit, group_id, scope, draft["field_key"], None)
+        for key, row in sources.items():
+            db.execute(
+                "INSERT INTO lineage VALUES (?,?,?,?)",
+                (group_id, key, row["revision"], row["epoch"]),
+            )
+        version = self.service._bump(db, scope)
+        result = {"group_id": group_id, "record_ids": ids}
+        db.execute(
+            "UPDATE profile_approvals SET consumed=1,result=? WHERE ref=?",
+            (canonical(result), approval_ref),
+        )
+        self.service._emit(
+            db, "memory.profile_published", {"scope": scope, "scope_version": version}
+        )
+        return result
+
     def jobs(self):
         with self.service.store.transaction() as db:
             return [dict(r) for r in db.execute("SELECT id,state FROM jobs ORDER BY rowid")]
@@ -372,66 +434,7 @@ class LocalWorkflow(_WorkflowBase):
             require(proof["source_snapshot"] == profiles.snapshot(sources), "version_conflict", 409)
             if proof["consumed"]:
                 return json.loads(proof["result"])
-            scope = profiles.storage_scope(draft)
-            group_id, ids = new_id("group"), [new_id("record") for _ in draft["units"]]
-            db.execute(
-                "INSERT INTO groups VALUES (?,?,'active',?,?,?,NULL)",
-                (group_id, canonical(scope), canonical(ids), draft["category"], draft["field_key"]),
-            )
-            subject = draft["subject"]
-            subject_id = (
-                subject["person_id"] if subject["kind"] == "person" else subject["conversation_id"]
-            )
-            db.execute(
-                "INSERT INTO profile_shares VALUES (?,?,?,?,?,?,?)",
-                (
-                    group_id,
-                    scope["actor_id"],
-                    subject["kind"],
-                    subject_id,
-                    draft["sharing"],
-                    draft["conversation_id"],
-                    approval_ref,
-                ),
-            )
-            for record_id, unit_draft in zip(ids, draft["units"], strict=True):
-                unit = dict(
-                    unit_draft,
-                    record_id=record_id,
-                    record_version=1,
-                    semantic_group_id=group_id,
-                    subject=subject,
-                    field_key=draft["field_key"],
-                    category=draft["category"],
-                    sharing=draft["sharing"],
-                    visibility="shared_projection",
-                    sources=[
-                        {
-                            "kind": "shareable_projection",
-                            "owner": "memory",
-                            "projection_ref": new_id("projection"),
-                            "projection_version": 1,
-                        }
-                    ],
-                )
-                if self.service.contracts.profile_version is not None:
-                    self.service.contracts.validate("profiles#unit", unit)
-                self._store_unit(db, unit, group_id, scope, draft["field_key"], None)
-            for key, row in sources.items():
-                db.execute(
-                    "INSERT INTO lineage VALUES (?,?,?,?)",
-                    (group_id, key, row["revision"], row["epoch"]),
-                )
-            version = self.service._bump(db, scope)
-            result = {"group_id": group_id, "record_ids": ids}
-            db.execute(
-                "UPDATE profile_approvals SET consumed=1,result=? WHERE ref=?",
-                (canonical(result), approval_ref),
-            )
-            self.service._emit(
-                db, "memory.profile_published", {"scope": scope, "scope_version": version}
-            )
-            return result
+            return self._publish_profile(db, draft, approval_ref, sources)
 
     def commit_candidate(self, job_id, drafts):
         return self._commit_candidate(job_id, drafts)
@@ -471,7 +474,7 @@ class TrustedWorkflow(_WorkflowBase):
 
     The injected adapter must authenticate the approving user and verify their approval of
     the whole input. A schema-valid context, service credential or model field is no proof.
-    No such user confirmation or profile approval issuer is shipped with this service.
+    The local user application authenticates explicit operations with deployment credentials.
     """
 
     def __init__(self, service, confirmation_adapter=None, profile_approval_adapter=None):
@@ -494,15 +497,10 @@ class TrustedWorkflow(_WorkflowBase):
         # Retain our own immutable value across the external approval call. The adapter may
         # not change what is bound into the durable confirmation after approving a copy.
         input = json.loads(canonical(input))
-        verifier = getattr(self.confirmation_adapter, "verify_approval", None)
-        require(callable(verifier), "dependency_unavailable", 503)
-        try:
-            approved = verifier(json.loads(canonical(input)))
-        except Fault:
-            raise
-        except Exception:
-            raise Fault("dependency_unavailable", 503) from None
-        require(approved is True)
+        self._approval(self.confirmation_adapter, "confirm_revision", input)
+        return self._register_confirmation(input)
+
+    def _register_confirmation(self, input):
         request, context = input["request"], input["verified_context"]
         scope = context["allowed_scope"]
         with self.service.operation(
@@ -514,6 +512,8 @@ class TrustedWorkflow(_WorkflowBase):
                 and context["audience_service"] == "memory"
                 and context["assertion_ref"] == request["command"]["origin"]["assertion_ref"]
             )
+            if self.confirmation_adapter is not None:
+                self.confirmation_adapter.recheck(db, context)
             binding = self.service._authorize(db, context, scope=scope)
             require(binding is not None and binding["version"] == input["binding_version"])
             require(parse_time(input["expires_at"]) > self.service.clock(), "invalid_input", 400)
@@ -575,13 +575,95 @@ class TrustedWorkflow(_WorkflowBase):
             )
             return proof
 
+    def _approval(self, adapter, operation, payload):
+        from .user_actions import LocalUserApproval
+
+        require(type(adapter) is LocalUserApproval, "dependency_unavailable", 503)
+        adapter.verify(operation, payload)
+        return adapter
+
+    def _profile_operation(self, draft, context):
+        sources = [source for unit in draft["units"] for source in unit["sources"]]
+        return self.service.operation(
+            scope=context["allowed_scope"], sources=sources, context=context, profile=True
+        )
+
     def approve_profile(self, draft, context, expires_at):
-        # Source admissions do not authorize publication. No real subject/curator issuer
-        # exists yet, so even an injected unimplemented profile adapter cannot issue consent.
-        raise Fault("dependency_unavailable", 503)
+        payload = dict(draft=draft, context=context, expires_at=expires_at)
+        adapter = self._approval(self.profile_approval_adapter, "approve_profile", payload)
+        draft, context = json.loads(canonical(draft)), json.loads(canonical(context))
+        require(parse_time(expires_at) > self.service.clock(), "invalid_input", 400)
+        with self._profile_operation(draft, context) as db:
+            self.service.store.require_user_actions(db)
+            sources = profiles.validate_draft(self.service, db, draft)
+            authority = adapter.authority(db, draft, context)
+            ref = new_id("profile-approval")
+            db.execute(
+                "INSERT INTO profile_approvals(ref,digest,source_snapshot,expires_at) VALUES (?,?,?,?)",
+                (ref, fingerprint(draft), profiles.snapshot(sources), expires_at),
+            )
+            db.execute(
+                "INSERT INTO profile_approval_authorities(ref,authority,draft) VALUES (?,?,?)",
+                (ref, canonical(authority), canonical(draft)),
+            )
+            return ref
 
     def publish_profile(self, draft, approval_ref, context):
-        raise Fault("dependency_unavailable", 503)
+        adapter = self._approval(
+            self.profile_approval_adapter,
+            "publish_profile",
+            dict(draft=draft, approval_ref=approval_ref, context=context),
+        )
+        draft, context = json.loads(canonical(draft)), json.loads(canonical(context))
+        with self._profile_operation(draft, context) as db:
+            self.service.store.require_user_actions(db)
+            sources = profiles.validate_draft(self.service, db, draft)
+            authority = adapter.authority(db, draft, context)
+            proof = db.execute(
+                "SELECT p.*,a.authority,a.draft,a.revoked FROM profile_approvals p "
+                "JOIN profile_approval_authorities a ON a.ref=p.ref WHERE p.ref=?",
+                (approval_ref,),
+            ).fetchone()
+            require(proof is not None and not proof["revoked"])
+            require(proof["authority"] == canonical(authority))
+            require(proof["digest"] == fingerprint(draft) and proof["draft"] == canonical(draft))
+            require(parse_time(proof["expires_at"]) > self.service.clock())
+            require(proof["source_snapshot"] == profiles.snapshot(sources), "version_conflict", 409)
+            if proof["consumed"]:
+                result = json.loads(proof["result"])
+                require(
+                    self.service._group_current(db, result["group_id"]), "version_conflict", 409
+                )
+                return result
+            return self._publish_profile(db, draft, approval_ref, sources)
+
+    def revoke_profile(self, draft, approval_ref, context):
+        adapter = self._approval(
+            self.profile_approval_adapter,
+            "revoke_profile",
+            dict(draft=draft, approval_ref=approval_ref, context=context),
+        )
+        # The owner barrier commits remote negatives before this withdrawal transaction.
+        with self._profile_operation(draft, context) as db:
+            self.service.store.require_user_actions(db)
+            authority = adapter.authority(db, draft, context)
+            proof = db.execute(
+                "SELECT p.*,a.authority,a.draft,a.revoked FROM profile_approvals p "
+                "JOIN profile_approval_authorities a ON a.ref=p.ref WHERE p.ref=?",
+                (approval_ref,),
+            ).fetchone()
+            require(proof is not None and proof["draft"] == canonical(draft))
+            original = json.loads(proof["authority"])
+            require(
+                all(original[key] == authority[key] for key in ("principal", "account", "scope"))
+            )
+            if not proof["revoked"]:
+                db.execute(
+                    "UPDATE profile_approval_authorities SET revoked=1 WHERE ref=?", (approval_ref,)
+                )
+                if proof["consumed"]:
+                    self.service._invalidate(db, [json.loads(proof["result"])["group_id"]])
+            return {"approval_ref": approval_ref, "state": "revoked"}
 
     def rebuild_index(self):
         # Whole-store maintenance needs independently bounded coverage for every scope.

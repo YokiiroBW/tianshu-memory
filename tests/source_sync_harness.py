@@ -10,13 +10,13 @@ import ssl
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
-from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
 from tianshu_memory.app import configured_app
 from tianshu_memory.domain import canonical, fingerprint
 from tianshu_memory.store import Store
+from tianshu_memory.user_actions import LocalUserApplication, credential_digest
 from tianshu_memory.workflow import TrustedWorkflow
 
 
@@ -151,17 +151,22 @@ class SyncHarness:
             evidence_refs=self.event(actor)["sources"],
             replacement_statement="只在上午喝茶" if kind == "correct" else None,
         )
-        # Explicit test approval issuer only; this is not a real user confirmation claim.
-        workflow = TrustedWorkflow(
-            self.service, SimpleNamespace(verify_approval=lambda input: True)
-        )
-        workflow.confirm_revision(
-            {
-                "request": request,
-                "verified_context": copy.deepcopy(self.contexts[f"synthetic-viewer:{actor}"]),
-                "binding_version": 1,
-                "expires_at": "2030-01-01T00:00:00Z",
+        # Synthetic person and independent credential, exercised through the real local app.
+        credential = "synthetic-user-credential-independent-0123456789"
+        self.config["local_users"] = {
+            "test-owner": {
+                "credential_sha256": credential_digest(credential),
+                "account": self.account,
+                "actors": ["actor:a", "actor:b"],
+                "revision_scopes": [self.scope(0), self.scope(1)],
+                "profile_permissions": [],
             }
+        }
+        self.save()
+        LocalUserApplication(self.service, self.config_path).execute(
+            dict(operation="confirm_revision", request=request, expires_at="2030-01-01T00:00:00Z"),
+            principal="test-owner",
+            credential=credential,
         )
         return request
 

@@ -169,12 +169,12 @@ def test_confirmation_unavailable_without_callable_real_adapter(trusted, adapter
         assert db.execute("SELECT COUNT(*) FROM confirmations").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("decision", [False, 1, "confirmed", {"confirmed": True}])
+@pytest.mark.parametrize("decision", [False, True, 1, "confirmed", {"confirmed": True}])
 def test_confirmation_never_treats_truthy_payload_as_approval(trusted, decision):
     adapter = SimpleNamespace(verify_approval=lambda input: decision)
     with pytest.raises(Fault) as error:
         TrustedWorkflow(trusted.h.service, adapter).confirm_revision(trusted.input)
-    assert error.value.status == 403
+    assert error.value.status == 503
     assert trusted.calls == []
 
 
@@ -192,17 +192,9 @@ def test_confirmation_adapter_failure_is_unavailable_without_writes(trusted):
 
 
 def test_confirmation_binds_exact_payload_and_never_reissues_consumed_proof(trusted):
-    seen = []
-
-    def approve(input):
-        seen.append(copy.deepcopy(input))
-        input["request"]["replacement_statement"] = "adapter cannot mutate retained input"
-        return True
-
-    workflow = TrustedWorkflow(trusted.h.service, SimpleNamespace(verify_approval=approve))
-    proof = workflow.confirm_revision(trusted.input)
+    workflow = TrustedWorkflow(trusted.h.service)
+    proof = workflow._register_confirmation(trusted.input)
     request = trusted.input["request"]
-    assert seen == [trusted.input]
     assert proof == {
         "confirmation_ref": request["confirmation_ref"],
         "record_id": request["record_id"],
@@ -225,11 +217,11 @@ def test_confirmation_binds_exact_payload_and_never_reissues_consumed_proof(trus
         db.execute(
             "UPDATE confirmations SET consumed=1 WHERE ref=?", (request["confirmation_ref"],)
         )
-    assert workflow.confirm_revision(trusted.input) == dict(proof, consumed=True)
+    assert workflow._register_confirmation(trusted.input) == dict(proof, consumed=True)
     altered = copy.deepcopy(trusted.input)
     altered["request"]["replacement_statement"] = "different semantic approval"
     with pytest.raises(Fault) as error:
-        workflow.confirm_revision(altered)
+        workflow._register_confirmation(altered)
     assert error.value.code == "idempotency_conflict"
     with trusted.h.store.transaction() as db:
         row = db.execute("SELECT * FROM confirmations").fetchone()
@@ -240,18 +232,13 @@ def test_confirmation_binds_exact_payload_and_never_reissues_consumed_proof(trus
 
 @pytest.mark.parametrize("change", ["binding", "record"])
 def test_confirmation_rechecks_changes_committed_during_approval(trusted, change):
-    def approve(input):
-        with trusted.h.store.transaction() as db:
-            if change == "binding":
-                db.execute("UPDATE accounts SET version=version+1")
-            else:
-                db.execute("UPDATE records SET version=version+1")
-        return True
-
+    with trusted.h.store.transaction() as db:
+        if change == "binding":
+            db.execute("UPDATE accounts SET version=version+1")
+        else:
+            db.execute("UPDATE records SET version=version+1")
     with pytest.raises(Fault) as error:
-        TrustedWorkflow(
-            trusted.h.service, SimpleNamespace(verify_approval=approve)
-        ).confirm_revision(trusted.input)
+        TrustedWorkflow(trusted.h.service)._register_confirmation(trusted.input)
     assert error.value.status == (403 if change == "binding" else 409)
     with trusted.h.store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM confirmations").fetchone()[0] == 0
@@ -293,9 +280,7 @@ def test_confirmation_rejects_mismatched_authority(trusted, change, status):
     else:
         input["expires_at"] = "2020-01-01T00:00:00Z"
     with pytest.raises(Fault) as error:
-        TrustedWorkflow(
-            trusted.h.service, SimpleNamespace(verify_approval=lambda input: True)
-        ).confirm_revision(input)
+        TrustedWorkflow(trusted.h.service)._register_confirmation(input)
     assert error.value.status == status
     with trusted.h.store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM confirmations").fetchone()[0] == 0

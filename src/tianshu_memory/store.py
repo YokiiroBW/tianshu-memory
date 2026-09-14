@@ -148,6 +148,18 @@ class Store:
 
         return migrate(self, backup_path, contracts)
 
+    def migrate_users(self, backup_path):
+        from .user_migration import migrate
+
+        return migrate(self, backup_path)
+
+    @staticmethod
+    def require_user_actions(db):
+        from .domain import require
+
+        row = db.execute("SELECT value FROM metadata WHERE key='local_users_schema'").fetchone()
+        require(row is not None and row[0] == "1", "dependency_unavailable", 503)
+
     @contextmanager
     def transaction(self):
         from . import source_recovery

@@ -16,6 +16,8 @@ TS-033 正式来源入口为 `SourceAuthority` + `SourceTransport`，绑定 sour
 
 来源接线：`uv run pytest tests/test_source_transport.py tests/test_source_migration.py tests/test_trusted_workflow.py tests/test_source_sync.py -q`。迁移/事务/认证共享变动后再跑完整产品测试。
 
+本地用户入口：`uv run pytest tests/test_user_actions.py tests/test_trusted_workflow.py -q --basetemp .runtime/tests-ts034-users`。HTTPS 测试前设置 `TIANSHU_TEST_CERT_PYTHON` 指向已有 cryptography 的工具解释器，见 `docs/runtime.md`；完整测试也使用 `.runtime/` 下独立 basetemp。
+
 完整本产品：`uv run pytest -q`，包含独立本地 HTTP 子进程启动、停止、重启验证。来源/身份 issuer 使用明确测试替身，不声称跨产品 L0 或真实外部验收。
 
 隔离启动和合同环境变量唯一说明见 README。不要自行发明其他检查层级；完整改动稳定后审查 diff，再从低成本到高成本运行所需检查，成功且输入未变的检查不重复运行。
@@ -27,3 +29,5 @@ TS-033 正式来源入口为 `SourceAuthority` + `SourceTransport`，绑定 sour
 schema 3 使用独立 `source-guard.json` 检查点防止旧数据库恢复丢失 suppression/消费账本/owner 水位；所有写入必须用 Store 事务。缺失/不一致不可重建为 ready，不覆盖检查点来“修复”测试或恢复；恢复批准/重建另立任务。迁移、备份、失败关闭与停止写入要求见 `docs/source-sync-runtime.md`。
 
 任务交付 `docs/handoffs/<任务编号>.md`，附实际测试、未完成、合同和本地提交；协调者审查后才能标完成。不自动合并、推送、部署或触发下游任务。
+
+TS-034 本地用户应用只接受完整显式操作；独立部署 token 摘要映射稳定账号/actor/精确权限，实时 Platform resolve 与 Memory binding 验证。禁止将任意 True 适配器、服务 token 或来源受理视为批准。画像扩展通过 `migrate-users --backup` 显式迁移，新增表必须受 source-guard 跟踪；配置与回滚边界见 `docs/local-user-actions.md`。
