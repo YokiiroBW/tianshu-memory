@@ -98,7 +98,13 @@ URL 只支持 HTTPS 公网 443，逐跳精确允许列表、最多 3 次重定�
 - 相同内容已是最新（含上次取消后已提交的项）记录为 `unchanged`，不重复写版本，因此取消/重启后可继续。
 - 每项一个短事务；项目行只在首次真正写入时创建。慢文件读取不持共享写锁，长任务在每次写入前重读配置授权，撤权或登记变化立即失败关闭。
 
-删除策略是 `explicit_approval_only`：`missing` 只是候选，只有把该 `document_id` 明确列进 `tombstones` 才会写索引墓碑（版本+1、移出索引、项目 revision+1）；路径又出现时记 `present_again` 且不删除，未列出的记 `not_approved`。本服务任何路径都不会写入、移动或删除项目文件。结果（含逐项 outcome、conflicts、counts、remaining）持久记录在 `knowledge_operations` 与 `knowledge_imports`，可用原 key 通过 `status` 读回；同请求重放返回 `replayed` 的历史结果。该结果的失效沿用既有语义：目录导入会增加 revision 与来源版本，因此旧 `recover` 包、`lesson_check` 与依赖这些来源的 `experience_check` 立即不再有效。
+幂等键在任何副作用之前绑定：`directory_apply` 在校验计划与登记之后、读取任何文件之前，就在共享的 `knowledge_operations`（client/key 唯一权威）写入该请求完整语义的摘要，并在 `knowledge_imports` 记录 `in_progress`。因此：
+
+- 同一 client 的同一 key 只接受**逐字节相同**的请求（操作、项目、计划、tombstones 都参与摘要）。同键异项目、异计划、异操作或异负载的请求在读取来源和写入任何索引行之前就以 `idempotency_conflict` 失败——绝不先写再报冲突；键复用约束对全部幂等操作（import/delete/write_state/lesson/experience）统一生效，因为完成结果与绑定写在同一张表。
+- 完全相同的请求是重试而非冲突：可续做被取消/中断留下的进度（已完成项记为 `unchanged`，不重复写版本），也可能返回先完成者的 `replayed` 历史结果。
+- 未完成的绑定不是成功：`status` 返回 `{"status":"in_progress", ...}`（含 project_id/directory/plan_id），便于判断该键是否可以续做。换内容或换计划请使用新 key。
+
+删除策略是 `explicit_approval_only`：`missing` 只是候选，只有把该 `document_id` 明确列进 `tombstones` 才会写索引墓碑（版本+1、移出索引、项目 revision+1）；路径又出现时记 `present_again` 且不删除，未列出的记 `not_approved`。本服务任何路径都不会写入、移动或删除项目文件。结果（含逐项 outcome、conflicts、counts、remaining）持久记录在 `knowledge_operations` 与 `knowledge_imports`，可用原 key 通过 `status` 读回；同请求重放返回 `replayed` 的历史结果。键绑定在第一次读文件之前就已持久化，所以被拒绝的同键请求不会留下任何项目写入；未完成的绑定以 `in_progress` 呈现，只有完全相同的请求能续做。该结果的失效沿用既有语义：目录导入会增加 revision 与来源版本，因此旧 `recover` 包、`lesson_check` 与依赖这些来源的 `experience_check` 立即不再有效。
 
 ## MCP 与 Hermes
 

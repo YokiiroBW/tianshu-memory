@@ -645,6 +645,21 @@ def remove_source(db, application, project_id, candidate, observed):
     return {**candidate, "outcome": "deleted", "version": row["version"] + 1}
 
 
+def pending_result(project_id, entry, plan):
+    """The honest state of a claimed apply before any item has been confirmed.
+
+    A key that was bound but never finished is not a success: `status` reports it as
+    `in_progress`, and only the identical request may resume it under that key.
+    """
+    return {
+        "status": "in_progress",
+        "project_id": project_id,
+        "directory": entry["path"],
+        "plan_id": plan["plan_id"],
+        "authority": "explicit_directory_confirmation",
+    }
+
+
 def applied_result(project_id, entry, plan, items, conflicts, tombstones, revision):
     """The persistent, resumable outcome of one confirmed apply."""
     written = len([item for item in items if item["outcome"] == "imported"])

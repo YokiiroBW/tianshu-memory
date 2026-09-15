@@ -523,17 +523,28 @@ def test_cancelled_apply_keeps_committed_items_and_is_resumable(catalog, monkeyp
         apply_plan(catalog, plan)
     monkeypatch.undo()
     assert documents(catalog.store) == {"docs/design.md": (1, "ready")}
-    with pytest.raises(Fault, match="not_found"):
-        catalog.run("status", {"key": "apply-1"})
+    # The key is bound before the first write and never claims a result it did not reach.
+    progress = catalog.run("status", {"key": "apply-1"})
+    assert progress["status"] == "in_progress" and progress["plan_id"] == plan["plan_id"]
     with catalog.store.transaction() as db:
-        assert not db.execute("SELECT 1 FROM knowledge_operations WHERE key='apply-1'").fetchone()
-    # After a restart the same stored plan finishes the work the cancellation left behind.
+        claimed = db.execute(
+            "SELECT digest,result FROM knowledge_operations WHERE key='apply-1'"
+        ).fetchone()
+        assert claimed["digest"] == fingerprint(
+            {
+                "operation": "directory_apply",
+                "project_id": "alpha",
+                "arguments": {"key": "apply-1", "plan": plan, "tombstones": []},
+            }
+        )
+        assert "$claim" in json.loads(claimed["result"])
+    # After a restart the identical request resumes under the key it already owns.
     restarted = KnowledgeApplication(catalog.path)
     result = restarted.execute(
         {
             "operation": "directory_apply",
             "project_id": "alpha",
-            "arguments": {"key": "apply-2", "plan": plan, "tombstones": []},
+            "arguments": {"key": "apply-1", "plan": plan, "tombstones": []},
         },
         client="operator",
         credential=SECRET,
@@ -544,6 +555,146 @@ def test_cancelled_apply_keeps_committed_items_and_is_resumable(catalog, monkeyp
         "docs/design.md": (1, "ready"),
         "docs/notes/retry.md": (1, "ready"),
     }
+    assert catalog.run("status", {"key": "apply-1"})["status"] == "applied"
+
+
+def test_conflicting_key_is_refused_before_any_read_or_write(catalog, monkeypatch):
+    """The coordinator probe, in the semantics a durable binding guarantees.
+
+    A second request under a key that is already bound elsewhere must be refused while nothing
+    has been read and nothing has been written in any project; the request that owns the key
+    finishes its own work.
+    """
+    alpha = scan(catalog)
+    beta = scan(catalog, "docs", project="beta")
+    calls = {"observe": 0}
+    real = directories.observe
+
+    def counting(*args, **kwargs):
+        calls["observe"] += 1
+        return real(*args, **kwargs)
+
+    entered, release = gate(monkeypatch, "observe", counting)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(apply_plan, catalog, alpha, key="same")
+        try:
+            assert entered.wait(5)
+            reads = calls["observe"]
+            with pytest.raises(Fault, match="idempotency_conflict"):
+                apply_plan(catalog, beta, key="same", project="beta")
+            # The refused request read no source and wrote nothing anywhere.
+            assert calls["observe"] == reads
+            assert documents(catalog.store, "beta") == {}
+            assert documents(catalog.store, "alpha") == {}
+        finally:
+            release.set()
+        assert first.result(timeout=5)["status"] == "applied"
+    assert documents(catalog.store, "alpha") == {
+        "docs/design.md": (1, "ready"),
+        "docs/notes/retry.md": (1, "ready"),
+    }
+    assert documents(catalog.store, "beta") == {}
+    # The key stays bound to the request that used it, in every later dispatch too.
+    with pytest.raises(Fault, match="idempotency_conflict"):
+        apply_plan(catalog, beta, key="same", project="beta")
+    assert apply_plan(catalog, alpha, key="same")["replayed"] is True
+    assert documents(catalog.store, "beta") == {}
+
+
+def test_same_key_with_another_plan_or_operation_is_refused_before_writing(catalog):
+    plan, _ = applied(catalog, "shared")
+    before = documents(catalog.store)
+    (catalog.roots["alpha"] / "docs" / "extra.md").write_text("Synthetic extra note.\n")
+    rescanned = scan(catalog)
+    assert rescanned["plan_id"] != plan["plan_id"]
+    # A new preview under the same key is a different request, so it is refused up front.
+    with pytest.raises(Fault, match="idempotency_conflict"):
+        apply_plan(catalog, rescanned, key="shared")
+    # Reusing the key for another operation of the same client is refused the same way.
+    with pytest.raises(Fault, match="idempotency_conflict"):
+        catalog.run(
+            "import",
+            {
+                "key": "shared",
+                "kind": "file",
+                "locator": "docs/extra.md",
+                "expected_version": 0,
+                "groups": None,
+            },
+        )
+    with pytest.raises(Fault, match="idempotency_conflict"):
+        apply_plan(catalog, scan(catalog, "docs", project="beta"), key="shared", project="beta")
+    assert documents(catalog.store) == before
+    assert documents(catalog.store, "beta") == {}
+    # The new preview is still confirmable under its own key.
+    assert apply_plan(catalog, rescanned, key="shared-2")["status"] == "applied"
+    assert documents(catalog.store)["docs/extra.md"] == (1, "ready")
+
+
+def test_in_flight_import_and_directory_apply_cannot_share_one_key(catalog, monkeypatch):
+    """Cross-operation key reuse is constrained in both directions, before any write."""
+    import tianshu_memory.knowledge as knowledge_module
+
+    plan = scan(catalog)
+    entered, release = Event(), Event()
+    real = knowledge_module.read_file
+
+    def paused(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(10)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(knowledge_module, "read_file", paused)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(
+            catalog.run,
+            "import",
+            {
+                "key": "shared",
+                "kind": "file",
+                "locator": "docs/design.md",
+                "expected_version": 0,
+                "groups": None,
+            },
+        )
+        assert entered.wait(5)
+        # The apply binds the key while the import is still reading, so the import must be
+        # refused instead of committing its own version after the conflict.
+        assert apply_plan(catalog, plan, key="shared")["status"] == "applied"
+        release.set()
+        with pytest.raises(Fault, match="idempotency_conflict"):
+            slow.result(timeout=5)
+    assert documents(catalog.store) == {
+        "docs/design.md": (1, "ready"),
+        "docs/notes/retry.md": (1, "ready"),
+    }
+    with catalog.store.transaction() as db:
+        assert (
+            db.execute("SELECT status FROM knowledge_imports WHERE key='shared'").fetchone()[0]
+            == "applied"
+        )
+
+
+def test_identical_same_key_retry_replays_or_resumes_without_duplicate_versions(
+    catalog, monkeypatch
+):
+    plan = scan(catalog)
+    entered, release = gate(monkeypatch, "observe", directories.observe)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(apply_plan, catalog, plan, key="same")
+        assert entered.wait(5)
+        release.set()
+        # An identical request is not a conflict: it may finish or replay the bound key.
+        second = pool.submit(apply_plan, catalog, plan, key="same")
+        results = [first.result(timeout=5), second.result(timeout=5)]
+    assert len([result for result in results if result.get("replayed")]) == 1
+    assert [result["status"] for result in results if not result.get("replayed")] == ["applied"]
+    assert documents(catalog.store) == {
+        "docs/design.md": (1, "ready"),
+        "docs/notes/retry.md": (1, "ready"),
+    }
+    assert catalog.run("status", {"key": "same"})["status"] == "applied"
 
 
 def test_revocation_and_registration_change_fail_closed(catalog, monkeypatch):

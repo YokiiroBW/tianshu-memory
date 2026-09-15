@@ -46,6 +46,10 @@ EVIDENCE_OPERATIONS = {
 }
 # Every operation that carries an idempotency key and records its result.
 IDEMPOTENT = WRITE | LESSON_WRITE | PROMOTE
+# Marker of a client/key binding that is persisted before the first side effect of a long
+# operation. It is a claim, never a result: an identical request may resume it, and any other
+# request under the same key is refused before it reads or writes anything.
+CLAIM = "$claim"
 # Global promotion and review need an independent explicit permission in addition to their
 # own operation permission. Reusing a project's write permission is never enough.
 EXTRA_PERMISSION = {
@@ -549,6 +553,14 @@ class KnowledgeApplication:
 
     @staticmethod
     def _replay(db, request, client):
+        """The recorded result of this exact request, or None when it may still run.
+
+        `knowledge_operations` is the one (client,key) authority for every idempotent
+        operation, and a binding is persisted there before any side effect. A request whose
+        key is bound to another operation, project or payload is therefore refused here, and a
+        binding that never reached a result is not a result: the identical request may resume
+        it instead of being told that it already succeeded.
+        """
         if request["operation"] not in IDEMPOTENT:
             return None
         args = request["arguments"]
@@ -559,10 +571,28 @@ class KnowledgeApplication:
         old = db.execute(
             "SELECT * FROM knowledge_operations WHERE client=? AND key=?", (client, key)
         ).fetchone()
-        if old:
-            require(old["digest"] == fingerprint(request), "idempotency_conflict", 409)
-            return dict(json.loads(old["result"]), replayed=True)
-        return None
+        if old is None:
+            return None
+        require(old["digest"] == fingerprint(request), "idempotency_conflict", 409)
+        recorded = json.loads(old["result"])
+        return None if CLAIM in recorded else dict(recorded, replayed=True)
+
+    @staticmethod
+    def _claim(db, operation, client, key, request):
+        """Bind one client key to this exact request before any source is read or written.
+
+        The binding lives in the same table that records results, so it also covers a key
+        reused across operations, projects or plans: only a byte-identical request may pass,
+        and a conflicting one fails here — before any external read and before any index row
+        is written. A binding that never completed is only a claim, so the identical request
+        can still resume the work instead of replaying a result that was never produced.
+        """
+        db.execute(
+            "INSERT INTO knowledge_operations VALUES (?,?,?,?) ON CONFLICT(client,key) "
+            "DO UPDATE SET digest=excluded.digest, result=excluded.result "
+            "WHERE knowledge_operations.digest=excluded.digest",
+            (client, key, fingerprint(request), canonical({CLAIM: operation})),
+        )
 
     def _directory(
         self, request, operation, project_id, args, client, credential, store, project, secret, scan
@@ -629,8 +659,9 @@ class KnowledgeApplication:
     ):
         """Confirm one issued preview item by item, each item in its own transaction.
 
-        The plan is re-checked against the recorded preview and the current registration, then
-        every file is re-read outside any transaction. An item whose path, bytes, size or current
+        The plan is re-checked against the recorded preview and the current registration, and
+        the client key is bound to this exact request before any file is read. Every file is
+        then re-read outside any transaction, and an item whose path, bytes, size or current
         index version moved becomes a conflict for that item alone, so a partial apply stays
         honest: content the preview never showed is never imported, already imported content is
         never written twice, and the recorded result can be read again after a restart.
@@ -663,6 +694,11 @@ class KnowledgeApplication:
                 409,
             )
             require(plan["registration"] == fingerprint(project), "registration_changed", 409)
+            # Bind this client key to this exact request while nothing has been read or written
+            # yet: a conflicting request is refused from here on, and the identical request can
+            # resume a half-finished apply instead of replaying a result that was never produced.
+            self._claim(db, "directory_apply", client, args["key"], request)
+            self._progress(db, client, args["key"], project_id, entry, plan, None)
 
         observed = directories.observe(project, entry, plan)
         self._reauthorize(client, credential, project_id, project, secret, scan, "directory_apply")
@@ -713,14 +749,28 @@ class KnowledgeApplication:
                 found["revision"] if found else 0,
             )
             db.execute(
-                "INSERT INTO knowledge_operations VALUES (?,?,?,?)",
+                "INSERT INTO knowledge_operations VALUES (?,?,?,?) ON CONFLICT(client,key) "
+                "DO UPDATE SET digest=excluded.digest, result=excluded.result",
                 (client, args["key"], fingerprint(request), canonical(result)),
             )
-            db.execute(
-                "INSERT INTO knowledge_imports VALUES (?,?,?,?,?)",
-                (client, args["key"], project_id, result["status"], canonical(result)),
-            )
+            self._progress(db, client, args["key"], project_id, entry, plan, result)
             return result
+
+    @staticmethod
+    def _progress(db, client, key, project_id, entry, plan, result):
+        """Record how far one claimed apply got, so `status` never has to guess.
+
+        Before the first item the entry says `in_progress`; the same row is rewritten with the
+        final result, so a cancelled or interrupted apply stays visibly unfinished and the
+        identical request can resume it under the key it already owns.
+        """
+        recorded = result or directories.pending_result(project_id, entry, plan)
+        db.execute(
+            "INSERT INTO knowledge_imports VALUES (?,?,?,?,?) ON CONFLICT(client,key) "
+            "DO UPDATE SET project_id=excluded.project_id, status=excluded.status, "
+            "result=excluded.result",
+            (client, key, project_id, recorded["status"], canonical(recorded)),
+        )
 
     def _dispatch(
         self, db, operation, project_id, project, args, seal_key, read, *, prepared, preview
