@@ -303,11 +303,15 @@ class SourceContext:
         require(self._revision() == self.revision, "project_conflict", 409)
         return verified
 
-    def lesson(self, reference):
+    def lesson(self, reference, *, phase):
         """Load and verify one lesson version, returning the row and its content hash.
 
-        Verification covers the current document version, the tombstone state and the current
-        file content, because the fingerprint is built from the hashes that are current now.
+        Every phase verifies the current document version and tombstone state. The final
+        `serve` phase additionally compares the fingerprint built from the hashes that are
+        current now against the recorded `reference["hash"]`, for every source kind: a URL
+        snapshot yields its stored digest, so the comparison must not depend on whether any
+        file happened to be read. Only `capture` defers that comparison, because it runs
+        before the external phase reads the files.
         """
         row = self.db.execute(
             "SELECT * FROM lessons WHERE id=? AND project_id=?",
@@ -321,8 +325,7 @@ class SourceContext:
             for view in views
         ]
         require(payload["project_id"] == self.project_id, "stale_evidence", 409)
-        if self.reader.read_results:
-            # Only a phase that actually read the files can confirm the recorded fingerprint.
+        if phase != "capture":
             require(lesson_hash(payload, hashes) == reference["hash"], "stale_evidence", 409)
         return row, payload
 
@@ -362,11 +365,6 @@ class LessonReader:
         """The hash this phase established for one file. Phase 1 has none: it reads nothing."""
         return self.cache.get(locator)
 
-    @property
-    def read_results(self):
-        """True once the external phase has read files, so hashes are authoritative here."""
-        return bool(self.cache)
-
     def serve(self, document, expected):
         return self.cache.get(document["locator"]) == expected
 
@@ -382,7 +380,7 @@ class LessonBook:
     @staticmethod
     def lesson_view(sources, db, project_id, reference, *, phase):
         """Validate one lesson version, including the current state of its sources."""
-        return sources.context(db, project_id, phase).lesson(reference)
+        return sources.context(db, project_id, phase).lesson(reference, phase=phase)
 
     # -- writes ------------------------------------------------------------------
 

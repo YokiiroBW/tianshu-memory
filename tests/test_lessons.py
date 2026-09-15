@@ -250,6 +250,48 @@ def lesson(harness, project="alpha", evidence=None, **changes):
     return payload
 
 
+def insert_legacy_entry(harness, references, *, title="Check the receipt before retrying"):
+    """Write an approved entry directly, as a build that skipped serve comparison would have.
+
+    The evidence hashes are stored exactly as given, so a test can model a historical entry
+    whose recorded fingerprint never matched the sources.
+    """
+    entry_id = "experience:" + hashlib.sha256(canonical(references).encode()).hexdigest()
+    payload = {
+        "title": title,
+        "rule": "Read the receipt table before resending a timed-out request.",
+        "applicability": ["idempotent delivery"],
+        "excludes": ["outbound-only notifications"],
+        "counterexamples": ["Fire-and-forget telemetry"],
+        "recheck_after": None,
+        "evidence": [dict(reference) for reference in references],
+        "project_id": "alpha",
+        "promoted_by": "operator",
+    }
+    with harness.store.transaction() as db:
+        db.execute(
+            "INSERT INTO experience_entries VALUES (?,?,?,?,?,?)",
+            (entry_id, 1, "active", "alpha", canonical(payload), "{}"),
+        )
+        for reference in payload["evidence"]:
+            db.execute(
+                "INSERT INTO experience_lesson_refs VALUES (?,?,?,?,?,?)",
+                (
+                    entry_id,
+                    reference["lesson_id"],
+                    reference["project_id"],
+                    reference["version"],
+                    reference["hash"],
+                    "ready",
+                ),
+            )
+        db.execute(
+            "INSERT INTO experience_index VALUES (?,?,?)",
+            (entry_id, "alpha", "receipt retry check"),
+        )
+    return entry_id
+
+
 def record(
     harness,
     project="alpha",
@@ -1553,3 +1595,125 @@ def test_url_deregistration_invalidates_promoted_experience(lessons, monkeypatch
     assert after["entries"] == [] and after["omissions"] == ["stale_source"]
     checked = check_effect(lessons, promoted["entry_id"])
     assert not checked["valid"] and checked["effect"] == "stale_source"
+
+
+# -- recorded fingerprint integrity in the final serve phase -------------------
+
+
+def stub_url(monkeypatch, body=b"Receipt evidence: check before resending."):
+    monkeypatch.setattr(
+        "tianshu_memory.knowledge.fetch_url",
+        lambda target, allowed: (body, "text/plain", target),
+    )
+
+
+@pytest.mark.parametrize("wrong", ["zeros", "one-bit"])
+def test_url_evidence_with_wrong_recorded_hash_cannot_promote(lessons, monkeypatch, wrong):
+    """A URL-only approval must compare the recorded fingerprint, not skip it."""
+    stub_url(monkeypatch)
+    references = url_references(lessons, allow_urls(lessons, "https://example.com/design"))
+    tampered = [dict(reference) for reference in references]
+    if wrong == "zeros":
+        tampered = [dict(reference, hash="0" * 64) for reference in references]
+    else:
+        tampered[0] = dict(tampered[0], hash="f" + tampered[0]["hash"][1:])
+        assert tampered[0]["hash"] != references[0]["hash"]
+    with pytest.raises(Fault, match="stale_evidence"):
+        promote(lessons, tampered, key=f"wrong-{wrong}")
+    assert promote(lessons, references, key=f"right-{wrong}")["status"] == "promoted"
+    assert [entry["effect"] for entry in status(lessons)["entries"]] == ["live"]
+
+
+@pytest.mark.parametrize("wrong", ["zeros", "one-bit"])
+def test_mixed_url_and_file_wrong_hash_cannot_promote(lessons, monkeypatch, wrong):
+    """The same rule holds when only one of the two sources is a URL."""
+    stub_url(monkeypatch)
+    url = allow_urls(lessons, "https://example.com/design")
+    imported_url(lessons, "alpha", url)
+    imported(lessons, "beta")
+    first = record(
+        lessons,
+        "alpha",
+        key="alpha-lesson",
+        op=f"mix-{wrong}",
+        evidence=[reference(lessons, "alpha")],
+    )
+    second = record(lessons, "beta", key="beta-lesson", op=f"mixfile-{wrong}")
+    references = sorted(
+        [
+            {
+                "project_id": "alpha",
+                "lesson_id": first["lesson_id"],
+                "version": first["version"],
+                "hash": first["hash"],
+            },
+            {
+                "project_id": "beta",
+                "lesson_id": second["lesson_id"],
+                "version": second["version"],
+                "hash": second["hash"],
+            },
+        ],
+        key=lambda item: item["lesson_id"],
+    )
+    tampered = [dict(reference) for reference in references]
+    if wrong == "zeros":
+        tampered = [dict(reference, hash="0" * 64) for reference in tampered]
+    else:
+        tampered[0] = dict(tampered[0], hash="0" + tampered[0]["hash"][1:])
+        assert tampered[0]["hash"] != references[0]["hash"]
+    with pytest.raises(Fault, match="stale_evidence"):
+        promote(lessons, tampered, key=f"mixed-wrong-{wrong}")
+    assert promote(lessons, references, key=f"mixed-right-{wrong}")["status"] == "promoted"
+
+
+def test_file_evidence_with_wrong_recorded_hash_cannot_promote(lessons):
+    """The file path keeps the same integrity rule."""
+    two_projects(lessons)
+    references = shared_references(lessons)
+    with pytest.raises(Fault, match="stale_evidence"):
+        promote(
+            lessons,
+            [dict(reference, hash="0" * 64) for reference in references],
+            key="file-wrong",
+        )
+    assert promote(lessons, references, key="file-right")["status"] == "promoted"
+
+
+def test_historical_wrong_hash_entry_is_not_live(lessons, monkeypatch):
+    """An entry recorded by a build that skipped serve comparison must not report live."""
+    stub_url(monkeypatch)
+    references = url_references(lessons, allow_urls(lessons, "https://example.com/design"))
+    entry_id = insert_legacy_entry(
+        lessons, [dict(reference, hash="0" * 64) for reference in references]
+    )
+    result = status(lessons)
+    assert result["entries"] == []
+    assert result["omissions"] == ["stale_source"]
+    checked = check_effect(lessons, entry_id)
+    assert not checked["valid"] and checked["effect"] == "stale_source"
+    # The matching fingerprint, stored the same way, is still live.
+    good_id = insert_legacy_entry(lessons, references, title="Correctly recorded receipt rule")
+    assert check_effect(lessons, good_id)["effect"] == "live"
+    assert {entry["entry_id"] for entry in status(lessons)["entries"]} == {good_id}
+
+
+def test_cross_project_url_hash_mismatch_cannot_promote(lessons, monkeypatch):
+    """A hash that is valid in another project does not validate this one."""
+    stub_url(monkeypatch)
+    url = allow_urls(lessons, "https://example.com/design")
+    references = url_references(lessons, url)
+    swapped = [dict(references[1]), dict(references[0])]
+    for reference, original in zip(swapped, references, strict=True):
+        reference["project_id"] = original["project_id"]
+        reference["lesson_id"] = original["lesson_id"]
+    # Both entries now carry the other project's lesson id, which cannot resolve at all.
+    with pytest.raises(Fault, match="stale_evidence|not_found"):
+        promote(lessons, swapped, key="swapped")
+    # A cross-project lesson id with this project's hash is refused for the same reason.
+    crossed = [
+        dict(references[0], lesson_id=references[1]["lesson_id"]),
+        dict(references[1], lesson_id=references[0]["lesson_id"]),
+    ]
+    with pytest.raises(Fault, match="stale_evidence|not_found"):
+        promote(lessons, crossed, key="crossed")

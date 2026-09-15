@@ -89,12 +89,15 @@ uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json mi
 
 总经验的可用性在**读取时**推导，不做后台改写、不把正文复制到全局。判断复用与 `lessons`/`query` 相同的当前证据校验，并且**按来源种类**执行：`file` 证据在事务外重读并双次校验内容哈希；`url` 证据是最近一次显式导入的快照，以其当前已导入版本、状态与摘要加"该项目仍登记该 URL"为准。URL locator 从不交给文件 reader，读取经验也不会触发联网抓取。
 
+最终提交段（serve）对**任何来源种类**都比较记录指纹：由当前哈希重建的 `lesson_hash` 必须等于错题引用里的 `hash`，否则 `stale_evidence`。该比较**不以"本阶段是否读过文件"为条件**——纯 URL 与混合来源同样必须通过；只有捕获段（capture）因文件尚未读取而暂缓这一项，其余检查照常执行。因此用全零或改一位的 `hash` 无法晋升，历史遗留的错误指纹条目在 `query`/`check` 中也不会报 `live`。
+
 | 情形 | 效果 | 行为 |
 | --- | --- | --- |
 | 来源错题被修订或被废弃 | `superseded` | 不再返回，`check` 判定失效 |
 | file 证据被修改/删除、文档被删除或标记不可用 | `stale_source` | 同上 |
 | url 证据被刷新到新版本、被逻辑删除，或刷新读取失败 | `stale_source` | 同上 |
 | 来源项目不再登记该 URL | `stale_source` | 该快照不再被承认 |
+| 记录指纹与当前来源不符（含历史遗留错误条目） | `stale_evidence`（写入）/ `stale_source`（读取） | 拒绝晋升；已存在条目不再返回 |
 | 来源项目主动撤出（`experience_withdraw`） | `withdrawn` | 同上；只有记录该错题的项目可撤出 |
 | 调用者失去某个来源项目的权限 | `unavailable` | 条目不出现，也不在 `check` 中泄露存在性 |
 | 项目登记期间被改动 | `unavailable` | 本次读取失败关闭，不返回缓存结论 |
