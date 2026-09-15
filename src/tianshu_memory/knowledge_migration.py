@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from .knowledge_directories_migration import install as install_directories
 from .lessons_migration import install as install_lessons
 
 SCHEMA = """
@@ -64,6 +65,14 @@ def migrate(store, backup_path):
         db.execute("INSERT INTO metadata VALUES ('knowledge_schema','1')")
         db.execute("INSERT INTO metadata VALUES ('knowledge_seal_key',?)", (secrets.token_hex(32),))
         db.execute("UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'")
-        # The same reviewed step installs the lesson book and the promoted experience book.
+        # The same reviewed step installs the lesson book, the promoted experience book and
+        # the registered-directory plan book.
         install_lessons(db)
-    return {"schema": 3, "knowledge_schema": 1, "lessons_schema": 1, "backup": str(backup)}
+        install_directories(db)
+    return {
+        "schema": 3,
+        "knowledge_schema": 1,
+        "lessons_schema": 1,
+        "knowledge_directories_schema": 1,
+        "backup": str(backup),
+    }

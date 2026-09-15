@@ -1,0 +1,90 @@
+[
+  {
+    "operation": "directory_scan",
+    "project_id": "demo",
+    "arguments": {
+      "directory": "docs"
+    }
+  },
+  {
+    "operation": "directory_apply",
+    "project_id": "demo",
+    "arguments": {
+      "key": "dir-apply-1",
+      "plan": {
+        "project_id": "demo",
+        "client": "hermes-demo",
+        "directory": "docs",
+        "registration": "da69b9524c8b0012e6f086e1df00cccd431dcf56313156a985ed9fcbc730ea24",
+        "revision": 3,
+        "issued_at": "2026-09-15T00:00:00Z",
+        "limits": {
+          "max_files": 64,
+          "max_bytes": 4194304,
+          "file_bytes": 1048576
+        },
+        "items": [
+          {
+            "locator": "docs/design.md",
+            "kind": "file",
+            "media_type": "text/plain",
+            "size": 94,
+            "digest": "c7045c3a193125f3c3841031b79ca2cf474ccbd00ea4ce5cf17b6d591892a232",
+            "source_id": "source:415fb2e155150505111654ac3ad3af7b53854e1bac76780b90f421c0502ca957",
+            "document_id": "document:2a115d0bdf4177332136023a17332be3092e74c450408ddad415d830b4a22dd8",
+            "version": 1,
+            "action": "import"
+          },
+          {
+            "locator": "docs/notes/retry.md",
+            "kind": "file",
+            "media_type": "text/plain",
+            "size": 54,
+            "digest": "0b92149a877d5f1f857fce2e7a800ec0e132beb524a2301d5b7783de590e2679",
+            "source_id": "source:d117622d3b7c63120f10efa99f6169204f1d377203582c37c3a0e9fae059f654",
+            "document_id": "document:1f0bc0b8c378bd60d2230141b25ea2d66d5a96687d0be30b9d963492d0c8d2d3",
+            "version": 0,
+            "action": "import"
+          }
+        ],
+        "omitted": [
+          {
+            "locator": "docs/logo.png",
+            "reason": "unsupported_type",
+            "size": 14
+          }
+        ],
+        "missing": [
+          {
+            "locator": "docs/old.md",
+            "document_id": "document:227f54e9017cd4ddb8a88ec3f92ba13ab4e36200bd305568e4ac9d75223dd8e6",
+            "source_id": "source:0f30a28534b285481c3aa56d831d348954bfdd3a15a951f530bc8896607cd17d",
+            "version": 2,
+            "reason": "not_present"
+          }
+        ],
+        "counts": {
+          "indexed": 3,
+          "listed": 2,
+          "import": 2,
+          "unchanged": 0,
+          "unchanged_unlisted": 0,
+          "omitted": 1,
+          "omitted_unlisted": 0,
+          "missing": 1,
+          "links": 0,
+          "denied_directories": 0
+        },
+        "walk_truncated": false,
+        "budget_incomplete": false,
+        "missing_truncated": false,
+        "deletions": "explicit_approval_only",
+        "scan": "registered_directory_only",
+        "plan_id": "84842bd21dcd214cd2f3d57334d6cebd9b051ed2a27d266b2df79375dd188163"
+      },
+      "tombstones": [
+        "document:227f54e9017cd4ddb8a88ec3f92ba13ab4e36200bd305568e4ac9d75223dd8e6"
+      ]
+    }
+  }
+]

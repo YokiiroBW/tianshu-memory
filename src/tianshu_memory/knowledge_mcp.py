@@ -103,6 +103,29 @@ def create_server(config_path, client, credential_env):
         """Read this registered client's recorded import outcome (not live URL freshness)."""
         return execute("status", project_id, {"key": key})
 
+    @server.tool(annotations=read)
+    def knowledge_directory_scan(project_id: str, directory: str) -> dict:
+        """Preview one operator-registered directory: paths, types, sizes, digests and current
+        index versions. Read-only; it imports nothing and never monitors a directory."""
+        return execute("directory_scan", project_id, {"directory": directory})
+
+    @server.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+        )
+    )
+    def knowledge_directory_apply(
+        project_id: str, key: str, plan: dict, tombstones: list[str]
+    ) -> dict:
+        """Confirm one issued preview exactly as shown. Changed files conflict instead of being
+        imported; a disappeared source is tombstoned only when its id is listed explicitly and
+        its original file is never deleted."""
+        return execute(
+            "directory_apply",
+            project_id,
+            {"key": key, "plan": plan, "tombstones": tombstones},
+        )
+
     @server.tool(annotations=write)
     def lesson_record(project_id: str, key: str, expected_version: int, lesson: dict) -> dict:
         """Record one project lesson with current source evidence; project-only, no sharing."""

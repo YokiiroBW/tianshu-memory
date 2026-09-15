@@ -1,0 +1,407 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tianshu:candidate:project-directory-import:1",
+  "title": "Registered directory import CLI envelope candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "operation",
+    "project_id",
+    "arguments"
+  ],
+  "properties": {
+    "operation": {
+      "enum": [
+        "directory_scan",
+        "directory_apply"
+      ]
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "arguments": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "directory_scan"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "directory"
+            ],
+            "properties": {
+              "directory": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "directory_apply"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "key",
+              "plan",
+              "tombstones"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "tombstones": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              },
+              "plan": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "plan_id",
+                  "project_id",
+                  "client",
+                  "directory",
+                  "registration",
+                  "revision",
+                  "issued_at",
+                  "limits",
+                  "items",
+                  "omitted",
+                  "missing",
+                  "counts",
+                  "walk_truncated",
+                  "budget_incomplete",
+                  "missing_truncated",
+                  "deletions",
+                  "scan"
+                ],
+                "properties": {
+                  "plan_id": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "project_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "client": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "directory": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "registration": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "issued_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "limits": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "max_files",
+                      "max_bytes",
+                      "file_bytes"
+                    ],
+                    "properties": {
+                      "max_files": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 256
+                      },
+                      "max_bytes": {
+                        "type": "integer",
+                        "minimum": 1024,
+                        "maximum": 8388608
+                      },
+                      "file_bytes": {
+                        "type": "integer",
+                        "const": 1048576
+                      }
+                    }
+                  },
+                  "items": {
+                    "type": "array",
+                    "maxItems": 256,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "locator",
+                        "kind",
+                        "media_type",
+                        "size",
+                        "digest",
+                        "source_id",
+                        "document_id",
+                        "version",
+                        "action"
+                      ],
+                      "properties": {
+                        "locator": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 2048
+                        },
+                        "kind": {
+                          "const": "file"
+                        },
+                        "media_type": {
+                          "enum": [
+                            "text/plain",
+                            "text/html"
+                          ]
+                        },
+                        "size": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 1048576
+                        },
+                        "digest": {
+                          "type": "string",
+                          "pattern": "^[a-f0-9]{64}$"
+                        },
+                        "source_id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "document_id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "version": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "action": {
+                          "enum": [
+                            "import",
+                            "unchanged"
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "omitted": {
+                    "type": "array",
+                    "maxItems": 128,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "locator",
+                        "reason",
+                        "size"
+                      ],
+                      "properties": {
+                        "locator": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 2048
+                        },
+                        "reason": {
+                          "enum": [
+                            "unsupported_type",
+                            "refused_name",
+                            "source_too_large",
+                            "unsupported_encoding",
+                            "empty_source",
+                            "unreadable",
+                            "source_changed",
+                            "file_budget",
+                            "byte_budget"
+                          ]
+                        },
+                        "size": {
+                          "oneOf": [
+                            {
+                              "type": "null"
+                            },
+                            {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 1048576
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "missing": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "locator",
+                        "document_id",
+                        "source_id",
+                        "version",
+                        "reason"
+                      ],
+                      "properties": {
+                        "locator": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 2048
+                        },
+                        "document_id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "source_id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "version": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "reason": {
+                          "enum": [
+                            "not_present",
+                            "not_scannable"
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "counts": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "indexed",
+                      "listed",
+                      "import",
+                      "unchanged",
+                      "unchanged_unlisted",
+                      "omitted",
+                      "omitted_unlisted",
+                      "missing",
+                      "links",
+                      "denied_directories"
+                    ],
+                    "properties": {
+                      "indexed": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "listed": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "import": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "unchanged": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "unchanged_unlisted": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "omitted": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "omitted_unlisted": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "missing": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "links": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "denied_directories": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    }
+                  },
+                  "walk_truncated": {
+                    "type": "boolean"
+                  },
+                  "budget_incomplete": {
+                    "type": "boolean"
+                  },
+                  "missing_truncated": {
+                    "type": "boolean"
+                  },
+                  "deletions": {
+                    "const": "explicit_approval_only"
+                  },
+                  "scan": {
+                    "const": "registered_directory_only"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

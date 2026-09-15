@@ -6,6 +6,7 @@ import http.client
 import json
 from pathlib import Path
 
+from . import knowledge_directories as directories
 from .domain import (
     Fault,
     canonical,
@@ -20,8 +21,12 @@ from .domain import (
 from .knowledge_sources import content_hash, decode, fetch_url, read_file
 from .store import Store
 
-READ = {"query", "recover", "check", "status"}
-WRITE = {"import", "delete", "write_state"}
+READ = {"query", "recover", "check", "status", "directory_scan"}
+WRITE = {"import", "delete", "write_state", "directory_apply"}
+# A preview is read-only: it may describe an uninitialized project, but only a successful
+# write ever creates the project row.
+DIRECTORY_OPERATIONS = {"directory_scan", "directory_apply"}
+PREVIEW_READS = {"directory_scan"}
 # The lesson book and the promoted experience book live in the same project domain but in
 # a separate module. Global promotion/review is its own explicit permission.
 LESSON_WRITE = {"lesson_record", "lesson_revise", "lesson_retire", "experience_withdraw"}
@@ -311,7 +316,13 @@ class KnowledgeApplication:
     def bump(db, project_id):
         KnowledgeApplication._bump(db, project_id)
 
-    def _context(self, client, credential, project_id, operation, evidence_projects=()):
+    def _authorize(self, client, credential, project_id, operation, evidence_projects=()):
+        """Read the private config and verify exactly what this dispatch is allowed to do.
+
+        Returns the registered project, the credential digest and the registered scan
+        directories. No database is opened here, so a long apply can re-check authorization
+        between its own transactions without taking the shared writer lock.
+        """
         config = strict_json(self.config_path.read_bytes())
         knowledge = config.get("knowledge", {})
         principal = knowledge.get("clients", {}).get(client, {})
@@ -363,6 +374,19 @@ class KnowledgeApplication:
                 "invalid_configuration",
                 503,
             )
+        # Only the directory operations read this section, so a malformed directory
+        # registration cannot break the chat-adjacent project operations.
+        scan = (
+            directories.registration(knowledge, project_id)
+            if operation in DIRECTORY_OPERATIONS
+            else []
+        )
+        return config, knowledge, principal, project, secret, scan
+
+    def _context(self, client, credential, project_id, operation, evidence_projects=()):
+        config, knowledge, principal, project, secret, scan = self._authorize(
+            client, credential, project_id, operation, evidence_projects
+        )
         store = Store(
             config["database_path"],
             recovery_path=config.get("source_sync", {}).get("recovery_path"),
@@ -375,7 +399,7 @@ class KnowledgeApplication:
         self.client = client
         self.projects = knowledge.get("projects", {})
         self.authorized_projects = authorized_projects(principal)
-        return store, project, secret
+        return store, project, secret, scan
 
     def execute(self, request, *, client, credential):
         exact(request, "operation project_id arguments")
@@ -392,9 +416,24 @@ class KnowledgeApplication:
         # read, so a refused operation cannot disclose whether a project or lesson exists.
         snapshot, factory, evidence = self._planner(operation)
         evidence_projects = tuple(evidence(args))
-        store, project, secret = self._context(
+        store, project, secret, scan = self._context(
             client, credential, project_id, operation, evidence_projects
         )
+        if operation in DIRECTORY_OPERATIONS:
+            # A directory preview and its confirmed apply re-verify every path themselves and
+            # run their slow reads outside any transaction, so they own their own phases.
+            return self._directory(
+                request,
+                operation,
+                project_id,
+                args,
+                client,
+                credential,
+                store,
+                project,
+                secret,
+                scan,
+            )
         sources = Sources(self, project_id, project)
         plan = factory(self, operation, project_id, project, args, sources)
 
@@ -423,14 +462,15 @@ class KnowledgeApplication:
         plan.external(project)
 
         # Re-read permissions/config outside the lock, then compare project state atomically.
-        current_store, current_project, current_secret = self._context(
+        current_store, current_project, current_secret, current_scan = self._context(
             client, credential, project_id, operation, evidence_projects
         )
         require(
             current_store.path == store.path
             and current_store.recovery_path == store.recovery_path
             and current_project == project
-            and current_secret == secret,
+            and current_secret == secret
+            and current_scan == scan,
             "registration_changed",
             409,
         )
@@ -504,7 +544,7 @@ class KnowledgeApplication:
         if registered:
             require(registered["registration"] == canonical(project), "registration_changed", 409)
         else:
-            require(operation in WRITE, "project_uninitialized", 409)
+            require(operation in WRITE or operation in PREVIEW_READS, "project_uninitialized", 409)
         return (registered["revision"] if registered else None), seal_key
 
     @staticmethod
@@ -523,6 +563,164 @@ class KnowledgeApplication:
             require(old["digest"] == fingerprint(request), "idempotency_conflict", 409)
             return dict(json.loads(old["result"]), replayed=True)
         return None
+
+    def _directory(
+        self, request, operation, project_id, args, client, credential, store, project, secret, scan
+    ):
+        """Preview or confirm one registered directory; slow reads never hold the writer lock."""
+        if operation == "directory_scan":
+            return self._directory_scan(
+                args, project_id, client, credential, store, project, secret, scan
+            )
+        return self._directory_apply(
+            request, args, project_id, client, credential, store, project, secret, scan
+        )
+
+    def _reauthorize(self, client, credential, project_id, project, secret, scan, operation):
+        """Re-read the private config outside the lock and refuse if authorization moved."""
+        _, current_project, current_secret, current_scan = self._context(
+            client, credential, project_id, operation
+        )
+        require(
+            current_project == project and current_secret == secret and current_scan == scan,
+            "registration_changed",
+            409,
+        )
+
+    @staticmethod
+    def _ensure_project(db, project_id, project):
+        """Register the project row on the first committed write; a preview never does this."""
+        db.execute(
+            "INSERT OR IGNORE INTO knowledge_projects(id,registration) VALUES (?,?)",
+            (project_id, canonical(project)),
+        )
+
+    def _directory_scan(self, args, project_id, client, credential, store, project, secret, scan):
+        """Capture the index, read the directory outside the lock, then record the preview.
+
+        The walk reads twice and validates the decoded text with the existing importer rules,
+        so the preview only offers sources an apply can really import. Only the plan itself is
+        written, and an incomplete walk or an exhausted budget is recorded as such instead of
+        being reported as a deletion.
+        """
+        directories.exact(args, "directory")
+        entry = directories.require_registration(scan, args["directory"])
+        with store.transaction() as db:
+            revision, _ = self._snapshot(db, project_id, project, client, secret, "directory_scan")
+            directories.require_schema(db)
+            indexed = directories.indexed_documents(db, project_id)
+        scanned = directories.scan(project, project_id, entry, indexed)
+        self._reauthorize(client, credential, project_id, project, secret, scan, "directory_scan")
+        with store.transaction() as db:
+            current, _ = self._snapshot(db, project_id, project, client, secret, "directory_scan")
+            require(current == revision, "project_conflict", 409)
+            require(
+                directories.versions(indexed)
+                == directories.versions(directories.indexed_documents(db, project_id)),
+                "project_conflict",
+                409,
+            )
+            body = directories.plan(project_id, client, entry, project, revision, scanned)
+            directories.store_plan(db, body)
+            return body
+
+    def _directory_apply(
+        self, request, args, project_id, client, credential, store, project, secret, scan
+    ):
+        """Confirm one issued preview item by item, each item in its own transaction.
+
+        The plan is re-checked against the recorded preview and the current registration, then
+        every file is re-read outside any transaction. An item whose path, bytes, size or current
+        index version moved becomes a conflict for that item alone, so a partial apply stays
+        honest: content the preview never showed is never imported, already imported content is
+        never written twice, and the recorded result can be read again after a restart.
+        """
+        directories.exact(args, "key plan tombstones")
+        string(args["key"], 128)
+        plan = directories.plan_shape(args["plan"])
+        require(plan["project_id"] == project_id and plan["client"] == client, "invalid_plan", 400)
+        require(plan["plan_id"] == directories.plan_fingerprint(plan), "invalid_plan", 400)
+        entry = directories.require_registration(scan, plan["directory"])
+        require(
+            plan["limits"]["max_files"] <= entry["max_files"]
+            and plan["limits"]["max_bytes"] <= entry["max_bytes"],
+            "registration_changed",
+            409,
+        )
+        approved = directories.tombstone_ids(args["tombstones"], plan)
+
+        with store.transaction() as db:
+            directories.require_schema(db)
+            replay = self._replay(db, request, client)
+            if replay is not None:
+                return replay
+            revision, _ = self._snapshot(db, project_id, project, client, secret, "directory_apply")
+            row = directories.stored_plan(db, client, project_id, plan["directory"])
+            require(row is not None, "plan_unissued", 404)
+            require(
+                row["plan_id"] == plan["plan_id"] and row["body"] == canonical(plan),
+                "plan_superseded",
+                409,
+            )
+            require(plan["registration"] == fingerprint(project), "registration_changed", 409)
+
+        observed = directories.observe(project, entry, plan)
+        self._reauthorize(client, credential, project_id, project, secret, scan, "directory_apply")
+
+        written = []
+        for item in plan["items"]:
+            # A long apply re-checks its own authorization before every write, so a config
+            # revoked mid-run cannot keep importing after earlier items already committed.
+            self._reauthorize(
+                client, credential, project_id, project, secret, scan, "directory_apply"
+            )
+            with store.transaction() as db:
+                written.append(
+                    directories.import_item(db, self, project_id, project, item, observed)
+                )
+        tombstones = []
+        for candidate in plan["missing"]:
+            if candidate["document_id"] not in approved:
+                # A disappearance is never a deletion unless the operator listed it explicitly.
+                tombstones.append({**candidate, "outcome": "not_approved"})
+                continue
+            self._reauthorize(
+                client, credential, project_id, project, secret, scan, "directory_apply"
+            )
+            with store.transaction() as db:
+                tombstones.append(
+                    directories.remove_source(db, self, project_id, candidate, observed)
+                )
+
+        items = [item for item in written if item["outcome"] != "conflict"]
+        conflicts = [item for item in written if item["outcome"] == "conflict"]
+        self._reauthorize(client, credential, project_id, project, secret, scan, "directory_apply")
+        with store.transaction() as db:
+            directories.require_schema(db)
+            replay = self._replay(db, request, client)
+            if replay is not None:
+                return replay
+            found = db.execute(
+                "SELECT revision FROM knowledge_projects WHERE id=?", (project_id,)
+            ).fetchone()
+            result = directories.applied_result(
+                project_id,
+                entry,
+                plan,
+                items,
+                conflicts,
+                tombstones,
+                found["revision"] if found else 0,
+            )
+            db.execute(
+                "INSERT INTO knowledge_operations VALUES (?,?,?,?)",
+                (client, args["key"], fingerprint(request), canonical(result)),
+            )
+            db.execute(
+                "INSERT INTO knowledge_imports VALUES (?,?,?,?,?)",
+                (client, args["key"], project_id, result["status"], canonical(result)),
+            )
+            return result
 
     def _dispatch(
         self, db, operation, project_id, project, args, seal_key, read, *, prepared, preview
@@ -611,9 +809,7 @@ class KnowledgeApplication:
                 "source_id": source_id,
                 "version": version,
             }
-        raw, media, resolved, text, units, digest = (
-            prepared[k] for k in ("raw", "media", "resolved", "text", "units", "digest")
-        )
+        units, digest = prepared["units"], prepared["digest"]
         if old and old["state"] == "ready":
             previous = db.execute(
                 "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
@@ -635,6 +831,36 @@ class KnowledgeApplication:
                     "hash": digest,
                 }
         version += 1
+        self._store_version(
+            db,
+            project_id,
+            document_id,
+            source_id,
+            args["kind"],
+            args["locator"],
+            prepared,
+            old,
+            version,
+        )
+        return {
+            "status": "imported",
+            "document_id": document_id,
+            "source_id": source_id,
+            "version": version,
+            "hash": digest,
+            "blocks": len(units),
+            "processing": "verbatim",
+        }
+
+    def _store_version(
+        self, db, project_id, document_id, source_id, kind, locator, prepared, old, version
+    ):
+        """Write one imported version with its blocks and index rows.
+
+        The caller owns the transaction. A directory apply reuses this so a confirmed preview
+        and a single explicit import produce identically shaped versions, provenance and
+        index rows; `old` is the current document row, or None for a first import.
+        """
         if old:
             db.execute(
                 "UPDATE knowledge_documents SET version=?,state='ready' WHERE id=?",
@@ -643,34 +869,36 @@ class KnowledgeApplication:
         else:
             db.execute(
                 "INSERT INTO knowledge_documents VALUES (?,?,?,?,?,?,?)",
-                (
-                    document_id,
-                    project_id,
-                    source_id,
-                    args["kind"],
-                    args["locator"],
-                    version,
-                    "ready",
-                ),
+                (document_id, project_id, source_id, kind, locator, version, "ready"),
             )
         provenance = {
-            "kind": args["kind"],
-            "locator": args["locator"],
-            "resolved": resolved,
+            "kind": kind,
+            "locator": locator,
+            "resolved": prepared["resolved"],
             "imported_at": utc(now()),
             "processing": "verbatim",
-            "citation_space": "visible_text_lines" if media == "text/html" else "text_lines",
+            "citation_space": (
+                "visible_text_lines" if prepared["media"] == "text/html" else "text_lines"
+            ),
         }
         db.execute(
             "INSERT INTO knowledge_versions VALUES (?,?,?,?,?,?,?)",
-            (document_id, version, digest, raw, text, media, canonical(provenance)),
+            (
+                document_id,
+                version,
+                prepared["digest"],
+                prepared["raw"],
+                prepared["text"],
+                prepared["media"],
+                canonical(provenance),
+            ),
         )
         db.execute(
             "DELETE FROM knowledge_index WHERE block_id IN "
             "(SELECT id FROM knowledge_blocks WHERE document_id=?)",
             (document_id,),
         )
-        for index, unit in enumerate(units):
+        for index, unit in enumerate(prepared["units"]):
             block_id = f"{document_id}:{version}:{index:03d}"
             db.execute(
                 "INSERT INTO knowledge_blocks VALUES (?,?,?,?)",
@@ -681,15 +909,6 @@ class KnowledgeApplication:
                 (block_id, project_id, prepared["index"][index]),
             )
         self._bump(db, project_id)
-        return {
-            "status": "imported",
-            "document_id": document_id,
-            "source_id": source_id,
-            "version": version,
-            "hash": digest,
-            "blocks": len(units),
-            "processing": "verbatim",
-        }
 
     def _delete(self, db, project_id, project, args, preview):
         exact(args, "key document_id expected_version")

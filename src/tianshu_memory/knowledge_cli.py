@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .domain import Fault, strict_json
 from .knowledge import KnowledgeApplication
+from .knowledge_directories_migration import migrate as migrate_directories
 from .knowledge_migration import migrate
 from .lessons_migration import migrate as migrate_lessons
 from .store import Store
@@ -22,6 +23,8 @@ def main():
     migration.add_argument("--backup", required=True)
     upgrade = commands.add_parser("migrate-lessons")
     upgrade.add_argument("--backup", required=True)
+    plans = commands.add_parser("migrate-directories")
+    plans.add_argument("--backup", required=True)
     for name in ("action", "mcp"):
         command = commands.add_parser(name)
         command.add_argument("--client", required=True)
@@ -30,17 +33,17 @@ def main():
             command.add_argument("file")
     args = parser.parse_args()
     try:
-        if args.command in {"migrate", "migrate-lessons"}:
+        if args.command in {"migrate", "migrate-lessons", "migrate-directories"}:
             config = strict_json(Path(args.config).read_bytes())
             store = Store(
                 config["database_path"],
                 recovery_path=config.get("source_sync", {}).get("recovery_path"),
             )
-            result = (
-                migrate(store, args.backup)
-                if args.command == "migrate"
-                else migrate_lessons(store, args.backup)
-            )
+            result = {
+                "migrate": migrate,
+                "migrate-lessons": migrate_lessons,
+                "migrate-directories": migrate_directories,
+            }[args.command](store, args.backup)
         elif args.command == "mcp":
             from .knowledge_mcp import create_server
 
@@ -55,7 +58,8 @@ def main():
                 strict_json(raw), client=args.client, credential=os.environ.get(args.credential_env)
             )
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        if result.get("status") == "failed":
+        # A partial directory apply is not success: some confirmed items were refused.
+        if result.get("status") in {"failed", "partial"}:
             raise SystemExit(1)
     except (Fault, OSError, sqlite3.Error, ValueError, KeyError, TypeError, ImportError) as error:
         code = error.code if isinstance(error, Fault) else "dependency_or_input_error"
