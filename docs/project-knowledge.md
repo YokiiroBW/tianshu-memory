@@ -106,6 +106,10 @@ URL 只支持 HTTPS 公网 443，逐跳精确允许列表、最多 3 次重定�
 
 删除策略是 `explicit_approval_only`：`missing` 只是候选，只有把该 `document_id` 明确列进 `tombstones` 才会写索引墓碑（版本+1、移出索引、项目 revision+1）；路径又出现时记 `present_again` 且不删除，未列出的记 `not_approved`。本服务任何路径都不会写入、移动或删除项目文件。结果（含逐项 outcome、conflicts、counts、remaining）持久记录在 `knowledge_operations` 与 `knowledge_imports`，可用原 key 通过 `status` 读回；同请求重放返回 `replayed` 的历史结果。键绑定在第一次读文件之前就已持久化，所以被拒绝的同键请求不会留下任何项目写入；未完成的绑定以 `in_progress` 呈现，只有完全相同的请求能续做。该结果的失效沿用既有语义：目录导入会增加 revision 与来源版本，因此旧 `recover` 包、`lesson_check` 与依赖这些来源的 `experience_check` 立即不再有效。
 
+## 项目接续包与工作目录事实核对（TS-083）
+
+`continuation_recover` 对一个**已登记工作目录**生成接续包（目标/约束/下一步、按提交绑定的最近验证、仓库历史、已索引摘要、少量完整资料单元与可追溯版本），`continuation_check` 在任何复用前重新观测该检出并给出裁决。登记段 `knowledge.worktrees.<project>`、只读 Git 采集器边界、验证绑定语义、字节预算与失败码见 [项目接续包与工作目录事实核对](project-continuation.md)。它复用 `recover`/`check`/`write_state` 与既有索引表，不新增迁移或项目数据库。
+
 ## MCP 与 Hermes
 
 MCP stdio 入口：

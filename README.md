@@ -4,6 +4,8 @@ TS-080 项目资料、显式写回、短恢复包与可选 MCP stdio 入口见 [
 
 TS-081 在其上追加有版本的项目错题本（触发/症状/原因/修正/验证/适用范围 + 当前来源证据）与**显式批准**的总经验：至少两个不同项目的有效错题证据、独立 `promote`/`review` 权限、来源撤权或修订后立即不可复用，只返回调用者授权的内容。见 [项目错题本与总经验](docs/project-lessons.md)。
 
+TS-083 追加项目接续包：对一个显式登记的独立工作目录只读核对 Git 仓库/分支/HEAD/脏状态与少量登记文件摘要，把仓库历史、已索引摘要与当前未提交事实分开呈现，并把“最近验证”绑定到实际观测到的提交；`continuation_check` 在切分支、新提交、新未提交改动或索引变化后立即判为失效。见 [项目接续包与工作目录事实核对](docs/project-continuation.md)。
+
 Python 人物与记忆服务，绑定已发布 text-dialogue/v1、profile-memory/v1 与 source-sync/v1 **1.0.0**。提供 SQLite/WAL、完整语义组预算检索、画像查询、修订/遗忘与候选幂等账本。TS-033 增加角色来源账本、物理否定传播、双 owner 读取屏障与真实 HTTPS 来源客户端。
 
 `source_sync` 模式经配置的 Core/Platform HTTPS 接口核验来源；`local_fixture` 保留隔离合成演示。实际测试包含合成 owner 经真实 HTTPS、Memory HTTP 与 SQLite 重启，不代表真实 Core/Platform 产品联合通过。TS-034 提供独立部署凭据认证的本地用户确认、画像批准/发布/撤销入口；未配置时仍不可用。Chat Audit、跨平台账号证明、PostgreSQL 与嵌入检索仍未接入。候选受理不自动生成记忆。
@@ -30,6 +32,12 @@ uv run pytest -q
 
 ```powershell
 $env:TIANSHU_CONTRACT_DIRECTORY = 'C:/YOKI/Codex/tianshu-peiban-bot/contracts/text-dialogue/v1'
+```
+
+项目接续的只读工作目录核对需要外部 Git 可执行文件：先看 `TIANSHU_GIT`，再看 `PATH` 上的 `git`，两者都没有时明确返回 `git_unavailable`（不回退、不伪成功）：
+
+```powershell
+$env:TIANSHU_GIT = 'C:/path/to/git.exe'   # 仅当 PATH 上没有 git 时需要
 ```
 
 运行时读取并核验发布目录 manifest 与其中所有摘要，不复制共享 schema，也不读取旧候选合同。本服务自己的测试会将合同形状的请求送进实际端点；主工作区 `contracts/validate.py` 不是这里的产品测试。

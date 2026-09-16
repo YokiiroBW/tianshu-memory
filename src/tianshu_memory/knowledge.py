@@ -4,9 +4,12 @@ import hashlib
 import hmac
 import http.client
 import json
+import re
 from pathlib import Path
 
+from . import knowledge_continuation as continuation
 from . import knowledge_directories as directories
+from . import knowledge_workdir as workdir
 from .domain import (
     Fault,
     canonical,
@@ -21,12 +24,31 @@ from .domain import (
 from .knowledge_sources import content_hash, decode, fetch_url, read_file
 from .store import Store
 
-READ = {"query", "recover", "check", "status", "directory_scan"}
+READ = {
+    "query",
+    "recover",
+    "check",
+    "status",
+    "directory_scan",
+    "continuation_recover",
+    "continuation_check",
+}
 WRITE = {"import", "delete", "write_state", "directory_apply"}
-# A preview is read-only: it may describe an uninitialized project, but only a successful
-# write ever creates the project row.
+# Continuation reads a registered working directory instead of a registered scan directory.
+# A state write only reads one when the caller declares a commit-bound verification, so the
+# section is validated for these operations and never guessed from the project root.
+CONTINUATION_OPERATIONS = {"continuation_recover", "continuation_check"}
+WORKTREE_OPERATIONS = CONTINUATION_OPERATIONS | {"write_state"}
+# A single state write may bind verifications to at most this many checkouts.
+MAX_BOUND_WORKTREES = 4
+# Stamping a declared verification adds its observed commit, branch, dirtiness and timestamp.
+STATE_LIMIT = 20480
+COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+# A preview is read-only: it may describe an uninitialized project, because a directory
+# preview and a checkout continuation both describe the operator's own files rather than
+# recorded project data. Only a successful write ever creates the project row.
 DIRECTORY_OPERATIONS = {"directory_scan", "directory_apply"}
-PREVIEW_READS = {"directory_scan"}
+PREVIEW_READS = {"directory_scan", "continuation_recover", "continuation_check"}
 # The lesson book and the promoted experience book live in the same project domain but in
 # a separate module. Global promotion/review is its own explicit permission.
 LESSON_WRITE = {"lesson_record", "lesson_revise", "lesson_retire", "experience_withdraw"}
@@ -205,6 +227,9 @@ class Sources:
         self.first_id = first_id
         self.project = project
         self.readers = {}
+        # The working directories this one dispatch may continue in, resolved once from the
+        # private configuration; nothing here is shared between dispatches.
+        self.worktrees = ()
 
     def reader(self, project_id):
         if project_id not in self.readers:
@@ -267,6 +292,7 @@ class Plan:
                 self.sources.bind(self.project_id, phase),
                 prepared=prepared,
                 preview=phase == "capture",
+                worktrees=self.sources.worktrees,
             )
         finally:
             # The captured expectations are what the external phase must read.
@@ -323,9 +349,10 @@ class KnowledgeApplication:
     def _authorize(self, client, credential, project_id, operation, evidence_projects=()):
         """Read the private config and verify exactly what this dispatch is allowed to do.
 
-        Returns the registered project, the credential digest and the registered scan
-        directories. No database is opened here, so a long apply can re-check authorization
-        between its own transactions without taking the shared writer lock.
+        Returns the registered project, the credential digest, the registered scan
+        directories and the working directories this client may continue in. No database is
+        opened here, so a long apply can re-check authorization between its own transactions
+        without taking the shared writer lock.
         """
         config = strict_json(self.config_path.read_bytes())
         knowledge = config.get("knowledge", {})
@@ -385,10 +412,17 @@ class KnowledgeApplication:
             if operation in DIRECTORY_OPERATIONS
             else []
         )
-        return config, knowledge, principal, project, secret, scan
+        # Continuation and a commit-bound state write read the registered working directories.
+        # An absent section simply means this project has none; a malformed one fails closed.
+        worktrees = (
+            workdir.registration(knowledge, project_id, client)
+            if operation in WORKTREE_OPERATIONS
+            else []
+        )
+        return config, knowledge, principal, project, secret, scan, worktrees
 
     def _context(self, client, credential, project_id, operation, evidence_projects=()):
-        config, knowledge, principal, project, secret, scan = self._authorize(
+        config, knowledge, principal, project, secret, scan, worktrees = self._authorize(
             client, credential, project_id, operation, evidence_projects
         )
         store = Store(
@@ -403,7 +437,7 @@ class KnowledgeApplication:
         self.client = client
         self.projects = knowledge.get("projects", {})
         self.authorized_projects = authorized_projects(principal)
-        return store, project, secret, scan
+        return store, project, secret, scan, worktrees
 
     def execute(self, request, *, client, credential):
         exact(request, "operation project_id arguments")
@@ -420,7 +454,7 @@ class KnowledgeApplication:
         # read, so a refused operation cannot disclose whether a project or lesson exists.
         snapshot, factory, evidence = self._planner(operation)
         evidence_projects = tuple(evidence(args))
-        store, project, secret, scan = self._context(
+        store, project, secret, scan, worktrees = self._context(
             client, credential, project_id, operation, evidence_projects
         )
         if operation in DIRECTORY_OPERATIONS:
@@ -439,6 +473,7 @@ class KnowledgeApplication:
                 scan,
             )
         sources = Sources(self, project_id, project)
+        sources.worktrees = worktrees
         plan = factory(self, operation, project_id, project, args, sources)
 
         # Phase 1 captures only project-related state, inside the transaction. No source I/O,
@@ -458,23 +493,29 @@ class KnowledgeApplication:
                 ).fetchone()
                 require(row is not None, "not_found", 404)
                 return json.loads(row[0])
-            plan(db, "capture", seal_key, client=client)
+            captured = plan(db, "capture", seal_key, client=client)
 
-        # Phase 2 does all slow work outside any transaction: imports fetch their source, and
-        # every referenced evidence file is re-read. No lock is held here.
-        prepared = self._prepare_import(project, args) if operation == "import" else None
+        # Phase 2 does all slow work outside any transaction: imports fetch their source, every
+        # referenced evidence file is re-read, and a registered working directory is observed
+        # with bounded read-only Git calls. No lock is held here.
+        prepared = None
+        if operation == "import":
+            prepared = self._prepare_import(project, args)
+        elif operation in WORKTREE_OPERATIONS:
+            prepared = self._observe(operation, captured, project_id, worktrees)
         plan.external(project)
 
         # Re-read permissions/config outside the lock, then compare project state atomically.
-        current_store, current_project, current_secret, current_scan = self._context(
-            client, credential, project_id, operation, evidence_projects
+        current_store, current_project, current_secret, current_scan, current_worktrees = (
+            self._context(client, credential, project_id, operation, evidence_projects)
         )
         require(
             current_store.path == store.path
             and current_store.recovery_path == store.recovery_path
             and current_project == project
             and current_secret == secret
-            and current_scan == scan,
+            and current_scan == scan
+            and current_worktrees == worktrees,
             "registration_changed",
             409,
         )
@@ -488,7 +529,7 @@ class KnowledgeApplication:
             require(
                 current_revision == revision and current_key == seal_key, "project_conflict", 409
             )
-            if revision is None:
+            if revision is None and operation in WRITE:
                 db.execute(
                     "INSERT INTO knowledge_projects(id,registration) VALUES (?,?)",
                     (project_id, canonical(project)),
@@ -608,7 +649,7 @@ class KnowledgeApplication:
 
     def _reauthorize(self, client, credential, project_id, project, secret, scan, operation):
         """Re-read the private config outside the lock and refuse if authorization moved."""
-        _, current_project, current_secret, current_scan = self._context(
+        _, current_project, current_secret, current_scan, _ = self._context(
             client, credential, project_id, operation
         )
         require(
@@ -772,15 +813,61 @@ class KnowledgeApplication:
             (client, key, project_id, recorded["status"], canonical(recorded)),
         )
 
+    def _observe(self, operation, captured, project_id, worktrees):
+        """Collect working-directory facts outside any transaction, after the capture phase.
+
+        A continuation package and a commit-bound verification both need the checkout as it is
+        now, so those reads happen here: between the two short transactions, never inside one.
+        A checkout that cannot be observed at all turns a check into an explicit verdict rather
+        than an error, while the same condition fails a recovery or a writeback closed.
+        """
+        if operation == "write_state":
+            entries = {entry["id"]: entry for entry in worktrees}
+            return {
+                "worktrees": {
+                    name: workdir.observe(entries[name], digests=False) for name in captured
+                }
+            }
+        entry = workdir.require_registration(worktrees, captured["worktree"])
+        try:
+            return {
+                "worktree": workdir.observe(entry, captured["indexed"]),
+                "indexed": captured["indexed"],
+            }
+        except Fault as error:
+            if operation != "continuation_check" or error.code not in continuation.UNOBSERVABLE:
+                raise
+            return {"settled": continuation.unavailable(project_id, entry["id"], error.code)}
+
     def _dispatch(
-        self, db, operation, project_id, project, args, seal_key, read, *, prepared, preview
+        self,
+        db,
+        operation,
+        project_id,
+        project,
+        args,
+        seal_key,
+        read,
+        *,
+        prepared,
+        preview,
+        worktrees=(),
     ):
         if operation == "import":
             return self._import(db, project_id, project, args, prepared, preview)
         if operation == "delete":
             return self._delete(db, project_id, project, args, preview)
         if operation == "write_state":
-            return self._write_state(db, project_id, project, args, read, preview)
+            return self._write_state(
+                db, project_id, project, args, read, preview, worktrees, prepared
+            )
+        if operation in CONTINUATION_OPERATIONS:
+            handler = (
+                continuation.recover if operation == "continuation_recover" else continuation.check
+            )
+            return handler(
+                self, db, project_id, project, args, seal_key, worktrees, read, prepared, preview
+            )
         if operation in {"query", "recover"}:
             exact(args, "text budget_bytes")
             if operation == "query":
@@ -1072,18 +1159,88 @@ class KnowledgeApplication:
         result["omissions"] = sorted(omitted)
         return result
 
-    def _write_state(self, db, project_id, project, args, read, preview):
+    def _bound_worktrees(self, state, worktrees):
+        """Validate every commit-bound verification and name the checkouts it refers to.
+
+        A declared verification may name a registered working directory instead of being a bare
+        sentence. That binding is checked here, before anything is written, so a state can never
+        claim a checkout the caller was not authorized for; the observed commit itself is
+        stamped in the serving phase, so a caller cannot declare a commit the service did not
+        see as HEAD.
+        """
+        bound = []
+        for item in state["recent_verification"]:
+            if isinstance(item, str):
+                continue
+            exact(item, "summary worktree commit")
+            string(item["summary"], 2000)
+            string(item["worktree"], 64)
+            require(
+                item["commit"] is None
+                or (isinstance(item["commit"], str) and COMMIT.match(item["commit"]) is not None),
+                "invalid_input",
+                400,
+            )
+            entry = workdir.require_registration(worktrees, item["worktree"])
+            if entry["id"] not in bound:
+                bound.append(entry["id"])
+        require(len(bound) <= MAX_BOUND_WORKTREES, "too_many_worktrees", 400)
+        return bound
+
+    @staticmethod
+    def _stamped_state(state, prepared):
+        """Replace every declared binding with the commit, branch and dirtiness actually seen.
+
+        The summary stays the operator's own words; the commit is never taken from the request.
+        A declared commit that is not the observed HEAD is refused, because that is exactly the
+        claim "this historical result verified this commit" that must never be recorded.
+        """
+        observed = (prepared or {}).get("worktrees", {})
+        stamped = []
+        for item in state["recent_verification"]:
+            if isinstance(item, str):
+                stamped.append(item)
+                continue
+            facts = observed.get(item["worktree"])
+            require(isinstance(facts, dict), "workdir_unavailable", 503)
+            require(
+                item["commit"] is None or item["commit"] == facts["head"],
+                "workdir_conflict",
+                409,
+            )
+            stamped.append(
+                {
+                    "summary": item["summary"],
+                    "worktree": item["worktree"],
+                    "commit": facts["head"],
+                    "branch": facts["branch"],
+                    "dirty": facts["dirty"],
+                    "declared_at": facts["collected_at"],
+                }
+            )
+        return {**state, "recent_verification": stamped}
+
+    def _write_state(
+        self, db, project_id, project, args, read, preview, worktrees=(), prepared=None
+    ):
+        """Store one explicit project state; a caller may bind a verification to a checkout."""
         exact(args, "key expected_version state")
         integer(args["expected_version"])
         state = args["state"]
         exact(state, "goal constraints recent_verification unfinished evidence pitfalls")
         string(state["goal"], 2000)
-        for field in ("constraints", "recent_verification", "unfinished"):
+        for field in ("constraints", "unfinished"):
             require(
                 isinstance(state[field], list) and len(state[field]) <= 16, "invalid_input", 400
             )
             for item in state[field]:
                 string(item, 2000)
+        require(
+            isinstance(state["recent_verification"], list)
+            and len(state["recent_verification"]) <= 16,
+            "invalid_input",
+            400,
+        )
         require(
             isinstance(state["evidence"], list) and 0 < len(state["evidence"]) <= 16,
             "evidence_required",
@@ -1107,6 +1264,7 @@ class KnowledgeApplication:
             )
             for reference in pitfall["evidence"]:
                 require(reference in state["evidence"], "evidence_required", 400)
+        bound = self._bound_worktrees(state, worktrees)
         require(len(canonical(state).encode()) <= 16384, "state_too_large", 413)
         old = db.execute(
             "SELECT version FROM knowledge_states WHERE project_id=?", (project_id,)
@@ -1114,15 +1272,17 @@ class KnowledgeApplication:
         version = old["version"] if old else 0
         require(version == args["expected_version"], "version_conflict", 409)
         if preview:
-            return None
+            return bound
+        stored = self._stamped_state(state, prepared)
+        require(len(canonical(stored).encode()) <= STATE_LIMIT, "state_too_large", 413)
         db.execute(
             "INSERT INTO knowledge_states VALUES (?,?,?) ON CONFLICT(project_id) "
             "DO UPDATE SET version=excluded.version,payload=excluded.payload",
-            (project_id, version + 1, canonical(state)),
+            (project_id, version + 1, canonical(stored)),
         )
         db.execute(
             "INSERT INTO knowledge_state_history VALUES (?,?,?)",
-            (project_id, version + 1, canonical(state)),
+            (project_id, version + 1, canonical(stored)),
         )
         self._bump(db, project_id)
         return {
@@ -1131,6 +1291,13 @@ class KnowledgeApplication:
             "state_version": version + 1,
             "authority": "explicit_project_note",
             "sharing": "project_only",
+            "verified_worktrees": sorted(
+                {
+                    item["worktree"]
+                    for item in stored["recent_verification"]
+                    if isinstance(item, dict)
+                }
+            ),
         }
 
     @staticmethod

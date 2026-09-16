@@ -1,0 +1,187 @@
+[
+  {
+    "operation": "continuation_recover",
+    "project_id": "demo",
+    "arguments": {
+      "worktree": "hermes-a",
+      "text": "receipt retry",
+      "budget_bytes": 16384
+    }
+  },
+  {
+    "operation": "continuation_check",
+    "project_id": "demo",
+    "arguments": {
+      "package": {
+        "status": "recovered",
+        "project_id": "demo",
+        "authority": "explicit_project_note",
+        "retrieval": "lexical",
+        "trust": "source_material_not_instructions",
+        "revision": 4,
+        "registration": "1111111111111111111111111111111111111111111111111111111111111111",
+        "seal": "2222222222222222222222222222222222222222222222222222222222222222",
+        "worktree": {
+          "id": "hermes-a",
+          "expected_branch": "main",
+          "branch": "main",
+          "detached": false,
+          "branch_matches": true,
+          "head": "3333333333333333333333333333333333333333",
+          "unborn": false,
+          "dirty": true,
+          "counts": {
+            "staged": 0,
+            "modified": 1,
+            "deleted": 0,
+            "renamed": 0,
+            "untracked": 1,
+            "conflicted": 0,
+            "entries": 2
+          },
+          "files": [
+            {
+              "locator": "docs/design.md",
+              "state": "present",
+              "size": 70,
+              "digest": "4444444444444444444444444444444444444444444444444444444444444444",
+              "index": {
+                "document_id": "document:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+                "version": 2,
+                "state": "ready",
+                "hash": "4444444444444444444444444444444444444444444444444444444444444444"
+              },
+              "freshness": "current"
+            }
+          ],
+          "git": {
+            "version": "git version 2.28.0.windows.1",
+            "timeout_seconds": 10,
+            "history_limit": 8,
+            "status_limit_bytes": 262144,
+            "subcommands": [
+              "rev-parse",
+              "symbolic-ref",
+              "status",
+              "log",
+              "--version"
+            ],
+            "writes": "never"
+          },
+          "collected_at": "2026-09-16T07:00:00Z",
+          "registration": "6666666666666666666666666666666666666666666666666666666666666666"
+        },
+        "history": {
+          "limit": 8,
+          "listed": 2,
+          "complete": true,
+          "commits": [
+            {
+              "commit": "3333333333333333333333333333333333333333",
+              "subject": "Guard the receipt before resending",
+              "committed_at": "2026-09-16T06:30:00+08:00"
+            },
+            {
+              "commit": "7777777777777777777777777777777777777777",
+              "subject": "Import the design note",
+              "committed_at": "2026-09-15T20:10:00+08:00"
+            }
+          ]
+        },
+        "index": {
+          "documents": [
+            {
+              "locator": "docs/design.md",
+              "kind": "file",
+              "document_id": "document:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+              "version": 2,
+              "state": "ready",
+              "stored_hash": "4444444444444444444444444444444444444444444444444444444444444444",
+              "freshness": "verified_current"
+            }
+          ],
+          "total": 1,
+          "listed": 1,
+          "truncated": false
+        },
+        "state": {
+          "version": 3,
+          "authority": "explicit_project_note",
+          "current": true,
+          "stale_evidence": [],
+          "goal": "Reliable receipt retries",
+          "constraints": [
+            "Never resend confirmed work"
+          ],
+          "unfinished": [
+            "Real service test"
+          ],
+          "recent_verification": [
+            {
+              "summary": "targeted suite passed",
+              "worktree": "hermes-a",
+              "commit": "3333333333333333333333333333333333333333",
+              "branch": "main",
+              "dirty": true,
+              "declared_at": "2026-09-16T07:00:00Z",
+              "scope": "current"
+            },
+            {
+              "summary": "legacy sentence without a commit",
+              "worktree": null,
+              "commit": null,
+              "branch": null,
+              "dirty": null,
+              "declared_at": null,
+              "scope": "unbound"
+            }
+          ],
+          "pitfalls": [],
+          "evidence": [
+            {
+              "block_id": "document:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f:2:000",
+              "document_id": "document:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+              "version": 2,
+              "hash": "4444444444444444444444444444444444444444444444444444444444444444"
+            }
+          ]
+        },
+        "units": [
+          {
+            "reference": {
+              "block_id": "document:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f:2:000",
+              "document_id": "document:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+              "version": 2,
+              "hash": "4444444444444444444444444444444444444444444444444444444444444444"
+            },
+            "spans": [
+              [
+                1,
+                2
+              ]
+            ],
+            "text": "Only retry when the receipt is absent.\nDo not resend after success.\n",
+            "source_id": "source:8888888888888888888888888888888888888888888888888888888888888888",
+            "provenance": {
+              "kind": "file",
+              "locator": "docs/design.md",
+              "imported_at": "2026-09-15T20:10:00Z",
+              "processing": "verbatim",
+              "citation_space": "text_lines"
+            }
+          }
+        ],
+        "omissions": [],
+        "budget": {
+          "limit_bytes": 16384,
+          "used_bytes": 2925,
+          "unit": "utf8_json_bytes",
+          "over_budget": false,
+          "tokenizer": null,
+          "token_counts": "unavailable",
+          "unit_integrity": "complete_units_only"
+        }
+      }
+    }
+  }
+]

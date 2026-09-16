@@ -1,0 +1,884 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tianshu:candidate:project-continuation:1",
+  "title": "Project continuation CLI envelope candidate",
+  "description": "One explicit continuation operation against an operator-registered working directory. The package is what a coding agent checks before reusing a cached continuation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "operation",
+    "project_id",
+    "arguments"
+  ],
+  "properties": {
+    "operation": {
+      "enum": [
+        "continuation_recover",
+        "continuation_check"
+      ]
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "arguments": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "continuation_recover"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "worktree",
+              "text",
+              "budget_bytes"
+            ],
+            "properties": {
+              "worktree": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              "budget_bytes": {
+                "type": "integer",
+                "minimum": 4096,
+                "maximum": 32768
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "continuation_check"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "package"
+            ],
+            "properties": {
+              "package": {
+                "$ref": "#/$defs/package"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "block_id",
+        "document_id",
+        "version",
+        "hash"
+      ],
+      "properties": {
+        "block_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "document_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reference",
+        "spans",
+        "text",
+        "source_id",
+        "provenance"
+      ],
+      "properties": {
+        "reference": {
+          "$ref": "#/$defs/reference"
+        },
+        "spans": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "provenance": {
+          "type": "object"
+        }
+      }
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "project_id",
+        "authority",
+        "retrieval",
+        "trust",
+        "worktree",
+        "history",
+        "index",
+        "state",
+        "units",
+        "omissions",
+        "budget",
+        "revision",
+        "registration",
+        "seal"
+      ],
+      "properties": {
+        "status": {
+          "const": "recovered"
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "authority": {
+          "const": "explicit_project_note"
+        },
+        "retrieval": {
+          "const": "lexical"
+        },
+        "trust": {
+          "const": "source_material_not_instructions"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "registration": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "seal": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "worktree": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "expected_branch",
+            "branch",
+            "detached",
+            "branch_matches",
+            "head",
+            "unborn",
+            "dirty",
+            "counts",
+            "files",
+            "git",
+            "collected_at",
+            "registration"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "expected_branch": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "branch": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              ]
+            },
+            "detached": {
+              "type": "boolean"
+            },
+            "branch_matches": {
+              "type": "boolean"
+            },
+            "head": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{40}$"
+                }
+              ]
+            },
+            "unborn": {
+              "type": "boolean"
+            },
+            "dirty": {
+              "type": "boolean"
+            },
+            "counts": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "staged",
+                "modified",
+                "deleted",
+                "renamed",
+                "untracked",
+                "conflicted",
+                "entries"
+              ],
+              "properties": {
+                "staged": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "modified": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "deleted": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "renamed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "untracked": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "conflicted": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "entries": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "files": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "locator",
+                  "state",
+                  "size",
+                  "digest",
+                  "index",
+                  "freshness"
+                ],
+                "properties": {
+                  "locator": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "state": {
+                    "enum": [
+                      "present",
+                      "missing",
+                      "unreadable",
+                      "changed",
+                      "too_large"
+                    ]
+                  },
+                  "size": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    ]
+                  },
+                  "digest": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$"
+                      }
+                    ]
+                  },
+                  "index": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "document_id",
+                          "version",
+                          "state",
+                          "hash"
+                        ],
+                        "properties": {
+                          "document_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 256
+                          },
+                          "version": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "state": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 32
+                          },
+                          "hash": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$"
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  "freshness": {
+                    "enum": [
+                      "current",
+                      "changed",
+                      "unindexed"
+                    ]
+                  }
+                }
+              }
+            },
+            "git": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "version",
+                "timeout_seconds",
+                "history_limit",
+                "status_limit_bytes",
+                "subcommands",
+                "writes"
+              ],
+              "properties": {
+                "version": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "timeout_seconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 120
+                },
+                "history_limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 64
+                },
+                "status_limit_bytes": {
+                  "type": "integer",
+                  "minimum": 1024
+                },
+                "subcommands": {
+                  "type": "array",
+                  "items": {
+                    "enum": [
+                      "rev-parse",
+                      "symbolic-ref",
+                      "status",
+                      "log",
+                      "--version"
+                    ]
+                  }
+                },
+                "writes": {
+                  "const": "never"
+                }
+              }
+            },
+            "collected_at": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "registration": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "history": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "limit",
+            "listed",
+            "complete",
+            "commits"
+          ],
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64
+            },
+            "listed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 64
+            },
+            "complete": {
+              "type": "boolean"
+            },
+            "commits": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "commit",
+                  "subject",
+                  "committed_at"
+                ],
+                "properties": {
+                  "commit": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{40}$"
+                  },
+                  "subject": {
+                    "type": "string",
+                    "maxLength": 512
+                  },
+                  "committed_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  }
+                }
+              }
+            }
+          }
+        },
+        "index": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "documents",
+            "total",
+            "listed",
+            "truncated"
+          ],
+          "properties": {
+            "documents": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "locator",
+                  "kind",
+                  "document_id",
+                  "version",
+                  "state",
+                  "stored_hash",
+                  "freshness"
+                ],
+                "properties": {
+                  "locator": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "kind": {
+                    "const": "file"
+                  },
+                  "document_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "version": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "state": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32
+                  },
+                  "stored_hash": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "freshness": {
+                    "enum": [
+                      "verified_current",
+                      "verified_changed",
+                      "unverified"
+                    ]
+                  }
+                }
+              }
+            },
+            "total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "listed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 64
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        },
+        "state": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "version",
+                "authority",
+                "current",
+                "stale_evidence",
+                "goal",
+                "constraints",
+                "unfinished",
+                "recent_verification",
+                "pitfalls",
+                "evidence"
+              ],
+              "properties": {
+                "version": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "authority": {
+                  "const": "explicit_project_note"
+                },
+                "current": {
+                  "type": "boolean"
+                },
+                "stale_evidence": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": {
+                    "$ref": "#/$defs/reference"
+                  }
+                },
+                "goal": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2000
+                },
+                "constraints": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "unfinished": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "recent_verification": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "summary",
+                      "worktree",
+                      "commit",
+                      "branch",
+                      "dirty",
+                      "declared_at",
+                      "scope"
+                    ],
+                    "properties": {
+                      "summary": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000
+                      },
+                      "worktree": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 64
+                          }
+                        ]
+                      },
+                      "commit": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{40}$"
+                          }
+                        ]
+                      },
+                      "branch": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 256
+                          }
+                        ]
+                      },
+                      "dirty": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      },
+                      "declared_at": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 64
+                          }
+                        ]
+                      },
+                      "scope": {
+                        "enum": [
+                          "current",
+                          "historical_commit",
+                          "workdir_changed",
+                          "other_worktree",
+                          "unbound"
+                        ]
+                      }
+                    }
+                  }
+                },
+                "pitfalls": {
+                  "type": "array",
+                  "maxItems": 8,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "trigger",
+                      "symptom",
+                      "cause",
+                      "correction",
+                      "verification",
+                      "evidence"
+                    ],
+                    "properties": {
+                      "trigger": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000
+                      },
+                      "symptom": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000
+                      },
+                      "cause": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000
+                      },
+                      "correction": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000
+                      },
+                      "verification": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000
+                      },
+                      "evidence": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 16,
+                        "items": {
+                          "$ref": "#/$defs/reference"
+                        }
+                      }
+                    }
+                  }
+                },
+                "evidence": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 16,
+                  "items": {
+                    "$ref": "#/$defs/reference"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "units": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/unit"
+          }
+        },
+        "omissions": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "limit_bytes",
+            "used_bytes",
+            "unit",
+            "over_budget",
+            "tokenizer",
+            "token_counts",
+            "unit_integrity"
+          ],
+          "properties": {
+            "limit_bytes": {
+              "type": "integer",
+              "minimum": 4096,
+              "maximum": 32768
+            },
+            "used_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "unit": {
+              "const": "utf8_json_bytes"
+            },
+            "over_budget": {
+              "type": "boolean"
+            },
+            "tokenizer": {
+              "type": "null"
+            },
+            "token_counts": {
+              "const": "unavailable"
+            },
+            "unit_integrity": {
+              "const": "complete_units_only"
+            }
+          }
+        }
+      }
+    }
+  }
+}

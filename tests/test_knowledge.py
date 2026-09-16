@@ -391,9 +391,10 @@ def test_cli_and_official_sdk_stdio_roundtrip(knowledge):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = await session.list_tools()
-                # Seven project-knowledge tools, eleven lesson/experience tools of TS-081 and
-                # the two registered-directory tools of TS-082.
-                assert len(tools.tools) == 20
+                # Seven project-knowledge tools, eleven lesson/experience tools of TS-081,
+                # the two registered-directory tools of TS-082 and the two continuation
+                # tools of TS-083.
+                assert len(tools.tools) == 22
                 names = {tool.name for tool in tools.tools}
                 assert {
                     "knowledge_query",
@@ -403,6 +404,8 @@ def test_cli_and_official_sdk_stdio_roundtrip(knowledge):
                     "experience_check",
                     "knowledge_directory_scan",
                     "knowledge_directory_apply",
+                    "knowledge_continuation_recover",
+                    "knowledge_continuation_check",
                 } <= names
                 response = await session.call_tool(
                     "knowledge_query",

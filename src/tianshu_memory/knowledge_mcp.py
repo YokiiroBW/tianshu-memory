@@ -104,6 +104,27 @@ def create_server(config_path, client, credential_env):
         return execute("status", project_id, {"key": key})
 
     @server.tool(annotations=read)
+    def knowledge_continuation_recover(
+        project_id: str, worktree: str, text: str, budget_bytes: int = 16384
+    ) -> dict:
+        """Continue one operator-registered working directory: current branch, HEAD, dirty
+        state, registered file digests, bounded repository history, indexed documents, the
+        declared goal/constraints/verifications/next steps and whole material units. Read-only;
+        check the package before reusing a cached copy."""
+        return execute(
+            "continuation_recover",
+            project_id,
+            {"worktree": worktree, "text": text, "budget_bytes": budget_bytes},
+        )
+
+    @server.tool(annotations=read)
+    def knowledge_continuation_check(project_id: str, package: dict) -> dict:
+        """Validate an issued continuation package against the checkout it names: a branch
+        switch, a new commit, new uncommitted changes, a changed registered file or a moved
+        index invalidates it instead of being silently reused."""
+        return execute("continuation_check", project_id, {"package": package})
+
+    @server.tool(annotations=read)
     def knowledge_directory_scan(project_id: str, directory: str) -> dict:
         """Preview one operator-registered directory: paths, types, sizes, digests and current
         index versions. Read-only; it imports nothing and never monitors a directory."""
