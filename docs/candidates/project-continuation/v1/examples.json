@@ -39,6 +39,12 @@
             "conflicted": 0,
             "entries": 2
           },
+          "changes": {
+            "mode": "stat_only",
+            "entries": 2,
+            "complete": true,
+            "fingerprint": "5555555555555555555555555555555555555555555555555555555555555555"
+          },
           "files": [
             {
               "locator": "docs/design.md",
@@ -60,11 +66,15 @@
             "history_limit": 8,
             "status_limit_bytes": 262144,
             "subcommands": [
-              "rev-parse",
-              "symbolic-ref",
-              "status",
+              "--version",
+              "config",
               "log",
-              "--version"
+              "rev-parse",
+              "status",
+              "symbolic-ref"
+            ],
+            "helpers": [
+              "lfs"
             ],
             "writes": "never"
           },
@@ -124,6 +134,7 @@
               "branch": "main",
               "dirty": true,
               "declared_at": "2026-09-16T07:00:00Z",
+              "facts": "8888888888888888888888888888888888888888888888888888888888888888",
               "scope": "current"
             },
             {
@@ -133,6 +144,7 @@
               "branch": null,
               "dirty": null,
               "declared_at": null,
+              "facts": null,
               "scope": "unbound"
             }
           ],

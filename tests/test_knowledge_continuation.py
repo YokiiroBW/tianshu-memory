@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from threading import Event
 
@@ -694,6 +695,136 @@ def test_check_follows_branch_head_and_uncommitted_truth(checkouts):
     assert checkouts.check(moved)["reason"] == "head_changed"
 
 
+def test_a_second_edit_with_identical_counts_is_never_still_valid(checkouts):
+    """The coordinator's reproduction: dirty, recover, edit again, same counts, same HEAD.
+
+    A tracked file that is not on the registered digest list used to be invisible to a check:
+    the counts, the dirty flag and HEAD all stayed equal, so an old package kept answering
+    `valid`. The observation now carries a bounded stat fingerprint of the changed set, so a
+    second edit is a difference, and a state that cannot be compared is never called current.
+    """
+    imported(checkouts)
+    (checkouts.first / "src/app.py").write_bytes(b"print('change one')\n")
+    package = checkouts.recover()
+    assert package["worktree"]["counts"]["modified"] == 1
+    assert package["worktree"]["changes"]["complete"] is True
+    assert checkouts.check(package)["valid"] is True
+    # Same size, same counts, same HEAD: only the content changed.
+    (checkouts.first / "src/app.py").write_bytes(b"print('change two')\n")
+    assert checkouts.check(package)["valid"] is False
+    answer = checkouts.check(package)
+    assert answer["reason"] == "workdir_unproven"
+    assert answer["differences"] == ["workdir_unproven"]
+    moved = checkouts.recover()
+    assert (
+        moved["worktree"]["changes"]["fingerprint"] != package["worktree"]["changes"]["fingerprint"]
+    )
+    assert checkouts.check(moved)["valid"] is True
+    # A different size, still one modified entry, is a difference on any filesystem.
+    (checkouts.first / "src/app.py").write_bytes(b"print('change three, longer')\n")
+    assert checkouts.check(moved)["reason"] == "workdir_unproven"
+    assert checkouts.check(checkouts.recover())["valid"] is True
+
+
+def test_a_bound_verification_is_never_current_after_a_further_edit(checkouts):
+    """A verification is stamped with the whole observable state, not with HEAD and a flag."""
+    imported(checkouts)
+    head = checkouts.head()
+    (checkouts.first / "src/app.py").write_bytes(b"print('first draft')\n")
+    checkouts.write(checkouts.state(recent_verification=[bound(commit=head)]))
+    current = checkouts.recover()["state"]["recent_verification"][0]
+    assert current["scope"] == "current" and current["dirty"] is True
+    assert current["facts"] is not None
+    # Same HEAD, same dirty flag, same counts: the checkout is not the one that was verified.
+    (checkouts.first / "src/app.py").write_bytes(b"print('second pass')\n")
+    stale = checkouts.recover()["state"]["recent_verification"][0]
+    assert stale["scope"] == "workdir_changed"
+    assert stale["commit"] == current["commit"] and stale["dirty"] is True
+
+
+def test_a_registered_digest_change_invalidates_a_bound_verification(checkouts):
+    """A verified clean checkout stops being current when a registered file changes."""
+    imported(checkouts)
+    checkouts.write(checkouts.state(recent_verification=[bound(commit=checkouts.head())]))
+    stamped = checkouts.recover()["state"]["recent_verification"][0]
+    assert stamped["scope"] == "current" and stamped["dirty"] is False
+    (checkouts.first / "docs/design.md").write_bytes(b"Only retry when the receipt is absent.\n")
+    stale = checkouts.recover()["state"]["recent_verification"][0]
+    assert stale["scope"] == "workdir_changed"
+    assert stale["dirty"] is False, "the record still says how it was declared"
+    # Restoring the registered bytes puts the checkout back in the state that was verified, so
+    # the record is current again: the scope is about the checkout, not a permanent poisoning of
+    # the note. (The package's own evidence reference was stale while the file differed.)
+    (checkouts.first / "docs/design.md").write_bytes(DESIGN.encode())
+    restored = checkouts.recover()
+    assert restored["state"]["recent_verification"][0]["scope"] == "current"
+    assert checkouts.check(restored)["valid"] is True
+
+
+def test_a_verification_without_a_stamped_fingerprint_is_never_assumed_current():
+    """A record that cannot be compared is `workdir_unproven`, never silently current."""
+    from tianshu_memory import knowledge_continuation as continuation
+
+    facts = {
+        "id": "agent-a",
+        "head": "a" * 40,
+        "unborn": False,
+        "branch": "main",
+        "detached": False,
+        "dirty": True,
+        "counts": dict.fromkeys(workdir.COUNT_KEYS, 1),
+        "changes": {
+            "mode": workdir.CHANGE_MODE,
+            "entries": 1,
+            "complete": True,
+            "fingerprint": "b" * 64,
+        },
+        "files": [],
+    }
+    legacy = {
+        "summary": "recorded before fingerprints existed",
+        "worktree": "agent-a",
+        "commit": "a" * 40,
+        "branch": "main",
+        "dirty": True,
+        "declared_at": "2026-09-16T00:00:00Z",
+    }
+    assert continuation.scoped(legacy, facts)["scope"] == "workdir_unproven"
+    # Only a checkout with nothing uncommitted is provable without a fingerprint: its content is
+    # exactly the recorded commit.
+    facts["dirty"] = False
+    facts["counts"] = dict.fromkeys(workdir.COUNT_KEYS, 0)
+    assert continuation.scoped(legacy, facts)["scope"] == "current"
+    facts["dirty"] = True
+    facts["changes"]["complete"] = False
+    assert continuation.scoped(legacy, facts)["scope"] == "workdir_unproven"
+
+
+def test_a_checkout_too_large_to_describe_never_claims_currency(checkouts):
+    """Past the changed-entry cap the state is incomplete, so nothing may pass as proved."""
+    imported(checkouts)
+    crowded = checkouts.first / "crowd"
+    crowded.mkdir()
+    for index in range(workdir.CHANGE_LIMIT + 1):
+        (crowded / f"note-{index}.md").write_bytes(b"x\n")
+    git(checkouts.first, "add", "crowd")
+    checkouts.commit(message="Crowd the checkout", allow_empty=False)
+    for index in range(workdir.CHANGE_LIMIT + 1):
+        (crowded / f"note-{index}.md").write_bytes(b"y\n")
+    package = checkouts.recover()
+    changes = package["worktree"]["changes"]
+    assert changes["complete"] is False and changes["entries"] == workdir.CHANGE_LIMIT + 1
+    assert package["worktree"]["counts"]["modified"] == workdir.CHANGE_LIMIT + 1
+    answer = checkouts.check(package)
+    assert answer["valid"] is False and answer["reason"] == "workdir_unproven"
+    # A verification cannot be bound to a checkout whose state cannot be described completely.
+    with pytest.raises(Fault, match="workdir_unproven"):
+        checkouts.write(checkouts.state(recent_verification=[bound(commit=checkouts.head())]))
+    git(checkouts.first, "add", "crowd")
+    checkouts.commit(message="Commit the crowd", allow_empty=False)
+    assert checkouts.check(checkouts.recover())["valid"] is True
+
+
 def test_check_rejects_index_and_revision_drift(checkouts):
     imported(checkouts)
     package = checkouts.recover()
@@ -840,6 +971,135 @@ def test_repository_configured_helper_is_never_run(checkouts):
     assert marker.exists() is False
 
 
+def clean_filter(checkouts, marker_name="clean-filter-marker.txt"):
+    """A repository that makes Git run a program while comparing content, plus its marker."""
+    (checkouts.first / ".gitattributes").write_bytes(b"src/app.py filter=probe\n")
+    git(
+        checkouts.first,
+        "config",
+        "filter.probe.clean",
+        f"echo EXECUTED > {marker_name}; cat",
+    )
+    # A same-size edit of a tracked file that is *not* one of the registered digests. Only a
+    # real content comparison can see it, which is exactly what makes Git run the clean filter.
+    (checkouts.first / "src/app.py").write_bytes(b"print('changed')\n")
+    return checkouts.first / marker_name
+
+
+def plain_status(path):
+    """The checkout's own `git status`, which is allowed to run whatever the repository says."""
+    return subprocess.run(
+        [git_path(), "-c", "core.autocrlf=false", "-C", str(path), "status", "--porcelain=v1"],
+        capture_output=True,
+        timeout=60,
+    )
+
+
+def test_a_repository_clean_filter_is_never_executed(checkouts, monkeypatch):
+    """A `.gitattributes` filter is a repository program: a read-only read never runs it.
+
+    This is the coordinator's reproduction. The control call below proves the fixture really
+    makes Git execute a repository-configured program, so the assertions after it are about the
+    collector's neutralization and not about a filter that was never reachable.
+    """
+    marker = clean_filter(checkouts)
+    control = plain_status(checkouts.first)
+    assert control.returncode == 0 and b"M src/app.py" in control.stdout, control.stdout
+    assert marker.exists(), "the fixture filter never ran, so this test would prove nothing"
+    marker.unlink()
+    commands = []
+    real_command = workdir.command
+
+    def spy(entry, *arguments, guard=()):
+        commands.append(real_command(entry, *arguments, guard=guard))
+        return real_command(entry, *arguments, guard=guard)
+
+    monkeypatch.setattr(workdir, "command", spy)
+    imported(checkouts)
+    package = checkouts.recover()
+    assert package["worktree"]["counts"]["modified"] == 1
+    assert "probe" in package["worktree"]["git"]["helpers"]
+    assert marker.exists() is False
+    assert checkouts.check(package)["valid"] is True
+    assert marker.exists() is False
+    flattened = [argument for command in commands for argument in command]
+    # The guard is not an accident of the configuration: every call carries the override that
+    # disables the discovered driver in both directions and its long-running process form.
+    for expected in (
+        "filter.probe.clean=",
+        "filter.probe.process=",
+        "filter.probe.smudge=",
+        "filter.probe.required=false",
+    ):
+        assert expected in flattened, expected
+    assert "core.fsmonitor=false" in flattened
+
+
+def test_a_repository_process_filter_is_never_executed(checkouts):
+    """The `process` form is preferred by Git when it exists, so it must be neutralized too."""
+    marker = checkouts.first / "process-filter-marker.txt"
+    (checkouts.first / ".gitattributes").write_bytes(b"src/app.py filter=probe\n")
+    git(
+        checkouts.first,
+        "config",
+        "filter.probe.process",
+        "echo PROCESS > process-filter-marker.txt; cat",
+    )
+    (checkouts.first / "src/app.py").write_bytes(b"print('changed')\n")
+    assert plain_status(checkouts.first).returncode == 0
+    assert marker.exists(), "the fixture process filter never ran, so this proves nothing"
+    marker.unlink()
+    imported(checkouts)
+    package = checkouts.recover()
+    assert package["worktree"]["counts"]["modified"] == 1
+    checkouts.check(package)
+    assert marker.exists() is False
+
+
+def test_an_inherited_git_configuration_cannot_install_a_helper(checkouts, monkeypatch):
+    """No inherited `GIT_*` variable may define a program for a read-only call to run."""
+    marker = checkouts.first / "environment-marker.txt"
+    (checkouts.first / ".gitattributes").write_bytes(b"src/app.py filter=probe\n")
+    (checkouts.first / "src/app.py").write_bytes(b"print('changed')\n")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "filter.probe.clean")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "echo EXECUTED > environment-marker.txt; cat")
+    imported(checkouts)
+    package = checkouts.recover()
+    assert marker.exists() is False
+    assert package["worktree"]["counts"]["modified"] == 1
+    # The inherited definition is invisible to the collector: it is neither listed as a driver
+    # that had to be neutralized nor able to run.
+    assert "probe" not in package["worktree"]["git"]["helpers"]
+
+
+def test_output_caps_stop_the_child_instead_of_buffering_it(checkouts, tmp_path, monkeypatch):
+    """Both pipes are capped while the child runs, so a flooding process is killed at the cap."""
+    tools = tmp_path / "caps"
+    tools.mkdir()
+    flood = tools / "flood-git.cmd"
+    flood.write_text(
+        "@echo off\r\n:loop\r\necho xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\ngoto loop\r\n",
+        encoding="ascii",
+    )
+    monkeypatch.setenv(workdir.GIT_ENVIRONMENT_VARIABLE, str(flood))
+    started = time.monotonic()
+    with pytest.raises(Fault, match="workdir_output_too_large"):
+        checkouts.recover()
+    assert time.monotonic() - started < workdir.TIMEOUT_SECONDS, "the cap, not the deadline"
+    # Standard error is capped as well: it used to be collected without a bound at all.
+    noisy = tools / "noisy-stderr-git.cmd"
+    noisy.write_text(
+        "@echo off\r\n:loop\r\necho yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy 1>&2\r\ngoto loop\r\n",
+        encoding="ascii",
+    )
+    monkeypatch.setenv(workdir.GIT_ENVIRONMENT_VARIABLE, str(noisy))
+    started = time.monotonic()
+    with pytest.raises(Fault, match="workdir_output_too_large"):
+        checkouts.recover()
+    assert time.monotonic() - started < workdir.TIMEOUT_SECONDS, "the cap, not the deadline"
+
+
 def test_only_read_only_git_subcommands_are_invoked_and_nothing_is_fetched(checkouts, monkeypatch):
     remote = checkouts.directory / "remote.git"
     completed = subprocess.run(
@@ -860,10 +1120,10 @@ def test_only_read_only_git_subcommands_are_invoked_and_nothing_is_fetched(check
     invoked, commands = [], []
     real_run, real_command = workdir.run, workdir.command
 
-    def spy_run(entry, arguments, limit):
+    def spy_run(entry, arguments, limit, guard=()):
         invoked.append(arguments[0])
-        commands.append(real_command(entry, *arguments))
-        return real_run(entry, arguments, limit)
+        commands.append(real_command(entry, *arguments, guard=guard))
+        return real_run(entry, arguments, limit, guard)
 
     monkeypatch.setattr(workdir, "run", spy_run)
     package = checkouts.recover()
@@ -911,11 +1171,11 @@ def test_slow_git_never_holds_the_shared_writer_lock(checkouts, contracts, monke
     entered, release = Event(), Event()
     real = workdir.run
 
-    def paused(entry, arguments, limit):
+    def paused(entry, arguments, limit, guard=()):
         if not entered.is_set():
             entered.set()
             assert release.wait(10), "test gate was not released"
-        return real(entry, arguments, limit)
+        return real(entry, arguments, limit, guard)
 
     def chat():
         service = MemoryService(checkouts.store, contracts)
@@ -979,17 +1239,55 @@ def test_registered_file_that_escapes_the_checkout_is_refused(checkouts):
     assert facts[1]["digest"] == hashlib.sha256(b"print('receipt')\n").hexdigest()
 
 
-def test_missing_and_oversized_registered_files_are_honest_states(checkouts):
+def test_missing_and_unreadable_registered_files_are_honest_states(checkouts):
     checkouts.edit(
         lambda knowledge, h: knowledge["worktrees"]["demo"][0].update(
-            files=["docs/design.md", "docs/gone.md", "docs/big.md"]
+            files=["docs/design.md", "docs/gone.md"]
         )
     )
-    (checkouts.first / "docs/big.md").write_text("x" * 1048577, encoding="utf-8")
+    (checkouts.first / "docs").mkdir(exist_ok=True)
     facts = checkouts.recover()["worktree"]["files"]
-    assert [fact["state"] for fact in facts] == ["present", "missing", "too_large"]
-    assert facts[1]["digest"] is None and facts[2]["digest"] is None
-    assert facts[1]["index"] is None and facts[1]["freshness"] == "unindexed"
+    assert [fact["state"] for fact in facts] == ["present", "missing"]
+    assert facts[1]["digest"] is None and facts[1]["index"] is None
+    assert facts[1]["freshness"] == "unindexed"
+
+
+def test_a_registered_file_that_outgrows_its_reader_is_never_digested(checkouts, monkeypatch):
+    """The reader's own limit is an honest per-file state, never a wrong digest."""
+    real = workdir.read_file
+
+    def grown(project, locator):
+        if locator == "docs/design.md":
+            raise Fault("source_too_large", 413)
+        return real(project, locator)
+
+    monkeypatch.setattr(workdir, "read_file", grown)
+    facts = checkouts.recover()["worktree"]["files"]
+    assert [fact["state"] for fact in facts] == ["too_large"]
+    assert facts[0]["digest"] is None and facts[0]["size"] is None
+
+
+def test_the_cumulative_read_budget_is_charged_before_a_file_is_read(checkouts, monkeypatch):
+    """`max_bytes` bounds the whole registered read, not merely every file so far."""
+    checkouts.edit(
+        lambda knowledge, h: knowledge["worktrees"]["demo"][0].update(
+            files=["docs/design.md", "docs/second.md"], max_bytes=1024
+        )
+    )
+    (checkouts.first / "docs/second.md").write_bytes(b"y" * 2048)
+    read = []
+    real = workdir.read_file
+
+    def observed(project, locator):
+        read.append(locator)
+        return real(project, locator)
+
+    monkeypatch.setattr(workdir, "read_file", observed)
+    with pytest.raises(Fault, match="workdir_byte_budget"):
+        checkouts.recover()
+    # The file that does not fit the budget is refused *before* it is opened, so the registered
+    # read set can never exceed the configured maximum, not even by its last member.
+    assert read == ["docs/design.md"]
 
 
 def test_cli_and_official_sdk_stdio_roundtrip(checkouts):

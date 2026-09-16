@@ -233,6 +233,7 @@
             "unborn",
             "dirty",
             "counts",
+            "changes",
             "files",
             "git",
             "collected_at",
@@ -324,6 +325,32 @@
                 "entries": {
                   "type": "integer",
                   "minimum": 0
+                }
+              }
+            },
+            "changes": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode",
+                "entries",
+                "complete",
+                "fingerprint"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "stat_only"
+                },
+                "entries": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "complete": {
+                  "type": "boolean"
+                },
+                "fingerprint": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
                 }
               }
             },
@@ -434,6 +461,7 @@
                 "history_limit",
                 "status_limit_bytes",
                 "subcommands",
+                "helpers",
                 "writes"
               ],
               "properties": {
@@ -460,12 +488,22 @@
                   "type": "array",
                   "items": {
                     "enum": [
-                      "rev-parse",
-                      "symbolic-ref",
-                      "status",
+                      "--version",
+                      "config",
                       "log",
-                      "--version"
+                      "rev-parse",
+                      "status",
+                      "symbolic-ref"
                     ]
+                  }
+                },
+                "helpers": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
                   }
                 },
                 "writes": {
@@ -683,6 +721,7 @@
                       "branch",
                       "dirty",
                       "declared_at",
+                      "facts",
                       "scope"
                     ],
                     "properties": {
@@ -748,11 +787,23 @@
                           }
                         ]
                       },
+                      "facts": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$"
+                          }
+                        ]
+                      },
                       "scope": {
                         "enum": [
                           "current",
                           "historical_commit",
                           "workdir_changed",
+                          "workdir_unproven",
                           "other_worktree",
                           "unbound"
                         ]

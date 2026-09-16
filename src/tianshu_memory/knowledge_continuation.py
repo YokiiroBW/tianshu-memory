@@ -21,8 +21,18 @@ MAX_PACKAGE_BYTES = 262144
 LIST_LIMIT = 64
 UNIT_SLACK = 160
 # A verification is only current when it names this checkout, records the commit that is still
-# HEAD and was declared with the same dirty state. Nothing else may pass as current.
-SCOPES = ("current", "historical_commit", "workdir_changed", "other_worktree", "unbound")
+# HEAD and was declared against the very uncommitted state that is still there: the stamped
+# fingerprint of that state has to match. A record whose state cannot be proven (an older record
+# without a fingerprint, or a working tree too large to describe completely) is `workdir_unproven`
+# rather than `current`, and any observed change is `workdir_changed`. Nothing else may pass.
+SCOPES = (
+    "current",
+    "historical_commit",
+    "workdir_changed",
+    "workdir_unproven",
+    "other_worktree",
+    "unbound",
+)
 INDEX_FRESHNESS = ("verified_current", "verified_changed", "unverified")
 DIFFERENCES = (
     "stale_or_tampered",
@@ -32,6 +42,7 @@ DIFFERENCES = (
     "branch_changed",
     "head_changed",
     "workdir_dirty",
+    "workdir_unproven",
     "file_changed",
     "stale_evidence",
 )
@@ -53,16 +64,17 @@ UNOBSERVABLE = (
     "workdir_file_changed",
     "workdir_file_too_large",
     "workdir_byte_budget",
+    "workdir_helpers_unbounded",
 )
 PACKAGE_FIELDS = (
     "status project_id worktree history index state units omissions budget revision "
     "registration authority retrieval trust seal"
 )
 WORKTREE_FIELDS = (
-    "id expected_branch branch detached branch_matches head unborn dirty counts files git "
+    "id expected_branch branch detached branch_matches head unborn dirty counts changes files git "
     "collected_at registration"
 )
-GIT_FIELDS = "version timeout_seconds history_limit status_limit_bytes subcommands writes"
+GIT_FIELDS = "version timeout_seconds history_limit status_limit_bytes subcommands helpers writes"
 HISTORY_FIELDS = "limit listed complete commits"
 HISTORY_ENTRY_FIELDS = "commit subject committed_at"
 INDEX_FIELDS = "documents total listed truncated"
@@ -73,7 +85,7 @@ STATE_FIELDS = (
     "version authority current stale_evidence goal constraints unfinished recent_verification "
     "pitfalls evidence"
 )
-VERIFICATION_FIELDS = "summary worktree commit branch dirty declared_at"
+VERIFICATION_FIELDS = "summary worktree commit branch dirty declared_at facts"
 SCOPED_FIELDS = VERIFICATION_FIELDS + " scope"
 PITFALL_FIELDS = "trigger symptom cause correction verification evidence"
 REFERENCE_FIELDS = "block_id document_id version hash"
@@ -142,17 +154,51 @@ def references(payload):
     return result
 
 
+def facts_fingerprint(facts):
+    """The observable identity of one checkout observation: everything a binding depends on.
+
+    The commit, branch, dirtiness, classified counts, the bounded fingerprint of the changed
+    entries and every registered digest are hashed together. A verification stamped with this
+    value is current only while a later observation of the same checkout produces it again, so a
+    second edit that leaves the counts and HEAD unchanged still invalidates it. Only facts of the
+    checkout itself take part: how fresh a digest looks next to the index is a property of the
+    index, not of the checkout, and must not make two observations of one unchanged checkout
+    differ.
+    """
+    return fingerprint(
+        {
+            "id": facts["id"],
+            "head": facts["head"],
+            "unborn": facts["unborn"],
+            "branch": facts["branch"],
+            "detached": facts["detached"],
+            "dirty": facts["dirty"],
+            "counts": facts["counts"],
+            "changes": facts["changes"],
+            "files": {
+                fact["locator"]: [fact["state"], fact["size"], fact["digest"]]
+                for fact in facts["files"]
+            },
+        }
+    )
+
+
 def scoped(payload, facts):
     """One declared verification, labeled against the live facts of the target checkout.
 
     A declared string that names no commit stays `unbound` forever: a historical test result is
-    never presented as a test of the commit in front of the agent.
+    never presented as a test of the commit in front of the agent. A bound record is `current`
+    only while the checkout still reads the same: the recorded commit is still HEAD *and* the
+    stamped fingerprint of the uncommitted state still matches. A state that cannot be proven
+    equal (a record written before fingerprints existed for a dirty checkout, or a working tree
+    with more changed entries than one observation may describe) is `workdir_unproven`, and an
+    observed difference is `workdir_changed`; neither is ever `current`.
     """
     if isinstance(payload, str):
         result = dict.fromkeys(VERIFICATION_FIELDS.split())
         result["summary"] = payload
     else:
-        result = {field: payload[field] for field in VERIFICATION_FIELDS.split()}
+        result = {field: payload.get(field) for field in VERIFICATION_FIELDS.split()}
     if result["worktree"] is None or result["commit"] is None:
         # A sentence that names no checkout and no commit was never bound to a run of code.
         result["scope"] = "unbound"
@@ -160,7 +206,13 @@ def scoped(payload, facts):
         result["scope"] = "other_worktree"
     elif result["commit"] != facts["head"]:
         result["scope"] = "historical_commit"
-    elif result["dirty"] != facts["dirty"]:
+    elif result["facts"] is None:
+        # Without a stamped fingerprint only a checkout with nothing uncommitted is provable:
+        # its content is exactly the recorded commit.
+        result["scope"] = "current" if not facts["dirty"] else "workdir_unproven"
+    elif not facts["changes"]["complete"]:
+        result["scope"] = "workdir_unproven"
+    elif result["facts"] != facts_fingerprint(facts):
         result["scope"] = "workdir_changed"
     else:
         result["scope"] = "current"
@@ -444,6 +496,13 @@ def live_differences(package, observed, indexed):
         differences.append("head_changed")
     if facts["dirty"] != stored["dirty"] or facts["counts"] != stored["counts"]:
         differences.append("workdir_dirty")
+    elif not stored["changes"]["complete"] or facts["changes"] != stored["changes"]:
+        # The counts and the dirty flag are unchanged, but the uncommitted state is not the one
+        # the package describes: a tracked file that is not on the registered digest list was
+        # edited again, or the package was issued with a description that stopped at the
+        # changed-entry cap and never described the whole checkout. Either way the honest answer
+        # is "cannot be proven equal", never "still valid".
+        differences.append("workdir_unproven")
     if file_map(facts["files"]) != file_map(stored["files"]):
         differences.append("file_changed")
     if versions(observed["indexed"]) != versions(indexed):
@@ -541,11 +600,27 @@ def worktree_shape(facts):
     exact(facts["counts"], " ".join(workdir.COUNT_KEYS))
     for value in facts["counts"].values():
         integer(value)
+    exact(facts["changes"], workdir.CHANGE_FIELDS)
+    require(
+        facts["changes"]["mode"] == workdir.CHANGE_MODE
+        and type(facts["changes"]["complete"]) is bool,
+        "invalid_input",
+        400,
+    )
+    integer(facts["changes"]["entries"])
+    digest(facts["changes"]["fingerprint"])
     exact(facts["git"], GIT_FIELDS)
     text(facts["git"]["version"], workdir.VERSION_LIMIT)
     integer(facts["git"]["timeout_seconds"], 1, 120)
     integer(facts["git"]["history_limit"], 1, 64)
     integer(facts["git"]["status_limit_bytes"], 1024, 1024 * 1024)
+    require(
+        isinstance(facts["git"]["helpers"], list)
+        and len(facts["git"]["helpers"]) <= workdir.MAX_HELPERS
+        and all(isinstance(name, str) and 0 < len(name) <= 64 for name in facts["git"]["helpers"]),
+        "invalid_input",
+        400,
+    )
     require(
         facts["git"]["subcommands"] == list(workdir.READ_ONLY)
         and facts["git"]["writes"] == "never",
@@ -633,6 +708,8 @@ def state_shape(state):
         optional_text(item["branch"], 256)
         require(item["dirty"] is None or type(item["dirty"]) is bool, "invalid_input", 400)
         optional_text(item["declared_at"], 64)
+        if item["facts"] is not None:
+            digest(item["facts"])
         require(item["scope"] in SCOPES, "invalid_input", 400)
     require(isinstance(state["pitfalls"], list) and len(state["pitfalls"]) <= 8)
     for pitfall in state["pitfalls"]:

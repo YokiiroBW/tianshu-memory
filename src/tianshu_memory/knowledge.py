@@ -825,7 +825,12 @@ class KnowledgeApplication:
             entries = {entry["id"]: entry for entry in worktrees}
             return {
                 "worktrees": {
-                    name: workdir.observe(entries[name], digests=False) for name in captured
+                    # The registered digests are read here on purpose: a recorded verification is
+                    # stamped with the whole observable state of the checkout, including the
+                    # files the operator registered, so a later change to any of them can be
+                    # detected instead of being assumed away.
+                    name: workdir.observe(entries[name])
+                    for name in captured
                 }
             }
         entry = workdir.require_registration(worktrees, captured["worktree"])
@@ -1193,7 +1198,10 @@ class KnowledgeApplication:
 
         The summary stays the operator's own words; the commit is never taken from the request.
         A declared commit that is not the observed HEAD is refused, because that is exactly the
-        claim "this historical result verified this commit" that must never be recorded.
+        claim "this historical result verified this commit" that must never be recorded. The
+        record also carries a fingerprint of the whole observable checkout state, so a later
+        `continuation_check` can tell a second edit from the first instead of trusting HEAD, the
+        dirty flag and two counts to have stayed equal.
         """
         observed = (prepared or {}).get("worktrees", {})
         stamped = []
@@ -1208,6 +1216,10 @@ class KnowledgeApplication:
                 "workdir_conflict",
                 409,
             )
+            # A binding may only be recorded when the uncommitted state can be described
+            # completely: an incomplete description could never be compared later, so the record
+            # would claim more than the service can prove.
+            require(facts["changes"]["complete"], "workdir_unproven", 409)
             stamped.append(
                 {
                     "summary": item["summary"],
@@ -1216,6 +1228,7 @@ class KnowledgeApplication:
                     "branch": facts["branch"],
                     "dirty": facts["dirty"],
                     "declared_at": facts["collected_at"],
+                    "facts": continuation.facts_fingerprint(facts),
                 }
             )
         return {**state, "recent_verification": stamped}

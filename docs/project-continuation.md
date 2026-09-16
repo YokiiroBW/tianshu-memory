@@ -55,32 +55,37 @@ uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json ac
 
 | 段 | 内容 | 是否本次实测 |
 | --- | --- | --- |
-| `worktree` | `id`、期望分支与实际分支、是否 detached、`head`、是否 unborn、脏状态分类计数、登记文件摘要、Git 版本/超时/输出上限/允许的子命令 | 是，本次只读采集 |
+| `worktree` | `id`、期望分支与实际分支、是否 detached、`head`、是否 unborn、脏状态分类计数、未提交状态指纹、登记文件摘要、Git 版本/超时/输出上限/允许的子命令与已中和的 helper 名 | 是，本次只读采集 |
 | `history` | 最多 8 条提交（`commit`/`subject`/`committed_at`），达到上限时 `complete=false` | 是，但只到上限为止 |
 | `index` | 本服务已索引文档的 `document_id`/版本/状态/存储哈希/`freshness` | 否；仅登记摘要与返回的资料单元被核验 |
 | `state` | `goal`、`constraints`、`unfinished`（下一步）、`recent_verification`、`pitfalls`、`evidence` | 引用被本次核验 |
 | `units` | 完整资料单元（`reference`/`spans`/`text`/`source_id`/`provenance`，从不切半） | 引用被本次核验 |
 
 - `index.documents[].freshness` 只有三种：`verified_current`（登记摘要与索引哈希一致）、`verified_changed`（登记摘要与索引哈希不一致，或当前文件缺失/不可读/超限）、`unverified`（未登记摘要，本服务不声称它是当前文件）。**旧摘要永远不覆盖当前文件**，两者并排展示。
-- `worktree.files[]` 给当前摘要、大小与状态（`present`/`missing`/`unreadable`/`changed`/`too_large`）以及同一 locator 的索引行；读取中变化或超限是诚实的状态，不是假成功。登记路径若变成越界链接、凭据名或不支持类型，则整次接续失败关闭（`workdir_file_refused`/`workdir_file_unsupported`）。
-- 脏状态只给**分类计数**（`staged`/`modified`/`deleted`/`renamed`/`untracked`/`conflicted`/`entries`），不列脏文件路径、不读 diff、不读未跟踪文件正文。采集结果与检出自己的 `git status` 一致（专项用例对照断言）。
-- 包不回声宿主绝对路径，也不含任何凭据。
+- `worktree.files[]` 给当前摘要、大小与状态（`present`/`missing`/`unreadable`/`changed`/`too_large`）以及同一 locator 的索引行；读取中变化或超限是诚实的状态，不是假成功。登记路径若变成越界链接、凭据名或不支持类型，则整次接续失败关闭（`workdir_file_refused`/`workdir_file_unsupported`）。`max_bytes` 是**整组登记文件**的累计读取预算：每个文件的预计大小在打开它之前就计入，装不下时 `workdir_byte_budget`（409），最后一个文件也不会让读取总量超过配置值。
+- 脏状态给**分类计数**（`staged`/`modified`/`deleted`/`renamed`/`untracked`/`conflicted`/`entries`）与一个未提交状态指纹 `worktree.changes`：`mode=stat_only`、`entries`（本次看到的改动条目数）、`complete`（是否全部条目都在上限内被描述）、`fingerprint`（对每条改动的状态码、**路径的 SHA256**、大小、mtime、mode 排序后取 SHA256）。指纹只读元数据：不列脏文件路径、不读 diff、不读未跟踪文件正文。计数相同不代表状态相同，因此 `check` 比对的是指纹而不是计数（专项用例：同计数、同 HEAD 的二次改写必须判为不可证明）。
+- 采集结果与检出自己的 `git status` 一致（专项用例对照断言）。
+- 包不回声宿主绝对路径，也不含任何凭据；脏文件路径只以摘要形式参与指纹。
 
 ## 采集器边界（可信本地只读）
 
-固定、可枚举的只读 Git 调用，全部带 `--no-optional-locks`（不刷新、不写索引）与 `-c core.fsmonitor=false`（不运行仓库配置的 helper，专项用例用真实 fsmonitor 钩子证明）：
+“只读”是对调用的性质要求，不是对意图的声明：仓库可以让 Git 在**读取**时执行程序（`.gitattributes` 选中的 `filter` clean/process driver、`diff` textconv 或外部命令、文件系统监视器）。因此采集前先从合并配置中列出全部 `filter`/`diff` driver 名，并在每次调用的命令行上用更高优先级的空值覆盖它们；子进程还使用固定环境（不是服务环境），任何继承的 `GIT_*`（`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_EXTERNAL_DIFF`/`GIT_DIR`/`GIT_ASKPASS` 等）都无法定义可执行程序。宿主的 Git 配置本身**保留**（否则 `core.autocrlf`/filter 设置会让刚提交的检出错判为已修改），被中和的 driver 名会出现在包的 `worktree.git.helpers` 里，便于核对。
+
+固定、可枚举的只读 Git 调用，全部带 `--no-optional-locks`（不刷新、不写索引）、`core.fsmonitor=false`、`core.hooksPath=<不存在的目录>`（不运行钩子）、`status.submoduleSummary=false`、`log.showSignature=false`，以及每个已发现 driver 的 `filter.<name>.{clean,process,smudge,required}`/`diff.<name>.{command,textconv}` 覆盖：
 
 | 调用 | 用途 | 上限 |
 | --- | --- | --- |
+| `config --null --list` | 列出配置里的 driver 名以便中和（只读配置，不执行任何东西；名字用代码过滤，避免正则参数被 `cmd` 垫片改写） | 64 KiB |
 | `rev-parse --show-toplevel` | 登记路径必须是自己检出的根（子目录、非仓库分别 `workdir_not_root`/`workdir_not_repository`） | 1024 B |
 | `rev-parse --verify --quiet HEAD^{commit}` | HEAD；未出生分支为 `null` + `unborn=true` | 128 B |
 | `symbolic-ref --short -q HEAD` | 分支；detached 时 `branch=null` + `detached=true` | 1024 B |
-| `status --porcelain=v1 -z --untracked-files=normal --ignore-submodules=all` | 分类计数 | 256 KiB，超出即 `workdir_output_too_large`，不静默截断 |
+| `status --porcelain=v1 -z --untracked-files=normal --ignore-submodules=all` | 分类计数与未提交状态指纹 | 256 KiB，超出即 `workdir_output_too_large`，不静默截断 |
 | `log -n 8 --no-show-signature --no-decorate --format=...` | 历史 | 64 KiB |
 | `--version` | 可追溯的 Git 版本 | 256 B |
 
-- 没有 `fetch`/`checkout`/`reset`/`clean`/`diff`/`pull`，不联网、不执行仓库脚本、不进入子模块；专项用例断言实际调用的子命令集合是允许列表的子集、索引 mtime 不变、远端跟踪引用在远端前进后仍不动（证明不 fetch）。
-- 每次调用固定 10 秒超时；HEAD 在 `status` 前后各读一次，采集期间检出移动即 `workdir_changed`，绝不报告半新半旧。
+- 没有 `fetch`/`checkout`/`reset`/`clean`/`diff`/`pull`，不联网、不执行仓库脚本（专项用例用真实 clean/process driver 与真实 fsmonitor 钩子证明：对照调用确实执行了仓库程序，采集后标记文件不存在）、不进入子模块；专项用例断言实际调用的子命令集合是允许列表的子集、索引 mtime 不变、远端跟踪引用在远端前进后仍不动（证明不 fetch）。
+- 输出上限是**采集期硬上限**：stdout 与 stderr 分别有界，任何一个越界就杀掉子进程并报 `workdir_output_too_large`（不是先无限缓冲、事后才发现）；每次调用固定 10 秒超时，到点同样杀进程并报 `workdir_timeout`。stderr 内容从不返回。
+- HEAD 在 `status` 前后各读一次，采集期间检出移动即 `workdir_changed`，绝不报告半新半旧。
 - 提交标题等仓库文本按不可信数据处理：去控制字符、按 200 字符截断。
 - 整个采集发生在两个短事务**之间**，慢 Git/磁盘 I/O 不持共享写锁（并发用例：采集被挂起时真实 `MemoryService.register`/`resolve` 仍在 1 秒内完成）。
 - 采集不写入工作目录：不改文件、不改索引，`git.writes` 恒为 `never`。
@@ -94,13 +99,14 @@ uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json ac
 "legacy sentence without a commit"
 ```
 
-结构化条目由服务端在写入时盖上**实际观测到**的 `commit`/`branch`/`dirty`/`declared_at`；调用方声明一个并非当前 HEAD 的 commit 会被 `workdir_conflict`（409）拒绝，且此时不写入任何状态。一个状态最多绑定 4 个不同检出（`too_many_worktrees`）。读取时按本次实测重新标注 `scope`：
+结构化条目由服务端在写入时盖上**实际观测到**的 `commit`/`branch`/`dirty`/`declared_at`，并附上 `facts`——该次观测整份可观测状态的指纹（HEAD、分支、脏标记、分类计数、未提交状态指纹、登记文件摘要）。因此写入绑定也会读取登记文件（受同一累计字节预算约束，读不下即 `workdir_byte_budget`）。调用方声明一个并非当前 HEAD 的 commit 会被 `workdir_conflict`（409）拒绝，且此时不写入任何状态；检出状态无法被完整描述（改动条目超过上限）时绑定被拒绝为 `workdir_unproven`（409），因为这样的记录日后无法比对。一个状态最多绑定 4 个不同检出（`too_many_worktrees`）。读取时按本次实测重新标注 `scope`：
 
 | scope | 含义 |
 | --- | --- |
-| `current` | 同一检出、同一 HEAD、声明时与现在的脏状态一致 |
+| `current` | 同一检出、同一 HEAD，且本次指纹与写入时的 `facts` 完全一致（干净检出在无指纹的旧记录下也可证明：内容就是该提交） |
 | `historical_commit` | HEAD 已前进，这是历史提交上的结果 |
-| `workdir_changed` | HEAD 相同但脏状态变了（例如声明后出现/消失了未提交改动） |
+| `workdir_changed` | HEAD 相同但状态指纹不同（声明后再次改写未提交文件、出现/消失改动、登记文件摘要变化） |
+| `workdir_unproven` | 无法证明相同：旧记录没有指纹而检出是脏的，或改动条目超过上限无法完整描述。**不冒充 current** |
 | `other_worktree` | 绑定的是另一个已登记检出，本包不做跨检出判断 |
 | `unbound` | 纯字符串或未出生分支：**永远**不冒充当前提交的测试 |
 
@@ -115,6 +121,7 @@ uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json ac
 | `branch_changed` | 切分支或进入/离开 detached |
 | `head_changed` | 新提交或 HEAD 回退 |
 | `workdir_dirty` | 出现/消失未提交改动（分类计数变化） |
+| `workdir_unproven` | 计数与脏标记未变但未提交状态指纹不同，或包本身的状态描述不完整：无法证明相同即不判有效 |
 | `file_changed` | 登记文件的摘要/大小/状态变化 |
 | `stale_evidence` | 包内证据引用不再是当前来源 |
 
@@ -146,6 +153,6 @@ uv run --extra mcp pytest -q --basetemp .runtime/tests-ts083-full
 
 1. 两台机器/两个编码体各自登记自己的检出即可分别接续同一项目；本服务不做跨检出比较，`other_worktree` 的验证只标注归属，不判断对方的 HEAD。
 2. `index` 段中未登记摘要的文档永远是 `unverified`：本服务只核验返回的资料单元与登记摘要，不重读整个索引（有界读取优先，无大库吞吐承诺）。
-3. 历史最多 8 条、登记文件最多 16 个、脏状态最多 256 KiB 输出；超限明确报错或标注 `complete=false`，不静默截断。
+3. 历史最多 8 条、登记文件最多 16 个、未提交状态最多描述 512 条改动（超限时 `complete=false`，`check` 与验证绑定按“无法证明”处理）、单次 Git 输出上限 256 KiB；超限明确报错或标注，不静默截断。未提交状态指纹只读元数据（大小/mtime/mode）与路径摘要，不读内容：若某个文件被改写后大小、mtime、mode 与路径全都保持不变，指纹无法察觉——这是“不读未跟踪正文、不做无界 diff”这一边界的已知代价，专项用例覆盖的是同尺寸改写（mtime 变化）与不同尺寸改写（大小变化）两类现实情形；登记文件的摘要仍是内容摘要，不受此限。
 4. 分支名、`path` 与 `files` 都属于登记内容，登记变化会让旧包与旧绑定失效或冲突，需要重新计算。
 5. 仍是本地 SQLite 单写者；未操作任何真实账号、群消息、设备、NAS 或生产数据库。
