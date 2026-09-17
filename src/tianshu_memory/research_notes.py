@@ -317,16 +317,21 @@ class ResearchNotes:
 
         A citation binds one **recorded** note version, and that is the version this walk
         follows: a note that has since been revised does not become the evidence a historical
-        citation named, so the current version is never substituted for a recorded one. Every
-        edge is verified before it is followed — the cited version must still be a current,
-        unretracted version whose recorded fingerprint matches the one the citing note bound —
-        and the map this returns holds exactly those verified versions.
+        citation named, so the current version is never substituted for a recorded one.
+
+        **Every edge is verified before anything is deduplicated.** Two edges may name the same
+        note at different versions — one current, one superseded — and deduplicating by identity
+        first would let the second edge ride on the first edge's check. So each edge is checked on
+        its own recorded `(note_id, version, hash)`: the cited version must still be a current,
+        unretracted version whose recorded fingerprint matches the one the citing note bound. Only
+        after that does a note already verified on another branch stop the walk from expanding its
+        descendants again, and the map this returns holds exactly the verified versions.
 
         A cycle is a back edge: a note version reached again **while it is still on the path
         being walked**. A diamond is not a cycle — two studies that both rest on the same
         foundational note may legitimately be combined — so a version already finished on another
         branch is deduplicated rather than refused. Two bounds keep the walk honest: a root counts
-        as depth 1 and the path is capped at `MAX_CITATION_DEPTH`, and the total node visits at
+        as depth 1 and the path is capped at `MAX_CITATION_DEPTH`, and the total edge visits at
         `MAX_GRAPH_WORK`. Exceeding either is refused rather than answered from a partial walk, so
         a cycle can never hide behind a bound by making the walk give up. A cited note of another
         project is unresolvable here instead of being followed.
@@ -338,13 +343,14 @@ class ResearchNotes:
             identifier = reference["note_id"]
             require(identifier not in path, "citation_cycle", 400)
             require(depth <= MAX_CITATION_DEPTH, "citation_cycle", 400)
-            if identifier in found:
-                return
             work[0] += 1
             require(work[0] <= MAX_GRAPH_WORK, "citation_cycle", 400)
-            # The edge itself is checked here, so a superseded, retracted or rewritten version is
-            # refused before anything under it is read.
+            # This edge is checked here, on its own recorded version, before the identity is
+            # deduplicated: a superseded, retracted or rewritten version is refused no matter
+            # which other version of the same note was already reached.
             self._note_evidence(reference)
+            if identifier in found:
+                return
             found[identifier] = reference
             for child in self._cited_notes(identifier, reference["version"]):
                 descend(child, path | {identifier}, depth + 1)

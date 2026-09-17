@@ -736,6 +736,84 @@ def test_a_cited_version_that_was_superseded_is_not_substituted_by_the_current_o
     assert healthy["status"] == "recorded"
 
 
+def test_a_mixed_basis_cannot_smuggle_a_superseded_version_past_the_current_one(notes):
+    """A basis naming both the current version and a note that cites the old one is refused.
+
+    The current version puts the note's identity into the walk first. If the walk deduplicated by
+    identity before checking each edge, the other branch's edge onto the superseded version would
+    never be verified and the new conclusion would be accepted. Both orders are checked, because
+    the order of the basis list must not decide whether the evidence is valid.
+    """
+    imported(notes)
+    reference = unit(notes)
+    first = record(notes, [reference], key="mixed-a")
+    middle = record(
+        notes,
+        [reference],
+        key="mixed-b",
+        decision=decision([], basis=basis(first)),
+    )
+    current = revise(
+        notes,
+        first["note_id"],
+        [reference],
+        key="mixed-a",
+        op="mixed-a-v2",
+        version=1,
+        inferences=["A now argues something else, on the same source bytes."],
+    )
+    assert current["version"] == 2
+    assert status(notes, middle["note_id"], 1)["current"] is False
+    # Current version first: the identity is already walked when the superseded edge is reached.
+    with pytest.raises(Fault, match="stale_evidence"):
+        record(
+            notes,
+            [reference],
+            key="mixed-current-first",
+            decision=decision([], basis=basis(current, middle)),
+        )
+    # Superseded chain first: the same evidence, the other order.
+    with pytest.raises(Fault, match="stale_evidence"):
+        record(
+            notes,
+            [reference],
+            key="mixed-stale-first",
+            decision=decision([], basis=basis(middle, current)),
+        )
+    # Neither refusal wrote anything.
+    for key in ("mixed-current-first", "mixed-stale-first"):
+        with pytest.raises(Fault, match="not_found"):
+            status(notes, note_id("alpha", key), 1)
+    # A revision that mixes the same two versions is refused the same way, and it keeps its
+    # version. The revised note is a third note, so the basis is not a self-citation.
+    outer = record(
+        notes,
+        [reference],
+        key="mixed-d",
+        decision=decision([], basis=basis(current)),
+    )
+    with pytest.raises(Fault, match="stale_evidence"):
+        revise(
+            notes,
+            outer["note_id"],
+            [reference],
+            key="mixed-d",
+            op="mixed-d-v2",
+            version=1,
+            decision=decision([], basis=basis(current, middle)),
+        )
+    assert status(notes, outer["note_id"], 1)["current_version"] == 1
+    # A mixed basis whose every edge is current is still accepted: the rule is about the edges,
+    # not about mixing a current version with a note that cites it.
+    healthy = record(
+        notes,
+        [reference],
+        key="mixed-e",
+        decision=decision([], basis=basis(current, outer)),
+    )
+    assert healthy["status"] == "recorded" and healthy["cited_notes"] == 2
+
+
 def test_a_withdrawn_note_inside_the_chain_is_refused(notes):
     """A retraction anywhere in the closure stops a new conclusion, not only at the top."""
     imported(notes)
