@@ -280,6 +280,7 @@ def test_official_sdk_stdio_note_roundtrip(notes):
                     {
                         "project_id": "alpha",
                         "key": "mcp-note",
+                        "dedupe": "mcp-revise-denied",
                         "note_id": body["note_id"],
                         "expected_version": 99,
                         "note": note([reference]),
@@ -290,6 +291,139 @@ def test_official_sdk_stdio_note_roundtrip(notes):
                     "note_query", {"project_id": "beta", "text": "receipt", "budget_bytes": 8192}
                 )
                 assert other.isError
+
+    asyncio.run(exercise())
+
+
+def test_official_sdk_stdio_record_revise_and_replay(notes):
+    """A note recorded through MCP can be revised through MCP, and the replay is the same result.
+
+    This is the adapter contract the record path implies: `key` is the note's stable identity, so
+    a revision must carry its own operation idempotency key. Reusing the record's key is refused
+    as a replay, and inventing a new key is refused as an identity change — only an explicit
+    `dedupe` reaches the revision.
+    """
+    pytest.importorskip("mcp")
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    imported(notes)
+    reference = unit(notes)
+    env = dict(os.environ, TIANSHU_PROJECT_SECRET=SECRET, PYTHONUTF8="1")
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            *COMMAND,
+            "--config",
+            str(notes.path),
+            "mcp",
+            "--client",
+            "alpha-writer",
+            "--credential-env",
+            "TIANSHU_PROJECT_SECRET",
+        ],
+        env=env,
+        cwd=str(notes.roots["alpha"]),
+    )
+
+    async def exercise():
+        async with stdio_client(parameters) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                schema = {
+                    tool.name: tool.inputSchema for tool in (await session.list_tools()).tools
+                }
+                assert "dedupe" in schema["note_revise"]["properties"]
+                assert "dedupe" in schema["note_withdraw"]["properties"]
+                assert "dedupe" not in schema["note_revise"].get("required", [])
+
+                recorded = await session.call_tool(
+                    "note_record",
+                    {
+                        "project_id": "alpha",
+                        "key": "mcp-revise",
+                        "expected_version": 0,
+                        "note": note([reference], decision=decision([reference])),
+                    },
+                )
+                assert not recorded.isError, recorded
+                first = json.loads(recorded.content[0].text)
+                assert first["status"] == "recorded" and first["version"] == 1
+
+                # Without its own key the revision falls back to the record's key, which is
+                # already bound to a different request: the adapter must let the caller name
+                # this call, or a revision is simply unreachable through MCP.
+                replayed = await session.call_tool(
+                    "note_revise",
+                    {
+                        "project_id": "alpha",
+                        "key": "mcp-revise",
+                        "note_id": first["note_id"],
+                        "expected_version": 1,
+                        "note": note([reference]),
+                    },
+                )
+                assert replayed.isError, replayed
+                assert "idempotency_conflict" in replayed.content[0].text
+                unchanged = await session.call_tool(
+                    "note_status",
+                    {"project_id": "alpha", "note_id": first["note_id"], "version": 1},
+                )
+                assert json.loads(unchanged.content[0].text)["current_version"] == 1
+
+                revision = {
+                    "project_id": "alpha",
+                    "key": "mcp-revise",
+                    "dedupe": "mcp-revise-second",
+                    "note_id": first["note_id"],
+                    "expected_version": 1,
+                    "note": note(
+                        [reference],
+                        inferences=["The revision supersedes the first inference."],
+                    ),
+                }
+                revised = await session.call_tool("note_revise", revision)
+                assert not revised.isError, revised
+                second = json.loads(revised.content[0].text)
+                assert second["status"] == "revised" and second["version"] == 2
+
+                # Replaying that exact revision returns the recorded result, not a third version.
+                again = await session.call_tool("note_revise", revision)
+                assert not again.isError, again
+                repeat = json.loads(again.content[0].text)
+                assert repeat["version"] == 2 and repeat["hash"] == second["hash"]
+                assert repeat["replayed"] is True
+
+                # A revision that keeps the operation key but changes the payload is refused.
+                conflicting = await session.call_tool(
+                    "note_revise", dict(revision, expected_version=2, note=note([reference]))
+                )
+                assert conflicting.isError
+
+                # The same independent key makes a withdrawal reachable, and its replay stable.
+                withdrawal = {
+                    "project_id": "alpha",
+                    "key": "mcp-revise",
+                    "dedupe": "mcp-withdraw",
+                    "note_id": first["note_id"],
+                    "expected_version": 2,
+                    "reason": "superseded through MCP",
+                }
+                withdrawn = await session.call_tool("note_withdraw", withdrawal)
+                assert not withdrawn.isError, withdrawn
+                assert json.loads(withdrawn.content[0].text)["status"] == "withdrawn"
+                repeated = await session.call_tool("note_withdraw", withdrawal)
+                assert not repeated.isError, repeated
+                assert json.loads(repeated.content[0].text)["version"] == 3
+
+                # The historical versions are still readable, with their citations.
+                for version in (1, 2, 3):
+                    historical = await session.call_tool(
+                        "note_status",
+                        {"project_id": "alpha", "note_id": first["note_id"], "version": version},
+                    )
+                    assert not historical.isError, historical
+                    assert json.loads(historical.content[0].text)["version"] == version
 
     asyncio.run(exercise())
 

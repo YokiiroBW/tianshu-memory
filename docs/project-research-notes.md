@@ -65,6 +65,7 @@ uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json mi
 - `question` 是本次研究问题；`source_statements` 是**来源论述**，每条的 `statement` 是操作者自己的话，`source` 是**实际读到的**已登记资料版本与完整语义单元引用；`inferences` 是**研究推论**；`open_questions` 是**未决问题**。
 - `decision` 是**项目决策**，必须显式给出 `summary` 与非空 `basis`（**决策依据**）。依据可以是资料单元（`kind="source"`）或另一条已记录的笔记版本（`kind="note"`）。没有依据的决定被 `evidence_required` 拒绝；模型建议、推论文本或来源标题都不能充当依据。
 - 引用不接受标题、URL 文本或摘要字符串：必须是与本项目 `query` 当前返回一致的块引用，否则 `not_found`/`stale_evidence`。跨项目块即使调用者能读两个项目也被拒绝。
+- **被引笔记的整条依赖链一并核验**：一条结论只有在它自己引用的每个资料单元都仍然有效时才是证据，因此新决定会检查被引笔记传递闭包里的所有资料单元，与直接引用的单元在同一阶段核验。链上任何一环过期都在**写入前**以 `stale_evidence` 拒绝，而不是先提交再在读取时标为不可用。历史版本不受影响。
 - `key` 是笔记的稳定身份：`note_id = "note:" + fingerprint([project_id, key])`，版本从 1 开始。身份只创建一次，之后只能通过 `note_revise` 增长；重复录入是 `version_conflict`。
 - 只有记录该笔记的身份可以修订或撤回它（`forbidden`）；同一项目的其他身份可以读取。
 
@@ -94,10 +95,13 @@ uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json mi
 决定依据里引用另一条笔记版本会形成引用图。服务在写入前遍历该图：
 
 - 笔记引用自己 → `citation_cycle`；
-- 两条笔记互相引用（环）→ `citation_cycle`；
-- 链长超过 `MAX_CITATION_DEPTH`（64）→ 同样 `citation_cycle` 失败关闭，而不是"走到上限就接受"。
+- **回边**（在被遍历的路径上再次遇到某条笔记，例如两条笔记互相引用）→ `citation_cycle`；
+- 链长超过 `MAX_CITATION_DEPTH`（64，根记为深度 1）→ 同样 `citation_cycle` 失败关闭，而不是"走到上限就接受"；
+- 一次遍历访问超过 `MAX_GRAPH_WORK`（4096）个节点 → 同样 `citation_cycle`，绝不用部分遍历的结论回答。
 
-因此一条结论永远不能成为它自己的证据。
+**菱形不是环**：两条研究各自引用同一份基础笔记、再由第三条把它们合起来，是正常的证据结构——共享祖先在第一条分支上走完，在第二条分支上去重，不判为环。同理，多条笔记引用同一条综合结论也不构成环。
+
+因此一条结论永远不能成为它自己的证据，而共享证据的正常综合不会被误杀。
 
 ## 查询、预算与接续
 
@@ -117,7 +121,11 @@ uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json mi
 
 ## 命令与验证
 
-CLI 与 MCP 入口与 TS-080/TS-081 相同，新增 `migrate-research-notes` 子命令与 7 个笔记工具（服务共 25 个工具）：
+CLI 与 MCP 入口与 TS-080/TS-081 相同，新增 `migrate-research-notes` 子命令与 7 个笔记工具（服务共 29 个工具）。
+
+**幂等键在入口处的形状**：`key` 是笔记的稳定身份，因此对同一身份的任何后续操作都需要它自己的操作键 `dedupe`。三个写工具（`note_record`、`note_revise`、`note_withdraw`）都接受可选 `dedupe`，省略时退化为 `key`：
+
+- 通过 MCP 修订一条已记录的笔记时必须给出 `dedupe`：不给会落到记录时的键上，被 `idempotency_conflict` 拒绝（同一个键绑定了另一个请求）；换一个新的 `key` 则被 `identity_conflict` 拒绝。`note_revise`/`note_withdraw` 因此各自需要独立键，同键同负载重放返回记录结果。
 
 ```powershell
 uv run python -m tianshu_memory.knowledge_cli --config C:/private/memory.json action --client alpha-writer --credential-env TIANSHU_PROJECT_SECRET C:/private/note.json

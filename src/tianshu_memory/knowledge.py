@@ -297,10 +297,10 @@ class Plan:
     def __call__(self, db, phase, seal_key=None, *, prepared=None, client=None):
         try:
             if self.application.note_domain:
+                from .research_notes import NoteActor, ProjectPort
                 from .research_notes import dispatch as notes_dispatch
 
                 return notes_dispatch(
-                    self.application,
                     db,
                     self.operation,
                     self.project_id,
@@ -309,6 +309,11 @@ class Plan:
                     seal_key,
                     self.sources,
                     phase,
+                    # The identity is resolved once here, and the note domain's only access to
+                    # project storage is the port below: it reads the project version and the
+                    # declared state, and advances the version after a committed note write.
+                    actor=NoteActor(client),
+                    project_port=ProjectPort(db, self.project_id),
                 )
             if self.application.lesson_domain:
                 return self._lessons(db, phase, seal_key)
@@ -527,7 +532,6 @@ class KnowledgeApplication:
                 require(row is not None, "not_found", 404)
                 return json.loads(row[0])
             captured = plan(db, "capture", seal_key, client=client)
-
         # Phase 2 does all slow work outside any transaction: imports fetch their source, every
         # referenced evidence file is re-read, and a registered working directory is observed
         # with bounded read-only Git calls. No lock is held here.
@@ -567,7 +571,7 @@ class KnowledgeApplication:
                     "INSERT INTO knowledge_projects(id,registration) VALUES (?,?)",
                     (project_id, canonical(project)),
                 )
-            result = plan(db, "serve", seal_key, prepared=prepared)
+            result = plan(db, "serve", seal_key, prepared=prepared, client=client)
             if operation in IDEMPOTENT:
                 db.execute(
                     "INSERT INTO knowledge_operations VALUES (?,?,?,?)",

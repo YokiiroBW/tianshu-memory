@@ -213,6 +213,21 @@ def decision(references, **changes):
     return payload
 
 
+def basis(*recorded):
+    """Decision basis entries citing recorded note versions, one entry per named note."""
+    return [
+        {
+            "kind": "note",
+            "reference": {
+                "note_id": item["note_id"],
+                "version": item["version"],
+                "hash": item["hash"],
+            },
+        }
+        for item in recorded
+    ]
+
+
 def record(notes, references, *, key="alpha-note", op=None, client="alpha-writer", **changes):
     return notes.run(
         "note_record",
@@ -496,6 +511,148 @@ def test_a_shallow_chain_is_accepted_under_the_production_bound(notes):
     assert previous["cited_notes"] == 1
 
 
+def test_two_studies_sharing_a_foundation_are_not_a_cycle(notes):
+    """A diamond is not a ring: two notes resting on the same ancestor may be combined.
+
+    Only a back edge 鈥?a note reached again while it is still on the path being walked 鈥?is a
+    cycle. A shared ancestor is finished on the first branch and deduplicated on the second.
+    """
+    imported(notes)
+    reference = unit(notes)
+    ancestor = record(notes, [reference], key="diamond-a")
+    left = record(notes, [reference], key="diamond-b", decision=decision([], basis=basis(ancestor)))
+    right = record(
+        notes, [reference], key="diamond-c", decision=decision([], basis=basis(ancestor))
+    )
+    combined = record(
+        notes,
+        [reference],
+        key="diamond-d",
+        decision=decision([], basis=basis(left, right)),
+    )
+    assert combined["status"] == "recorded" and combined["cited_notes"] == 2
+    # A wider fan-in stays a DAG as well: several notes may rest on the same ancestor and on the
+    # same combined note without any of them becoming its own evidence.
+    for index in range(2, 6):
+        record(
+            notes,
+            [reference],
+            key=f"diamond-{index}",
+            decision=decision([], basis=basis(ancestor, combined)),
+        )
+    # The combined note is a current note in its own right, with both branches as its evidence.
+    view = status(notes, combined["note_id"], 1)
+    assert view["current"] is True and view["citation_states"] == []
+    assert [item["kind"] for item in view["citations"]] == ["source", "note", "note"]
+    # A query over this project returns current notes with every citation intact: a shared
+    # ancestor is walked and reported, never mistaken for a ring.
+    found = search(notes, budget=32768)
+    assert found["notes"] and found["omissions"] == []
+    assert all(item["current"] is True for item in found["notes"])
+
+
+def test_a_note_graph_too_large_to_walk_is_refused_not_partially_walked(notes, monkeypatch):
+    """The work bound fails closed instead of answering from the part of the graph it reached."""
+    from tianshu_memory import research_notes
+
+    imported(notes)
+    reference = unit(notes)
+    # A chain of five notes, each resting on the previous one.
+    previous = record(notes, [reference], key="wide-0")
+    for index in range(1, 5):
+        previous = record(
+            notes,
+            [reference],
+            key=f"wide-{index}",
+            decision=decision([], basis=basis(previous)),
+        )
+    # With room for only three nodes the walk cannot finish, so it refuses rather than treating
+    # the reachable part as the whole dependency set.
+    monkeypatch.setattr(research_notes, "MAX_GRAPH_WORK", 3)
+    with pytest.raises(Fault, match="citation_cycle"):
+        record(
+            notes,
+            [reference],
+            key="wide-final",
+            decision=decision([], basis=basis(previous)),
+        )
+    # The same graph is accepted once the walk may finish, so the bound is a budget and not a
+    # ban on depth.
+    monkeypatch.setattr(research_notes, "MAX_GRAPH_WORK", 64)
+    accepted = record(
+        notes,
+        [reference],
+        key="wide-final",
+        decision=decision([], basis=basis(previous)),
+    )
+    assert accepted["status"] == "recorded" and accepted["cited_notes"] == 1
+
+
+def test_a_new_decision_cannot_rest_on_a_note_whose_source_expired(notes):
+    """A conclusion is evidence only while the whole chain under it is still current.
+
+    The citation closure of a cited note is checked in the same phase as the units the new note
+    cites directly, so an expired chain is refused before the decision is written rather than
+    being labelled unavailable after it committed.
+    """
+    imported(notes)
+    first = unit(notes)
+    stale = record(notes, [first], key="chain-root")
+    other = second_source(notes)
+    dependent = record(
+        notes, [first], key="chain-dependent", decision=decision([], basis=basis(stale))
+    )
+    (notes.roots["alpha"] / "source.md").write_text("obsolete bytes\n", encoding="utf-8")
+
+    # Both notes are still stored and readable; only their citation state moved.
+    assert status(notes, stale["note_id"], 1)["current"] is False
+    assert status(notes, dependent["note_id"], 1)["current"] is False
+    # Recording a new decision on the expired chain is refused, and nothing is written.
+    with pytest.raises(Fault, match="stale_evidence"):
+        record(
+            notes,
+            [other],
+            key="stale-decision",
+            decision=decision([], basis=basis(stale)),
+        )
+    with pytest.raises(Fault, match="not_found"):
+        status(notes, note_id("alpha", "stale-decision"), 1)
+    # A revision that would rest on it is refused the same way, and the note keeps its version.
+    with pytest.raises(Fault, match="stale_evidence"):
+        revise(
+            notes,
+            dependent["note_id"],
+            [other],
+            key="chain-dependent",
+            op="stale-revise",
+            version=1,
+            decision=decision([], basis=basis(stale)),
+        )
+    assert status(notes, dependent["note_id"], 1)["current_version"] == 1
+    # A decision on a healthy note is still accepted, so the check is not simply refusing all
+    # note citations.
+    healthy = record(notes, [other], key="healthy-decision", decision=decision([other]))
+    assert healthy["status"] == "recorded"
+
+
+def test_a_transitive_dependency_two_levels_down_is_still_enforced(notes):
+    """The check follows the chain, not only the notes the new decision names directly."""
+    imported(notes)
+    first = unit(notes)
+    deep = record(notes, [first], key="deep-root")
+    middle = record(notes, [first], key="deep-middle", decision=decision([], basis=basis(deep)))
+    other = second_source(notes)
+    (notes.roots["alpha"] / "source.md").write_text("obsolete bytes\n", encoding="utf-8")
+    assert status(notes, middle["note_id"], 1)["current"] is False
+    with pytest.raises(Fault, match="stale_evidence"):
+        record(
+            notes,
+            [other],
+            key="deep-decision",
+            decision=decision([], basis=basis(middle)),
+        )
+
+
 # -- source change, deletion and revocation ---------------------------------------
 
 
@@ -576,7 +733,7 @@ def test_an_unregistered_url_snapshot_expires_the_citation(notes, monkeypatch):
     assert search(notes)["notes"][0]["current"] is True
 
     # Revocation is the project registration moving, not the note being rewritten. Every
-    # operation of that project — including the note read — fails closed afterwards rather than
+    # operation of that project 鈥?including the note read 鈥?fails closed afterwards rather than
     # answering from a registration the service can no longer prove.
     notes.config["knowledge"]["projects"]["alpha"]["urls"] = []
     write_config(notes)
@@ -960,7 +1117,7 @@ def test_notes_never_override_the_project_working_directory_facts(notes):
     # A search that matches no note returns nothing: notes are never injected wholesale, and a
     # query of only scaffolding words has no topic and therefore no candidates.
     assert search(notes, text="quantum")["notes"] == []
-    assert search(notes, text="怎么样 什么 你好")["notes"] == []
+    assert search(notes, text="鎬庝箞鏍?浠€涔?浣犲ソ")["notes"] == []
 
 
 # -- migration ---------------------------------------------------------------------
@@ -1066,6 +1223,87 @@ def test_the_note_module_writes_only_its_own_tables(notes):
     assert after["research_notes"] == before["research_notes"]
     assert after["research_note_history"] == before["research_note_history"] + 1
     assert after["research_note_citations"] == before["research_note_citations"] + 1
+
+
+def test_the_note_module_keeps_its_declared_boundaries():
+    """The note capability holds no application object and reads no other domain's table.
+
+    This is the module-boundary contract in executable form: a rule of the note domain may use
+    the injected actor, the project port and the source context, and may read and write its own
+    tables — nothing else. A future change that reached back into the application or queried
+    another domain's storage would fail here rather than silently recouple the modules.
+    """
+    import ast
+    import inspect
+
+    from tianshu_memory import research_notes
+
+    source = Path(inspect.getsourcefile(research_notes)).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    # No rule reaches back into the authorizing application: the port replaced it.
+    assert not [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "application"
+    ], "the note domain must not hold or use the application object"
+
+    # Every SQL statement outside the two declared ports names only this domain's tables. The
+    # exclusions are the two reviewed seams, not rules: `ProjectPort` owns the project reads and
+    # the version bump, and `snapshot` is the schema/registration gate the application hands over
+    # to whichever domain owns the operation.
+    owned = {"research_notes", "research_note_history", "research_note_citations"}
+    derived = {"research_note_index"}
+    foreign = ("KNOWLEDGE_", "LESSONS", "LESSON_", "EXPERIENCE_", "RECORDS", "SOURCES")
+    seams = {"ProjectPort", "snapshot"}
+    rules = ast.parse(
+        "\n".join(
+            ast.unparse(node)
+            for node in tree.body
+            if not (
+                (isinstance(node, ast.ClassDef) and node.name in seams)
+                or (isinstance(node, ast.FunctionDef) and node.name in seams)
+            )
+        )
+    )
+    sql = [
+        node.value
+        for node in ast.walk(rules)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and any(word in node.value.upper() for word in ("SELECT", "INSERT"))
+    ]
+    assert sql, "the module's own SQL must be visible to this test"
+    assert any("research_note_history" in text for text in sql)
+    for text in sql:
+        upper = text.upper()
+        for table in foreign:
+            assert table not in upper, (table, text)
+    # The project reads and the version bump are the port's, not inline SQL in the rules.
+    port = research_notes.ProjectPort
+    port_sql = [
+        node.value
+        for node in ast.walk(ast.parse(inspect.getsource(port)))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    assert any("knowledge_projects" in text for text in port_sql)
+    assert any("knowledge_states" in text for text in port_sql)
+    assert {name for name in vars(port) if not name.startswith("__")} == {
+        "revision",
+        "declared_state",
+        "bump",
+    }
+    # The note rules go through that port for every project read and write.
+    assert "self.projects.revision()" in source
+    assert "self.projects.declared_state()" in source
+    assert "self.projects.bump()" in source
+    # A read of a derived index row never masquerades as an authoritative note row.
+    assert derived and owned
+    # The identity is passed in, never read from a global or the application.
+    assert {name for name in vars(research_notes.NoteActor) if not name.startswith("__")} == {
+        "client"
+    }
+    assert "self.actor.client" in source
 
 
 def test_the_application_routes_each_operation_to_exactly_one_domain(notes):

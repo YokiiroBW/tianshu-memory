@@ -27,16 +27,38 @@
 knowledge_cli / knowledge_mcp        （适配器：参数、身份、错误映射）
         ↓  只调用
 KnowledgeApplication.execute          （应用用例：授权、幂等、三阶段事务）
-        ↓  按域路由
+        ↓  按域路由，注入 NoteActor + ProjectPort + Sources
 research_notes.dispatch               （笔记域规则）
         ↓  ← 复用窄端口
-domain / SourceContext.observe / SourceContext.blocks / Store.transaction
+domain / SourceContext.observe / SourceContext.blocks / ProjectPort / Store.transaction
 ```
 
-- `research_notes.py` 的导入只有 `domain`（纯规则与错误码）与标准库；不导入 `knowledge.py`、`lessons.py`、`app.py`、HTTP 框架或任何数据库驱动。
+- `research_notes.py` 的模块级导入只有 `domain`（纯规则与错误码）、`knowledge` 的两个公开标量校验器（`string`/`integer`，使笔记参数与其它知识参数由同一条规则拒绝）与标准库；不导入 `lessons.py`、`app.py`、HTTP 框架或任何数据库驱动。
+- **不持有 `KnowledgeApplication`**：规则里没有 `application` 成员，身份由 `NoteActor` 注入，项目读写由 `ProjectPort` 注入。凭据留在授权代码里，只以已派生的包 seal key 进入本模块，不作为可再校验的值传入。
 - 资料单元核验经由应用已有的证据端口（`Sources.context()` → `SourceContext.observe/blocks`），没有第二套来源库、权限缓存或哈希实现。
 - 反向依赖为零：`domain`、`store`、`lessons` 不导入 `research_notes`；`knowledge.py` 只在 `_planner`/`Plan` 内按操作名延迟导入该模块。
 - 没有共享连接、全局变量、跨工作树导入或私有成员访问：笔记模块不使用 `Evidence._revision`、`Plan.pending`、`Store._connect` 等私有成员。
+
+## 注入端口
+
+| 端口 | 提供者 | 内容 | 笔记域不得做的事 |
+| --- | --- | --- | --- |
+| `NoteActor(client)` | `Plan.__call__`（身份在授权后解析一次） | 不可变的操作者身份，用于"只有记录者能改" | 不从全局或应用对象读身份；不接触凭据 |
+| `ProjectPort(db, project_id)` | `Plan.__call__` | `revision()`、`declared_state()`、`bump()` | 不直接写 `knowledge_projects`/`knowledge_states`，不改项目状态内容 |
+| `Sources.context(db, project_id, phase)` | 既有知识域 | 资料单元核验、项目 revision 未变判定、捕获段期望记录 | 不另造来源核验、权限缓存或哈希 |
+| `research_notes.snapshot` | 应用按域交接 | schema/登记门（含 `knowledge_projects` 登记比对） | 不在业务规则内重复该检查 |
+
+可执行证据：`tests/test_research_notes.py::test_the_note_module_keeps_its_declared_boundaries` 解析模块 AST，断言规则代码里没有 `application` 属性访问、除上述两个端口外没有其它知识域表名，且项目读写确实走 `self.projects.revision()/declared_state()/bump()`。
+
+## 引用图的写入前核验
+
+| 项 | 规则 |
+| --- | --- |
+| 环判定 | 只有**回边**（在被遍历路径上再次遇到）才是环：自引、二元环拒绝；菱形共享祖先不是环，第二分支去重即可 |
+| 深度上限 | 根记为深度 1，路径超过 `MAX_CITATION_DEPTH`（64）即拒绝，而不是"走到上限就接受" |
+| 工作量上限 | 单次遍历最多访问 `MAX_GRAPH_WORK`（4096）个节点；超预算同样拒绝，绝不用部分遍历的结论回答 |
+| 传递来源依赖 | 被引笔记的整条引用闭包中的**所有资料单元**与直接引用的单元在同一阶段核验：捕获段只记录期望（事务内、无文件 I/O），提交段逐条严格核验，因此过期链上的新决定在写入前就被拒绝 |
+| 历史 | 拒绝只影响新写入；已存储版本与其引用行一律保持原样 |
 
 ## 接口与状态所有者
 
@@ -59,11 +81,15 @@ domain / SourceContext.observe / SourceContext.blocks / Store.transaction
 | 禁止项 | 核对结果 |
 | --- | --- |
 | 再造一套来源库或权限缓存 | 无：引用核验全部经 `SourceContext` 与 `KnowledgeApplication` 授权 |
+| 笔记规则持有整个应用对象 | 无：身份与项目读写由 `NoteActor`/`ProjectPort` 注入，规则代码内无 `application` 访问（AST 用例断言） |
+| 笔记规则直接读写其他知识域表 | 无：规则内的 SQL 只出现在笔记域表；项目读取与版本递增只在 `ProjectPort`（AST 用例断言） |
 | CLI/MCP 分别实现规则或入口直接 SQL | 无：两个入口只做参数、身份、错误映射，规则只在 `research_notes.py` |
 | 笔记擅自修改源、项目状态、工作目录事实、错题本 | 无：`test_the_note_module_writes_only_its_own_tables` 按表计数实测 |
 | 反向控制 recover 流程 | 无：接续使用独立的 `note_recover` 有界只读包，不改 `continuation_recover` |
 | 假身份走聊天 SourceAuthority | 无：仍由 `KnowledgeApplication.execute` 的 client/credential 授权 |
-| 循环引用充当自己的证据 | 拒绝：`citation_cycle`（自引、二元环、超过深度上限的链） |
+| 循环引用充当自己的证据 | 拒绝：`citation_cycle`（自引、回边环、超过深度或工作量上限的遍历） |
+| 过期链上的新决定被接受 | 拒绝：被引笔记的传递资料依赖在同一阶段核验，写入前即 `stale_evidence` |
+| 共享祖先被误判为环 | 无：菱形与宽扇入实测可写入且读回为当前 |
 | 模型建议自动升级为决定 | 无模型调用；决定必须显式给出 `summary` 与非空 `basis` |
 | 旧结论静默重新标当前 | 读取时按当前来源状态推导 `current`/`citation_states`，不改写历史版本 |
 | 失权正文泄漏 | 过期引用只返回状态与引用坐标，不返回正文（`test_a_deleted_source_expires_the_citation_and_leaks_no_text`） |

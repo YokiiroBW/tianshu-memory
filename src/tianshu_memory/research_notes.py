@@ -26,6 +26,10 @@ from .domain import (
     terms,
 )
 
+# The two scalar validators are the knowledge domain's own public helpers, so a note argument is
+# rejected by exactly the same rule as any other knowledge argument instead of a copy of it.
+from .knowledge import integer, string
+
 BLOCK_FIELDS = "block_id document_id version hash"
 NOTE_REFERENCE_FIELDS = "note_id version hash"
 STATEMENT_FIELDS = "kind statement source"
@@ -34,9 +38,13 @@ NOTE_REQUIRED = "question source_statements inferences open_questions"
 NOTE_OPTIONAL = ("decision",)
 MAX_CANDIDATES = 128
 # A citation chain is walked at most this many levels while a note is recorded or revised.
-# A deeper chain is refused instead of being walked further, so a cycle can never hide behind
-# the bound by making the walk give up.
+# A chain that has not ended within the bound is refused instead of being walked further, so a
+# cycle can never hide behind the bound by making the walk give up.
 MAX_CITATION_DEPTH = 64
+# Total node visits one dependency walk may spend. A note graph is a DAG whose shared ancestors
+# are revisited along each path, so a pathological graph could otherwise cost exponential time;
+# spending the budget is refused rather than silently answering from a partial walk.
+MAX_GRAPH_WORK = 4096
 # State of one citation, derived at read time from the current state of what it names.
 CITATION_LIVE = "live"
 CITATION_EXPIRED = "expired"
@@ -193,69 +201,82 @@ def seal(package, seal_key):
     return hmac.new(seal_key.encode(), canonical(body).encode(), hashlib.sha256).hexdigest()
 
 
-class CitationGraph:
-    """Read-only view of the stored citation edges, used to refuse a cyclic chain.
+class NoteActor:
+    """The immutable identity of one dispatch, resolved before any phase runs.
 
-    A note that cites itself, or a ring of notes that cite each other, would let a conclusion
-    become its own evidence. Nothing about the cited content is read here: only the edges.
+    A note capability needs to know who is acting, but it does not need the application that
+    authorized the request. The credential stays with the authorization code: it reaches this
+    module only through the already-derived package seal key, never as a value to re-check.
+    """
+
+    __slots__ = ("client",)
+
+    def __init__(self, client):
+        self.client = client
+
+
+class ProjectPort:
+    """The explicit project reads and the one project write a note operation may perform.
+
+    This is the whole of what the note capability knows about another domain's storage: read the
+    project's version, read the declared project state, and advance the project version after a
+    committed note write. The note tables themselves are read by this module, and no other
+    knowledge-domain table is touched.
     """
 
     def __init__(self, db, project_id):
         self.db = db
         self.project_id = project_id
 
-    def children(self, identifier, version):
-        rows = self.db.execute(
-            "SELECT cited_note_id FROM research_note_citations "
-            "WHERE note_id=? AND version=? AND kind='note' ORDER BY ordinal",
-            (identifier, version),
-        ).fetchall()
-        return [row["cited_note_id"] for row in rows if row["cited_note_id"]]
+    def revision(self):
+        """The project version, or `project_uninitialized` when the project row is absent."""
+        row = self.db.execute(
+            "SELECT revision FROM knowledge_projects WHERE id=?", (self.project_id,)
+        ).fetchone()
+        require(row is not None, "project_uninitialized", 409)
+        return row["revision"]
 
-    def closure(self, roots):
-        """Every note reachable from `roots`, or `citation_cycle` when a note is reached twice.
+    def declared_state(self):
+        """The goal and unfinished items the project itself declared, or `(None, [])`."""
+        row = self.db.execute(
+            "SELECT payload FROM knowledge_states WHERE project_id=?", (self.project_id,)
+        ).fetchone()
+        if row is None:
+            return None, []
+        payload = json.loads(row["payload"])
+        return payload["goal"], payload["unfinished"]
 
-        The walk is bounded by `MAX_CITATION_DEPTH`. A chain that has not ended within the bound
-        is refused rather than silently accepted, so a cycle can never hide behind it. A note of
-        another project is unresolvable here instead of being followed.
-        """
-        seen = set()
-        level = list(roots)
-        for _ in range(MAX_CITATION_DEPTH + 1):
-            if not level:
-                return seen
-            following = []
-            for identifier in level:
-                require(identifier not in seen, "citation_cycle", 400)
-                seen.add(identifier)
-                row = self.db.execute(
-                    "SELECT version FROM research_notes WHERE id=? AND project_id=?",
-                    (identifier, self.project_id),
-                ).fetchone()
-                require(row is not None, "not_found", 404)
-                following.extend(self.children(identifier, row["version"]))
-            level = following
-        raise Fault("citation_cycle", 400)
+    def bump(self):
+        """Advance the project version, so a cached continuation package stops being current."""
+        self.db.execute(
+            "UPDATE knowledge_projects SET revision=revision+1 WHERE id=?", (self.project_id,)
+        )
 
 
 class ResearchNotes:
     """Record, revise, withdraw, query and inspect versioned research notes."""
 
-    def __init__(self, application, sources, db, project_id, *, phase):
-        self.application = application
-        self.sources = sources
+    def __init__(self, db, project_id, *, phase, actor, project_port, sources):
         self.db = db
         self.project_id = project_id
         self.phase = phase
+        self.actor = actor
+        self.projects = project_port
+        self.sources = sources
         # One dispatch reads each stored citation list at most once. The caches are dropped with
         # the object, so a later dispatch can never answer from an earlier phase.
         self._rows = {}
+        self._source_cache = {}
 
     # -- storage helpers ---------------------------------------------------------
 
     def _context(self):
         """The lesson evidence context of this project in this phase, reused unchanged."""
-        return self.sources.context(self.db, self.project_id, self.phase)
+        if self._source_cache.get("context") is None:
+            self._source_cache["context"] = self.sources.context(
+                self.db, self.project_id, self.phase
+            )
+        return self._source_cache["context"]
 
     def _note_row(self, identifier):
         return self.db.execute(
@@ -289,6 +310,60 @@ class ResearchNotes:
         payload = json.loads(stored["payload"])
         return row, payload, citation_hash(payload, self._citations(identifier, version))
 
+    # -- citation graph ----------------------------------------------------------
+
+    def _walk(self, roots):
+        """Every note reachable from `roots`, refusing a genuine cycle.
+
+        A cycle is a back edge: a note reached again **while it is still on the path being
+        walked**. A diamond is not a cycle — two studies that both rest on the same foundational
+        note may legitimately be combined — so a node already finished on another branch is
+        deduplicated rather than refused. Two bounds keep the walk honest: a root counts as depth
+        1 and the path is capped at `MAX_CITATION_DEPTH`, and the total node visits at
+        `MAX_GRAPH_WORK`. Exceeding either is refused rather than answered from a partial walk, so
+        a cycle can never hide behind a bound by making the walk give up. A cited note of another
+        project is unresolvable here instead of being followed.
+        """
+        nodes = set()
+        work = [0]
+
+        def descend(identifier, path, depth):
+            require(identifier not in path, "citation_cycle", 400)
+            require(depth <= MAX_CITATION_DEPTH, "citation_cycle", 400)
+            if identifier in nodes:
+                return
+            work[0] += 1
+            require(work[0] <= MAX_GRAPH_WORK, "citation_cycle", 400)
+            nodes.add(identifier)
+            row = self.db.execute(
+                "SELECT version FROM research_notes WHERE id=? AND project_id=?",
+                (identifier, self.project_id),
+            ).fetchone()
+            require(row is not None, "not_found", 404)
+            for child in self._cited_notes(identifier, row["version"]):
+                descend(child, path | {identifier}, depth + 1)
+
+        for root in roots:
+            descend(root, frozenset(), 1)
+        return nodes
+
+    def _cited_notes(self, identifier, version):
+        """The note identities one stored version cites, in the order they were recorded."""
+        rows = self.db.execute(
+            "SELECT cited_note_id FROM research_note_citations "
+            "WHERE note_id=? AND version=? AND kind='note' ORDER BY ordinal",
+            (identifier, version),
+        ).fetchall()
+        return [row["cited_note_id"] for row in rows if row["cited_note_id"]]
+
+    def _cited_sources(self, identifier, version):
+        """The source units one stored version cites, as evidence references."""
+        return [
+            self._citation_reference(citation)
+            for citation in self._citations(identifier, version)
+            if citation["kind"] == "source"
+        ]
+
     # -- write validation --------------------------------------------------------
 
     def _refuse_cycles(self, identifier, note):
@@ -299,33 +374,75 @@ class ResearchNotes:
             if entry["kind"] == "note"
         ]
         require(identifier not in roots, "citation_cycle", 400)
-        require(
-            identifier not in CitationGraph(self.db, self.project_id).closure(roots),
-            "citation_cycle",
-            400,
-        )
+        require(identifier not in self._walk(roots), "citation_cycle", 400)
+
+    def _note_evidence(self, reference):
+        """One cited note version as evidence, or `stale_evidence` when it is not usable.
+
+        A conclusion can only be cited while it is still a current, unretracted version whose
+        recorded fingerprint matches the one this citation binds. Resolving it here, before any
+        write, is what stops a withdrawn or superseded conclusion from being adopted after the
+        fact.
+        """
+        row, _, digest = self._stored(reference["note_id"], reference["version"])
+        require(row["state"] == "ready", "stale_evidence", 409)
+        require(row["version"] == reference["version"], "stale_evidence", 409)
+        require(digest == reference["hash"], "stale_evidence", 409)
+        return row
+
+    def _dependencies(self, note):
+        """Every source unit this note depends on, including through the notes it cites.
+
+        A cited note is evidence only while the whole chain under it is current: a conclusion
+        that rests on a source which has since changed is no longer that conclusion. The walk
+        therefore follows cited notes and collects their source units too, and every collected
+        unit is verified exactly like a unit the new note cites directly. The walk is the same
+        bounded, cycle-refusing walk the write path uses, so a stored ring is refused instead of
+        being followed.
+        """
+        roots = [
+            entry["reference"]["note_id"]
+            for entry in note.get("decision", {}).get("basis", [])
+            if entry["kind"] == "note"
+        ]
+        units = [statement["source"] for statement in note["source_statements"]] + [
+            entry["reference"]
+            for entry in note.get("decision", {}).get("basis", [])
+            if entry["kind"] != "note"
+        ]
+        for identifier in sorted(self._walk(roots)):
+            row = self.db.execute(
+                "SELECT version FROM research_notes WHERE id=? AND project_id=?",
+                (identifier, self.project_id),
+            ).fetchone()
+            require(row is not None, "not_found", 404)
+            units.extend(self._cited_sources(identifier, row["version"]))
+        return units
 
     def _check_citations(self, note):
-        """Verify every cited source unit and every cited note version in this phase.
+        """Verify every source unit and every cited note version in this phase.
 
         A source unit goes through the project's existing evidence check, so a citation can only
         bind a registered document version whose bytes are still the ones that were read. A note
         citation is resolved inside this project and must be a current `ready` version whose
-        recorded fingerprint still matches, which is what stops a retracted conclusion from
-        being cited as evidence after the fact.
+        recorded fingerprint still matches, **and every source unit under it must still be
+        current**: the transitive dependencies are checked in the same phase as the direct ones,
+        so an expired chain is refused before the new decision is written rather than being
+        labelled unavailable after it committed.
         """
         context = self._context()
-        for statement in note["source_statements"]:
-            context.blocks(statement["source"])
         for entry in note.get("decision", {}).get("basis", []):
-            if entry["kind"] != "note":
-                context.blocks(entry["reference"])
-                continue
-            reference = entry["reference"]
-            row, _, digest = self._stored(reference["note_id"], reference["version"])
-            require(row["state"] == "ready", "stale_evidence", 409)
-            require(row["version"] == reference["version"], "stale_evidence", 409)
-            require(digest == reference["hash"], "stale_evidence", 409)
+            if entry["kind"] == "note":
+                self._note_evidence(entry["reference"])
+        units = self._dependencies(note)
+        if self.phase == "capture":
+            # Capture runs inside the transaction and must not touch the filesystem: it records
+            # what has to be read, and the serving phase decides from the result.
+            for unit in units:
+                context.observe(unit)
+        else:
+            for unit in units:
+                context.blocks(unit)
         require(context.revision_unchanged(), "project_conflict", 409)
 
     # -- writes ------------------------------------------------------------------
@@ -333,8 +450,8 @@ class ResearchNotes:
     def record(self, args):
         required = "key expected_version note"
         exact_fields(args, f"{required} dedupe" if "dedupe" in args else required)
-        self.application.string(args["key"], 128)
-        self.application.integer(args["expected_version"], 0)
+        string(args["key"], 128)
+        integer(args["expected_version"], 0)
         validate_note(args["note"])
         require(len(canonical(args["note"]).encode()) <= 16384, "note_too_large", 413)
         identifier = note_id(self.project_id, args["key"])
@@ -354,9 +471,9 @@ class ResearchNotes:
     def revise(self, args):
         required = "key note_id expected_version note"
         exact_fields(args, f"{required} dedupe" if "dedupe" in args else required)
-        self.application.string(args["key"], 128)
-        self.application.string(args["note_id"], 128)
-        self.application.integer(args["expected_version"], 1)
+        string(args["key"], 128)
+        string(args["note_id"], 128)
+        integer(args["expected_version"], 1)
         validate_note(args["note"])
         require(len(canonical(args["note"]).encode()) <= 16384, "note_too_large", 413)
         old = self._note_row(args["note_id"])
@@ -365,7 +482,7 @@ class ResearchNotes:
         require(old["version"] == args["expected_version"], "version_conflict", 409)
         # A note belongs to the identity that recorded it: another identity of the same project
         # may read it, and may not rewrite it or its citations.
-        require(old["owner"] == self.application.client, "forbidden", 403)
+        require(old["owner"] == self.actor.client, "forbidden", 403)
         require(
             old["payload"] and note_of(json.loads(old["payload"])) == args["key"],
             "identity_conflict",
@@ -422,7 +539,7 @@ class ResearchNotes:
                     identifier,
                     self.project_id,
                     payload["key"],
-                    self.application.client,
+                    self.actor.client,
                     version,
                     "ready",
                     canonical(payload),
@@ -437,7 +554,7 @@ class ResearchNotes:
             "INSERT INTO research_note_index VALUES (?,?,?)",
             (identifier, self.project_id, note_text(payload)),
         )
-        self.application.bump(self.db, self.project_id)
+        self.projects.bump()
         return {
             "status": status,
             "note_id": identifier,
@@ -491,16 +608,21 @@ class ResearchNotes:
         Every earlier version stays in history with the citation state it had, and the note
         leaves the query index, so a withdrawn conclusion is never returned as current.
         """
-        exact_fields(args, "key note_id expected_version reason")
-        self.application.string(args["key"], 128)
-        self.application.string(args["note_id"], 128)
-        self.application.integer(args["expected_version"], 1)
+        exact_fields(
+            args,
+            "key note_id expected_version reason dedupe"
+            if "dedupe" in args
+            else "key note_id expected_version reason",
+        )
+        string(args["key"], 128)
+        string(args["note_id"], 128)
+        integer(args["expected_version"], 1)
         text(args["reason"], 1000)
         old = self._note_row(args["note_id"])
         require(old is not None, "not_found", 404)
         require(old["version"] == args["expected_version"], "version_conflict", 409)
         require(old["state"] != "withdrawn", "already_withdrawn", 409)
-        require(old["owner"] == self.application.client, "forbidden", 403)
+        require(old["owner"] == self.actor.client, "forbidden", 403)
         if self.phase == "capture":
             return None
         payload = json.loads(old["payload"])
@@ -517,7 +639,7 @@ class ResearchNotes:
             (args["note_id"], old["version"] + 1, canonical(stored)),
         )
         self.db.execute("DELETE FROM research_note_index WHERE note_id=?", (args["note_id"],))
-        self.application.bump(self.db, self.project_id)
+        self.projects.bump()
         return {
             "status": "withdrawn",
             "note_id": args["note_id"],
@@ -708,8 +830,8 @@ class ResearchNotes:
     def query(self, args):
         """Search this project's current notes; a note and all its citations are one unit."""
         exact_fields(args, "text budget_bytes")
-        self.application.string(args["text"], 1024)
-        self.application.integer(args["budget_bytes"], 256, 32768)
+        string(args["text"], 1024)
+        integer(args["budget_bytes"], 256, 32768)
         result = {
             "project_id": self.project_id,
             "notes": [],
@@ -752,25 +874,17 @@ class ResearchNotes:
     def recover(self, args, project, seal_key):
         """A short, sealed package of the current state and this project's current notes."""
         exact_fields(args, "text budget_bytes")
-        self.application.string(args["text"], 1024)
-        self.application.integer(args["budget_bytes"], 1024, 32768)
+        string(args["text"], 1024)
+        integer(args["budget_bytes"], 1024, 32768)
+        goal, unfinished = self.projects.declared_state()
         result = dict(
             self.query(args),
-            revision=self.db.execute(
-                "SELECT revision FROM knowledge_projects WHERE id=?", (self.project_id,)
-            ).fetchone()[0],
+            revision=self.projects.revision(),
             registration=fingerprint(project),
-            goal=None,
-            unfinished=[],
+            goal=goal,
+            unfinished=unfinished,
             authority="explicit_operator_research_note",
         )
-        state = self.db.execute(
-            "SELECT * FROM knowledge_states WHERE project_id=?", (self.project_id,)
-        ).fetchone()
-        if state:
-            payload = json.loads(state["payload"])
-            result["goal"] = payload["goal"]
-            result["unfinished"] = payload["unfinished"]
         # Notes are dropped whole from the end until the package fits; the state section is never
         # split and no note is ever returned with part of its citation list missing.
         while len(canonical(result).encode()) + 80 > args["budget_bytes"] and result["notes"]:
@@ -783,8 +897,8 @@ class ResearchNotes:
     def status(self, args):
         """Read one stored note version, current or historical, with its citation state."""
         exact_fields(args, "note_id version")
-        self.application.string(args["note_id"], 128)
-        self.application.integer(args["version"], 1)
+        string(args["note_id"], 128)
+        integer(args["version"], 1)
         row, payload, _ = self._stored(args["note_id"], args["version"])
         self._observe_citations([(args["note_id"], args["version"])])
         view = self._view(payload, args["version"])
@@ -805,10 +919,7 @@ class ResearchNotes:
         valid = (
             valid
             and package.get("project_id") == self.project_id
-            and package.get("revision")
-            == self.db.execute(
-                "SELECT revision FROM knowledge_projects WHERE id=?", (self.project_id,)
-            ).fetchone()[0]
+            and package.get("revision") == self.projects.revision()
         )
         if not valid:
             return {"valid": False, "reason": "stale_or_tampered"}
@@ -845,9 +956,17 @@ class ResearchNotes:
         return {"valid": True, "reason": "current"}
 
 
-def dispatch(application, db, operation, project_id, project, args, seal_key, sources, phase):
-    """Entry point used by KnowledgeApplication for every research-note operation."""
-    book = ResearchNotes(application, sources, db, project_id, phase=phase)
+def dispatch(
+    db, operation, project_id, project, args, seal_key, sources, phase, *, actor, project_port
+):
+    """Entry point used by KnowledgeApplication for every research-note operation.
+
+    The caller resolves the identity and the project port before any phase runs; this module
+    never reaches back into the application that authorized the request.
+    """
+    book = ResearchNotes(
+        db, project_id, phase=phase, actor=actor, project_port=project_port, sources=sources
+    )
     if operation == "note_record":
         return book.record(args)
     if operation == "note_revise":
