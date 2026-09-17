@@ -14,7 +14,8 @@
 
 | 入口 | 修改内容 | 未做的事 |
 | --- | --- | --- |
-| `knowledge.py`（`KnowledgeApplication`） | 组合：`NOTE_OPERATIONS`/`NOTE_WRITE` 加入操作集合与幂等集合；`_planner` 多选一个域模块；`Plan.__call__` 路由到 `research_notes.dispatch`；`_authorize` 接受笔记操作名 | 笔记业务规则一行未写；`READ`/`WRITE`/错题本分支未改语义 |
+| `knowledge.py`（`KnowledgeApplication`） | 组合：`NOTE_OPERATIONS`/`NOTE_WRITE` 加入操作集合与幂等集合；`_planner` 多选一个域模块；`Plan.__call__` 路由到 `research_notes.dispatch` 并装配 `NoteActor`/`ProjectAdapter`；`_authorize` 接受笔记操作名；`ProjectAdapter`（项目表读写实现）与 `validate` 委托 | 笔记业务规则一行未写；`READ`/`WRITE`/错题本分支未改语义 |
+| `validate.py`（新增） | 三个共享标量校验器（`exact`/`integer`/`string`）的唯一实现，供各域复用 | 不含任何域规则、不导入任何域模块 |
 | `lessons.py`（`SourceContext`） | 新增两个窄公开端口 `observe()`、`revision_unchanged()` | 错题本自身校验逻辑未改 |
 | `knowledge_migration.py` | 全新库安装时同一已审查步骤内追加 `install_research_notes` | 既有表与触发器未改 |
 | `store.py` | 新增 `migrate_research_notes` 委托方法，与既有 `migrate_lessons` 同形 | Store 事务/连接/迁移职责未变 |
@@ -27,28 +28,29 @@
 knowledge_cli / knowledge_mcp        （适配器：参数、身份、错误映射）
         ↓  只调用
 KnowledgeApplication.execute          （应用用例：授权、幂等、三阶段事务）
-        ↓  按域路由，注入 NoteActor + ProjectPort + Sources
-research_notes.dispatch               （笔记域规则）
+        ↓  按域路由，注入 NoteActor + ProjectAdapter + Sources
+research_notes.dispatch               （笔记域规则，叶子模块）
         ↓  ← 复用窄端口
-domain / SourceContext.observe / SourceContext.blocks / ProjectPort / Store.transaction
+domain / validate / SourceContext.observe / SourceContext.blocks / ProjectPort 契约 / Store.transaction
 ```
 
-- `research_notes.py` 的模块级导入只有 `domain`（纯规则与错误码）、`knowledge` 的两个公开标量校验器（`string`/`integer`，使笔记参数与其它知识参数由同一条规则拒绝）与标准库；不导入 `lessons.py`、`app.py`、HTTP 框架或任何数据库驱动。
-- **不持有 `KnowledgeApplication`**：规则里没有 `application` 成员，身份由 `NoteActor` 注入，项目读写由 `ProjectPort` 注入。凭据留在授权代码里，只以已派生的包 seal key 进入本模块，不作为可再校验的值传入。
+- `research_notes.py` 的模块级导入只有 `domain`（纯规则与错误码）、`validate`（三个共享标量校验器）与标准库；**不导入 `knowledge.py`、`lessons.py`、`app.py`、HTTP 框架或任何数据库驱动**。这一条由 AST 用例断言，因为"延迟导入"只避免加载期报错，并不消除依赖回边。
+- 标量校验器放在中立的 `validate.py`：知识域与笔记域由同一条规则拒绝参数，而不必互相导入；`knowledge.py` 的 `exact`/`integer`/`string` 委托给同一实现，历史调用点不变。
+- **不持有 `KnowledgeApplication`**：规则里没有 `application` 成员。身份由 `NoteActor`（冻结 DTO，二次赋值即报错）注入；项目读写由 `ProjectPort` **契约**注入，实现在拥有那些表的域里（`knowledge.ProjectAdapter`），由 `Plan` 装配。凭据留在授权代码里，只以已派生的包 seal key 进入本模块。
 - 资料单元核验经由应用已有的证据端口（`Sources.context()` → `SourceContext.observe/blocks`），没有第二套来源库、权限缓存或哈希实现。
-- 反向依赖为零：`domain`、`store`、`lessons` 不导入 `research_notes`；`knowledge.py` 只在 `_planner`/`Plan` 内按操作名延迟导入该模块。
+- 反向依赖：`domain`、`validate`、`store`、`lessons` 不导入 `research_notes`；`knowledge.py` 只在 `_planner`/`Plan` 内按操作名延迟导入该模块，用于选择 schema 门与装配端口，不复制任何笔记规则。
 - 没有共享连接、全局变量、跨工作树导入或私有成员访问：笔记模块不使用 `Evidence._revision`、`Plan.pending`、`Store._connect` 等私有成员。
 
 ## 注入端口
 
 | 端口 | 提供者 | 内容 | 笔记域不得做的事 |
 | --- | --- | --- | --- |
-| `NoteActor(client)` | `Plan.__call__`（身份在授权后解析一次） | 不可变的操作者身份，用于"只有记录者能改" | 不从全局或应用对象读身份；不接触凭据 |
-| `ProjectPort(db, project_id)` | `Plan.__call__` | `revision()`、`declared_state()`、`bump()` | 不直接写 `knowledge_projects`/`knowledge_states`，不改项目状态内容 |
+| `NoteActor(client)` | `Plan.__call__`（身份在授权后解析一次） | 冻结的操作者身份，用于"只有记录者能改" | 不从全局或应用对象读身份；不接触凭据；不重新赋值 |
+| `ProjectPort` 契约（`revision()`/`declared_state()`/`bump()`） | 契约在笔记域声明；实现是 `knowledge.ProjectAdapter`，由 `Plan` 注入 | 读项目版本、读项目声明状态、笔记写入提交后递增项目版本 | 不写项目表 SQL、不导入路由模块、不使用契约之外的方法 |
 | `Sources.context(db, project_id, phase)` | 既有知识域 | 资料单元核验、项目 revision 未变判定、捕获段期望记录 | 不另造来源核验、权限缓存或哈希 |
-| `research_notes.snapshot` | 应用按域交接 | schema/登记门（含 `knowledge_projects` 登记比对） | 不在业务规则内重复该检查 |
+| `research_notes.snapshot` | 应用按域交接 | schema/登记门（`metadata` + `knowledge_projects` 登记比对） | 不在业务规则内重复该检查 |
 
-可执行证据：`tests/test_research_notes.py::test_the_note_module_keeps_its_declared_boundaries` 解析模块 AST，断言规则代码里没有 `application` 属性访问、除上述两个端口外没有其它知识域表名，且项目读写确实走 `self.projects.revision()/declared_state()/bump()`。
+可执行证据：`tests/test_research_notes.py::test_the_note_module_keeps_its_declared_boundaries` 解析模块 AST，断言：规则代码里没有 `application` 属性访问；模块不导入 `knowledge`；除 `snapshot` 门以外没有任何 `knowledge_projects` 查询；`ProjectPort` 契约内没有存储实现；`knowledge.ProjectAdapter` 才是持有项目表 SQL 的一方且由 `Plan` 注入；`NoteActor` 赋值或删除即报错。
 
 ## 引用图的写入前核验
 
@@ -57,7 +59,8 @@ domain / SourceContext.observe / SourceContext.blocks / ProjectPort / Store.tran
 | 环判定 | 只有**回边**（在被遍历路径上再次遇到）才是环：自引、二元环拒绝；菱形共享祖先不是环，第二分支去重即可 |
 | 深度上限 | 根记为深度 1，路径超过 `MAX_CITATION_DEPTH`（64）即拒绝，而不是"走到上限就接受" |
 | 工作量上限 | 单次遍历最多访问 `MAX_GRAPH_WORK`（4096）个节点；超预算同样拒绝，绝不用部分遍历的结论回答 |
-| 传递来源依赖 | 被引笔记的整条引用闭包中的**所有资料单元**与直接引用的单元在同一阶段核验：捕获段只记录期望（事务内、无文件 I/O），提交段逐条严格核验，因此过期链上的新决定在写入前就被拒绝 |
+| **边的版本** | 遍历按**每条引用边记录的** `(note_id, version, hash)` 前进并逐边核验：被引版本必须是当前 `ready` 版本、`research_notes.version` 等于该版本、重建指纹等于该边记录的 `hash`。**绝不用被引笔记的当前版本替代历史引用** |
+| 传递来源依赖 | 只用**被核验过的那些版本**收集资料单元，与直接引用的单元在同一阶段核验：捕获段只记录期望（事务内、无文件 I/O），提交段逐条严格核验，因此被顶替或过期的链在写入前就被拒绝 |
 | 历史 | 拒绝只影响新写入；已存储版本与其引用行一律保持原样 |
 
 ## 接口与状态所有者
@@ -82,13 +85,17 @@ domain / SourceContext.observe / SourceContext.blocks / ProjectPort / Store.tran
 | --- | --- |
 | 再造一套来源库或权限缓存 | 无：引用核验全部经 `SourceContext` 与 `KnowledgeApplication` 授权 |
 | 笔记规则持有整个应用对象 | 无：身份与项目读写由 `NoteActor`/`ProjectPort` 注入，规则代码内无 `application` 访问（AST 用例断言） |
-| 笔记规则直接读写其他知识域表 | 无：规则内的 SQL 只出现在笔记域表；项目读取与版本递增只在 `ProjectPort`（AST 用例断言） |
+| 笔记域导入路由模块（依赖回边） | 无：`research_notes.py` 不导入 `knowledge`，标量校验走中立 `validate.py`（AST 用例断言）；`knowledge` 只在 `_planner`/`Plan` 内按操作名延迟导入笔记模块 |
+| 消费方模块包装其他域的表 SQL | 无：`ProjectPort` 只是契约（无存储实现），项目表 SQL 在 `knowledge.ProjectAdapter` 并由 `Plan` 注入（AST 用例断言） |
+| 笔记规则直接读写其他知识域表 | 无：规则内的 SQL 只出现在笔记域表；唯一例外是 `snapshot` 门的登记比对，且只有它查询 `knowledge_projects`（AST 用例断言） |
 | CLI/MCP 分别实现规则或入口直接 SQL | 无：两个入口只做参数、身份、错误映射，规则只在 `research_notes.py` |
 | 笔记擅自修改源、项目状态、工作目录事实、错题本 | 无：`test_the_note_module_writes_only_its_own_tables` 按表计数实测 |
 | 反向控制 recover 流程 | 无：接续使用独立的 `note_recover` 有界只读包，不改 `continuation_recover` |
 | 假身份走聊天 SourceAuthority | 无：仍由 `KnowledgeApplication.execute` 的 client/credential 授权 |
 | 循环引用充当自己的证据 | 拒绝：`citation_cycle`（自引、回边环、超过深度或工作量上限的遍历） |
 | 过期链上的新决定被接受 | 拒绝：被引笔记的传递资料依赖在同一阶段核验，写入前即 `stale_evidence` |
+| **被顶替的中间引用被当前版本顶替** | 拒绝：每条边按记录的 `(note_id, version, hash)` 核验，只用被核实版本收集资料单元；实测 A 修订到 v2 后引用 A v1 的记录与修订都被拒绝 |
+| 撤回笔记在链中被当作可用 | 拒绝：链上任一版本 `state != ready` 即 `stale_evidence` |
 | 共享祖先被误判为环 | 无：菱形与宽扇入实测可写入且读回为当前 |
 | 模型建议自动升级为决定 | 无模型调用；决定必须显式给出 `summary` 与非空 `basis` |
 | 旧结论静默重新标当前 | 读取时按当前来源状态推导 `current`/`citation_states`，不改写历史版本 |

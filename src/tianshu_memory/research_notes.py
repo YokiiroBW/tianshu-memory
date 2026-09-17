@@ -26,9 +26,10 @@ from .domain import (
     terms,
 )
 
-# The two scalar validators are the knowledge domain's own public helpers, so a note argument is
-# rejected by exactly the same rule as any other knowledge argument instead of a copy of it.
-from .knowledge import integer, string
+# The scalar validators are shared by every domain and live in a neutral module, so a note
+# argument is rejected by exactly the same rule as any other knowledge argument, without this
+# module importing the application that routes the dispatch.
+from .validate import integer, string
 
 BLOCK_FIELDS = "block_id document_id version hash"
 NOTE_REFERENCE_FIELDS = "note_id version hash"
@@ -202,55 +203,54 @@ def seal(package, seal_key):
 
 
 class NoteActor:
-    """The immutable identity of one dispatch, resolved before any phase runs.
+    """The frozen identity of one dispatch, resolved before any phase runs.
 
     A note capability needs to know who is acting, but it does not need the application that
     authorized the request. The credential stays with the authorization code: it reaches this
     module only through the already-derived package seal key, never as a value to re-check.
+    The identity is immutable — a second assignment raises — so no rule can quietly rewrite who
+    is acting halfway through a dispatch.
     """
 
-    __slots__ = ("client",)
+    __slots__ = ("_client",)
 
     def __init__(self, client):
-        self.client = client
+        object.__setattr__(self, "_client", client)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("NoteActor is immutable")
+
+    def __delattr__(self, name):
+        raise AttributeError("NoteActor is immutable")
+
+    @property
+    def client(self):
+        return self._client
+
+    def __repr__(self):
+        return f"NoteActor(client={self._client!r})"
 
 
 class ProjectPort:
-    """The explicit project reads and the one project write a note operation may perform.
+    """What the note domain is allowed to ask of the project domain, and nothing more.
 
-    This is the whole of what the note capability knows about another domain's storage: read the
-    project's version, read the declared project state, and advance the project version after a
-    committed note write. The note tables themselves are read by this module, and no other
-    knowledge-domain table is touched.
+    This is a contract, not an implementation: the object the application injects is built by
+    whichever domain owns the project tables, so the note module never writes SQL against
+    `knowledge_projects` or `knowledge_states` and never imports the routing module to reach
+    them. The note domain calls these three methods and no others.
     """
-
-    def __init__(self, db, project_id):
-        self.db = db
-        self.project_id = project_id
 
     def revision(self):
         """The project version, or `project_uninitialized` when the project row is absent."""
-        row = self.db.execute(
-            "SELECT revision FROM knowledge_projects WHERE id=?", (self.project_id,)
-        ).fetchone()
-        require(row is not None, "project_uninitialized", 409)
-        return row["revision"]
+        raise NotImplementedError
 
     def declared_state(self):
         """The goal and unfinished items the project itself declared, or `(None, [])`."""
-        row = self.db.execute(
-            "SELECT payload FROM knowledge_states WHERE project_id=?", (self.project_id,)
-        ).fetchone()
-        if row is None:
-            return None, []
-        payload = json.loads(row["payload"])
-        return payload["goal"], payload["unfinished"]
+        raise NotImplementedError
 
     def bump(self):
         """Advance the project version, so a cached continuation package stops being current."""
-        self.db.execute(
-            "UPDATE knowledge_projects SET revision=revision+1 WHERE id=?", (self.project_id,)
-        )
+        raise NotImplementedError
 
 
 class ResearchNotes:
@@ -313,48 +313,70 @@ class ResearchNotes:
     # -- citation graph ----------------------------------------------------------
 
     def _walk(self, roots):
-        """Every note reachable from `roots`, refusing a genuine cycle.
+        """Every cited note version reachable from `roots`, keyed by identity.
 
-        A cycle is a back edge: a note reached again **while it is still on the path being
-        walked**. A diamond is not a cycle — two studies that both rest on the same foundational
-        note may legitimately be combined — so a node already finished on another branch is
-        deduplicated rather than refused. Two bounds keep the walk honest: a root counts as depth
-        1 and the path is capped at `MAX_CITATION_DEPTH`, and the total node visits at
+        A citation binds one **recorded** note version, and that is the version this walk
+        follows: a note that has since been revised does not become the evidence a historical
+        citation named, so the current version is never substituted for a recorded one. Every
+        edge is verified before it is followed — the cited version must still be a current,
+        unretracted version whose recorded fingerprint matches the one the citing note bound —
+        and the map this returns holds exactly those verified versions.
+
+        A cycle is a back edge: a note version reached again **while it is still on the path
+        being walked**. A diamond is not a cycle — two studies that both rest on the same
+        foundational note may legitimately be combined — so a version already finished on another
+        branch is deduplicated rather than refused. Two bounds keep the walk honest: a root counts
+        as depth 1 and the path is capped at `MAX_CITATION_DEPTH`, and the total node visits at
         `MAX_GRAPH_WORK`. Exceeding either is refused rather than answered from a partial walk, so
         a cycle can never hide behind a bound by making the walk give up. A cited note of another
         project is unresolvable here instead of being followed.
         """
-        nodes = set()
+        found = {}
         work = [0]
 
-        def descend(identifier, path, depth):
+        def descend(reference, path, depth):
+            identifier = reference["note_id"]
             require(identifier not in path, "citation_cycle", 400)
             require(depth <= MAX_CITATION_DEPTH, "citation_cycle", 400)
-            if identifier in nodes:
+            if identifier in found:
                 return
             work[0] += 1
             require(work[0] <= MAX_GRAPH_WORK, "citation_cycle", 400)
-            nodes.add(identifier)
-            row = self.db.execute(
-                "SELECT version FROM research_notes WHERE id=? AND project_id=?",
-                (identifier, self.project_id),
-            ).fetchone()
-            require(row is not None, "not_found", 404)
-            for child in self._cited_notes(identifier, row["version"]):
+            # The edge itself is checked here, so a superseded, retracted or rewritten version is
+            # refused before anything under it is read.
+            self._note_evidence(reference)
+            found[identifier] = reference
+            for child in self._cited_notes(identifier, reference["version"]):
                 descend(child, path | {identifier}, depth + 1)
 
         for root in roots:
             descend(root, frozenset(), 1)
-        return nodes
+        return found
+
+    @staticmethod
+    def _note_references(note):
+        """The note versions one candidate note cites, as recorded references."""
+        return [
+            entry["reference"]
+            for entry in note.get("decision", {}).get("basis", [])
+            if entry["kind"] == "note"
+        ]
 
     def _cited_notes(self, identifier, version):
-        """The note identities one stored version cites, in the order they were recorded."""
-        rows = self.db.execute(
-            "SELECT cited_note_id FROM research_note_citations "
-            "WHERE note_id=? AND version=? AND kind='note' ORDER BY ordinal",
-            (identifier, version),
-        ).fetchall()
-        return [row["cited_note_id"] for row in rows if row["cited_note_id"]]
+        """The note references one stored version cites, as they were recorded.
+
+        Each reference keeps the version and fingerprint that version had when the citing note
+        was written, so a later revision of the cited note cannot be walked in its place.
+        """
+        return [
+            {
+                "note_id": citation["cited_note_id"],
+                "version": citation["cited_note_version"],
+                "hash": citation["hash"],
+            }
+            for citation in self._citations(identifier, version)
+            if citation["kind"] == "note"
+        ]
 
     def _cited_sources(self, identifier, version):
         """The source units one stored version cites, as evidence references."""
@@ -368,12 +390,8 @@ class ResearchNotes:
 
     def _refuse_cycles(self, identifier, note):
         """Refuse a citation chain that would make this note part of its own evidence."""
-        roots = [
-            entry["reference"]["note_id"]
-            for entry in note.get("decision", {}).get("basis", [])
-            if entry["kind"] == "note"
-        ]
-        require(identifier not in roots, "citation_cycle", 400)
+        roots = self._note_references(note)
+        require(identifier not in [root["note_id"] for root in roots], "citation_cycle", 400)
         require(identifier not in self._walk(roots), "citation_cycle", 400)
 
     def _note_evidence(self, reference):
@@ -395,28 +413,20 @@ class ResearchNotes:
 
         A cited note is evidence only while the whole chain under it is current: a conclusion
         that rests on a source which has since changed is no longer that conclusion. The walk
-        therefore follows cited notes and collects their source units too, and every collected
-        unit is verified exactly like a unit the new note cites directly. The walk is the same
-        bounded, cycle-refusing walk the write path uses, so a stored ring is refused instead of
-        being followed.
+        therefore follows every **recorded** note reference, verifying each edge's version,
+        fingerprint and state, and collects the source units of exactly the versions it verified
+        — never the units of a version the citing note did not name. Every collected unit is then
+        verified exactly like a unit the new note cites directly. The walk is the same bounded,
+        cycle-refusing walk the write path uses, so a stored ring is refused instead of being
+        followed.
         """
-        roots = [
-            entry["reference"]["note_id"]
-            for entry in note.get("decision", {}).get("basis", [])
-            if entry["kind"] == "note"
-        ]
         units = [statement["source"] for statement in note["source_statements"]] + [
             entry["reference"]
             for entry in note.get("decision", {}).get("basis", [])
             if entry["kind"] != "note"
         ]
-        for identifier in sorted(self._walk(roots)):
-            row = self.db.execute(
-                "SELECT version FROM research_notes WHERE id=? AND project_id=?",
-                (identifier, self.project_id),
-            ).fetchone()
-            require(row is not None, "not_found", 404)
-            units.extend(self._cited_sources(identifier, row["version"]))
+        for identifier, reference in sorted(self._walk(self._note_references(note)).items()):
+            units.extend(self._cited_sources(identifier, reference["version"]))
         return units
 
     def _check_citations(self, note):
@@ -425,15 +435,13 @@ class ResearchNotes:
         A source unit goes through the project's existing evidence check, so a citation can only
         bind a registered document version whose bytes are still the ones that were read. A note
         citation is resolved inside this project and must be a current `ready` version whose
-        recorded fingerprint still matches, **and every source unit under it must still be
-        current**: the transitive dependencies are checked in the same phase as the direct ones,
-        so an expired chain is refused before the new decision is written rather than being
-        labelled unavailable after it committed.
+        recorded fingerprint still matches, **and every recorded note reference under it must
+        still be current at the version it named**, with every source unit under that version
+        still readable: the transitive dependencies are checked in the same phase as the direct
+        ones, so a superseded or expired chain is refused before the new decision is written
+        rather than being labelled unavailable after it committed.
         """
         context = self._context()
-        for entry in note.get("decision", {}).get("basis", []):
-            if entry["kind"] == "note":
-                self._note_evidence(entry["reference"])
         units = self._dependencies(note)
         if self.phase == "capture":
             # Capture runs inside the transaction and must not touch the filesystem: it records

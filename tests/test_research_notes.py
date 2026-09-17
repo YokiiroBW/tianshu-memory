@@ -214,18 +214,25 @@ def decision(references, **changes):
 
 
 def basis(*recorded):
-    """Decision basis entries citing recorded note versions, one entry per named note."""
-    return [
-        {
-            "kind": "note",
-            "reference": {
-                "note_id": item["note_id"],
-                "version": item["version"],
-                "hash": item["hash"],
-            },
-        }
-        for item in recorded
-    ]
+    """Decision basis entries citing recorded note versions, one entry per named note.
+
+    Each argument is either the result of a note write (its recorded version and fingerprint) or
+    an explicit `(note_id, version, hash)` triple, so a test can also name a version that is no
+    longer current.
+    """
+    entries = []
+    for item in recorded:
+        if isinstance(item, tuple):
+            identifier, version, digest = item
+        else:
+            identifier, version, digest = item["note_id"], item["version"], item["hash"]
+        entries.append(
+            {
+                "kind": "note",
+                "reference": {"note_id": identifier, "version": version, "hash": digest},
+            }
+        )
+    return entries
 
 
 def record(notes, references, *, key="alpha-note", op=None, client="alpha-writer", **changes):
@@ -268,11 +275,22 @@ def revise(
 
 
 def withdraw(
-    notes, note_id_value, version, *, key="withdraw", client="alpha-writer", reason="done"
+    notes,
+    note_id_value,
+    version,
+    *,
+    key="withdraw",
+    op=None,
+    client="alpha-writer",
+    reason="done",
 ):
+    arguments = dict(key=key, note_id=note_id_value, expected_version=version, reason=reason)
+    if op is not None:
+        # A withdrawal of a note whose identity key is already bound needs its own operation key.
+        arguments["dedupe"] = op
     return notes.run(
         "note_withdraw",
-        dict(key=key, note_id=note_id_value, expected_version=version, reason=reason),
+        arguments,
         project="alpha",
         client=client,
     )
@@ -514,7 +532,7 @@ def test_a_shallow_chain_is_accepted_under_the_production_bound(notes):
 def test_two_studies_sharing_a_foundation_are_not_a_cycle(notes):
     """A diamond is not a ring: two notes resting on the same ancestor may be combined.
 
-    Only a back edge 鈥?a note reached again while it is still on the path being walked 鈥?is a
+    Only a back edge - a note reached again while it is still on the path being walked - is a
     cycle. A shared ancestor is finished on the first branch and deduplicated on the second.
     """
     imported(notes)
@@ -653,6 +671,102 @@ def test_a_transitive_dependency_two_levels_down_is_still_enforced(notes):
         )
 
 
+def test_a_cited_version_that_was_superseded_is_not_substituted_by_the_current_one(notes):
+    """An inner edge is checked at the version it recorded, never at the cited note's latest.
+
+    B cites A v1. A is then revised to v2 with a valid source, so B's evidence is superseded even
+    though every source file is unchanged. Walking A at its *current* version would find healthy
+    sources and accept the new conclusion, which is the defect: the reference B recorded names
+    A v1, and A v1 is no longer current.
+    """
+    imported(notes)
+    reference = unit(notes)
+    first = record(notes, [reference], key="edge-a")
+    middle = record(
+        notes,
+        [reference],
+        key="edge-b",
+        decision=decision([], basis=basis(first)),
+    )
+    revise(
+        notes,
+        first["note_id"],
+        [reference],
+        key="edge-a",
+        op="edge-a-v2",
+        version=1,
+        inferences=["A now argues something else, on the same source bytes."],
+    )
+    assert status(notes, middle["note_id"], 1)["current"] is False
+    # Recording a conclusion that names the superseded inner version is refused before any write.
+    with pytest.raises(Fault, match="stale_evidence"):
+        record(
+            notes,
+            [reference],
+            key="edge-c",
+            decision=decision([], basis=basis(middle)),
+        )
+    with pytest.raises(Fault, match="not_found"):
+        status(notes, note_id("alpha", "edge-c"), 1)
+    # Revising an existing note onto the same superseded edge is refused the same way.
+    with pytest.raises(Fault, match="stale_evidence"):
+        revise(
+            notes,
+            middle["note_id"],
+            [reference],
+            key="edge-b",
+            op="edge-b-v2",
+            version=1,
+            decision=decision([], basis=basis(first)),
+        )
+    assert status(notes, middle["note_id"], 1)["current_version"] == 1
+    # A direct citation of the superseded version is refused too: the inner edge is not a
+    # loophole in the direct check.
+    with pytest.raises(Fault, match="stale_evidence"):
+        record(notes, [reference], key="edge-d", decision=decision([], basis=basis(first)))
+    # The current version of the same note is still usable evidence, so the refusal is about the
+    # recorded version and not about the note identity.
+    current = status(notes, first["note_id"], 2)
+    healthy = record(
+        notes,
+        [reference],
+        key="edge-e",
+        decision=decision([], basis=basis((first["note_id"], 2, current["hash"]))),
+    )
+    assert healthy["status"] == "recorded"
+
+
+def test_a_withdrawn_note_inside_the_chain_is_refused(notes):
+    """A retraction anywhere in the closure stops a new conclusion, not only at the top."""
+    imported(notes)
+    reference = unit(notes)
+    inner = record(notes, [reference], key="withdrawn-inner")
+    outer = record(
+        notes, [reference], key="withdrawn-outer", decision=decision([], basis=basis(inner))
+    )
+    assert status(notes, outer["note_id"], 1)["current"] is True
+    withdraw(
+        notes,
+        inner["note_id"],
+        1,
+        key="withdrawn-inner",
+        op="withdraw-inner",
+        reason="retracted",
+    )
+    # The outer note is no longer current, and nothing new may rest on it.
+    assert status(notes, outer["note_id"], 1)["current"] is False
+    with pytest.raises(Fault, match="stale_evidence"):
+        record(
+            notes,
+            [reference],
+            key="withdrawn-c",
+            decision=decision([], basis=basis(outer)),
+        )
+    # The retracted version itself is refused directly as well.
+    with pytest.raises(Fault, match="stale_evidence"):
+        record(notes, [reference], key="withdrawn-d", decision=decision([], basis=basis(inner)))
+
+
 # -- source change, deletion and revocation ---------------------------------------
 
 
@@ -733,7 +847,7 @@ def test_an_unregistered_url_snapshot_expires_the_citation(notes, monkeypatch):
     assert search(notes)["notes"][0]["current"] is True
 
     # Revocation is the project registration moving, not the note being rewritten. Every
-    # operation of that project 鈥?including the note read 鈥?fails closed afterwards rather than
+    # operation of that project - including the note read - fails closed afterwards rather than
     # answering from a registration the service can no longer prove.
     notes.config["knowledge"]["projects"]["alpha"]["urls"] = []
     write_config(notes)
@@ -1117,7 +1231,7 @@ def test_notes_never_override_the_project_working_directory_facts(notes):
     # A search that matches no note returns nothing: notes are never injected wholesale, and a
     # query of only scaffolding words has no topic and therefore no candidates.
     assert search(notes, text="quantum")["notes"] == []
-    assert search(notes, text="鎬庝箞鏍?浠€涔?浣犲ソ")["notes"] == []
+    assert search(notes, text="怎么样?什么?你好")["notes"] == []
 
 
 # -- migration ---------------------------------------------------------------------
@@ -1226,52 +1340,54 @@ def test_the_note_module_writes_only_its_own_tables(notes):
 
 
 def test_the_note_module_keeps_its_declared_boundaries():
-    """The note capability holds no application object and reads no other domain's table.
+    """The note domain is a leaf: no application, no foreign table, no dependency back edge.
 
-    This is the module-boundary contract in executable form: a rule of the note domain may use
-    the injected actor, the project port and the source context, and may read and write its own
-    tables — nothing else. A future change that reached back into the application or queried
-    another domain's storage would fail here rather than silently recouple the modules.
+    This is the module-boundary contract in executable form. A note rule may use the injected
+    actor, the injected project port and the source context, and may read and write its own
+    tables — nothing else. The note module must not import the module that routes dispatches, and
+    the SQL that touches the project tables must live with the domain that owns them. A future
+    change that recoupled the modules would fail here instead of silently passing.
     """
     import ast
     import inspect
 
-    from tianshu_memory import research_notes
+    from tianshu_memory import knowledge, research_notes, validate
 
     source = Path(inspect.getsourcefile(research_notes)).read_text(encoding="utf-8")
     tree = ast.parse(source)
 
-    # No rule reaches back into the authorizing application: the port replaced it.
+    # No rule reaches back into the authorizing application: the ports replaced it.
     assert not [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Attribute) and node.attr == "application"
     ], "the note domain must not hold or use the application object"
 
-    # Every SQL statement outside the two declared ports names only this domain's tables. The
-    # exclusions are the two reviewed seams, not rules: `ProjectPort` owns the project reads and
-    # the version bump, and `snapshot` is the schema/registration gate the application hands over
-    # to whichever domain owns the operation.
+    # No dependency back edge: the note module never imports the routing module, at any level.
+    imported = {
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert not {name for name in imported if name.endswith("knowledge")}, imported
+    assert "knowledge" not in imported, imported
+    assert "from .knowledge" not in source and "import knowledge" not in source
+
+    # Every SQL statement in this module names only this domain's tables. `snapshot` is the
+    # schema/registration gate the application hands over per domain; it reads `metadata` and the
+    # project registration row, and it is the only such read here.
     owned = {"research_notes", "research_note_history", "research_note_citations"}
     derived = {"research_note_index"}
-    foreign = ("KNOWLEDGE_", "LESSONS", "LESSON_", "EXPERIENCE_", "RECORDS", "SOURCES")
-    seams = {"ProjectPort", "snapshot"}
-    rules = ast.parse(
-        "\n".join(
-            ast.unparse(node)
-            for node in tree.body
-            if not (
-                (isinstance(node, ast.ClassDef) and node.name in seams)
-                or (isinstance(node, ast.FunctionDef) and node.name in seams)
-            )
-        )
-    )
+    foreign = ("KNOWLEDGE_STATES", "LESSONS", "LESSON_", "EXPERIENCE_", "RECORDS", "SOURCES")
     sql = [
         node.value
-        for node in ast.walk(rules)
+        for node in ast.walk(tree)
         if isinstance(node, ast.Constant)
         and isinstance(node.value, str)
-        and any(word in node.value.upper() for word in ("SELECT", "INSERT"))
+        and any(word in node.value.upper() for word in ("SELECT", "INSERT", "UPDATE", "DELETE"))
     ]
     assert sql, "the module's own SQL must be visible to this test"
     assert any("research_note_history" in text for text in sql)
@@ -1279,31 +1395,88 @@ def test_the_note_module_keeps_its_declared_boundaries():
         upper = text.upper()
         for table in foreign:
             assert table not in upper, (table, text)
-    # The project reads and the version bump are the port's, not inline SQL in the rules.
-    port = research_notes.ProjectPort
-    port_sql = [
+    # The only project-table read left in this module is the registration comparison of the
+    # snapshot gate; every rule goes through the injected port instead.
+    project_reads = [text for text in sql if "KNOWLEDGE_PROJECTS" in text.upper()]
+    assert len(project_reads) == 1 and "SELECT * FROM knowledge_projects" in project_reads[0]
+    snapshot = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "snapshot"
+    )
+    assert project_reads[0] in [
         node.value
-        for node in ast.walk(ast.parse(inspect.getsource(port)))
+        for node in ast.walk(snapshot)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     ]
-    assert any("knowledge_projects" in text for text in port_sql)
-    assert any("knowledge_states" in text for text in port_sql)
+    elsewhere = ast.parse(
+        "\n".join(ast.unparse(node) for node in tree.body if node is not snapshot)
+    )
+    assert not [
+        node
+        for node in ast.walk(elsewhere)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "knowledge_projects" in node.value
+        and any(word in node.value.upper() for word in ("SELECT", "INSERT", "UPDATE", "DELETE"))
+    ], "only the snapshot gate may query the project table"
+
+    # The port contract is a contract: three methods and no storage of its own.
+    port = research_notes.ProjectPort
     assert {name for name in vars(port) if not name.startswith("__")} == {
         "revision",
         "declared_state",
         "bump",
     }
-    # The note rules go through that port for every project read and write.
+    port_source = inspect.getsource(port)
+    assert not [
+        node
+        for node in ast.walk(ast.parse(port_source))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and any(word in node.value.upper() for word in ("SELECT", "UPDATE", "INSERT"))
+    ], "the port contract must not implement storage"
+
+    # The implementation lives with the domain that owns those tables, and that is what the
+    # application injects.
+    adapter = knowledge.ProjectAdapter
+    adapter_sql = [
+        node.value
+        for node in ast.walk(ast.parse(inspect.getsource(adapter)))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    assert any("knowledge_projects" in text for text in adapter_sql)
+    assert any("knowledge_states" in text for text in adapter_sql)
+    assert {name for name in vars(adapter) if not name.startswith("__")} == {
+        "revision",
+        "declared_state",
+        "bump",
+    }
+    knowledge_source = Path(inspect.getsourcefile(knowledge)).read_text(encoding="utf-8")
+    assert "ProjectAdapter(db, self.project_id)" in knowledge_source
+    # The scalar validators are neutral, and the routing module delegates to the same rules.
+    assert validate.integer is not None and validate.string is not None
+    assert "from . import validate as validation" in knowledge_source
+
+    # The note rules go through the injected port for every project read and write.
     assert "self.projects.revision()" in source
     assert "self.projects.declared_state()" in source
     assert "self.projects.bump()" in source
     # A read of a derived index row never masquerades as an authoritative note row.
     assert derived and owned
-    # The identity is passed in, never read from a global or the application.
+    # The identity is passed in, never read from a global or the application, and it is frozen.
     assert {name for name in vars(research_notes.NoteActor) if not name.startswith("__")} == {
-        "client"
+        "_client",
+        "client",
     }
     assert "self.actor.client" in source
+    actor = research_notes.NoteActor("alpha-writer")
+    assert actor.client == "alpha-writer" and "alpha-writer" in repr(actor)
+    with pytest.raises(AttributeError):
+        actor.client = "beta-writer"
+    with pytest.raises(AttributeError):
+        actor._client = "beta-writer"
+    with pytest.raises(AttributeError):
+        del actor.client
+    assert actor.client == "alpha-writer"
 
 
 def test_the_application_routes_each_operation_to_exactly_one_domain(notes):

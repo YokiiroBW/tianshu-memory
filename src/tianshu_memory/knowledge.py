@@ -10,6 +10,7 @@ from pathlib import Path
 from . import knowledge_continuation as continuation
 from . import knowledge_directories as directories
 from . import knowledge_workdir as workdir
+from . import validate as validation
 from .domain import (
     Fault,
     canonical,
@@ -100,15 +101,15 @@ EXTRA_PERMISSION = {
 
 
 def exact(value, fields):
-    require(isinstance(value, dict) and set(value) == set(fields.split()), "invalid_input", 400)
+    return validation.exact(value, fields)
 
 
 def integer(value, minimum=0, maximum=2**31):
-    require(type(value) is int and minimum <= value <= maximum, "invalid_input", 400)
+    return validation.integer(value, minimum, maximum)
 
 
 def string(value, maximum=2048):
-    require(isinstance(value, str) and 0 < len(value) <= maximum, "invalid_input", 400)
+    return validation.string(value, maximum)
 
 
 def blocks(text, groups):
@@ -278,6 +279,46 @@ class Sources:
         )
 
 
+class ProjectAdapter:
+    """The project rows a routed domain may read, and the one project write it may perform.
+
+    This is the knowledge domain's own storage, so its reads and its version bump live here, next
+    to the tables they touch, and are handed to a routed domain as a port. A domain module
+    therefore never writes SQL against `knowledge_projects` or `knowledge_states` and never
+    imports this module to get at them: it receives an object that answers three questions —
+    what version is the project, what state did the project declare, advance the version — and
+    the schema of those tables stays owned by whoever owns them.
+    """
+
+    def __init__(self, db, project_id):
+        self.db = db
+        self.project_id = project_id
+
+    def revision(self):
+        """The project version, or `project_uninitialized` when the project row is absent."""
+        row = self.db.execute(
+            "SELECT revision FROM knowledge_projects WHERE id=?", (self.project_id,)
+        ).fetchone()
+        require(row is not None, "project_uninitialized", 409)
+        return row["revision"]
+
+    def declared_state(self):
+        """The goal and unfinished items the project itself declared, or `(None, [])`."""
+        row = self.db.execute(
+            "SELECT payload FROM knowledge_states WHERE project_id=?", (self.project_id,)
+        ).fetchone()
+        if row is None:
+            return None, []
+        payload = json.loads(row["payload"])
+        return payload["goal"], payload["unfinished"]
+
+    def bump(self):
+        """Advance the project version, so a cached continuation package stops being current."""
+        self.db.execute(
+            "UPDATE knowledge_projects SET revision=revision+1 WHERE id=?", (self.project_id,)
+        )
+
+
 class Plan:
     """One dispatch, expressed as three phases over the same evidence readers."""
 
@@ -297,7 +338,7 @@ class Plan:
     def __call__(self, db, phase, seal_key=None, *, prepared=None, client=None):
         try:
             if self.application.note_domain:
-                from .research_notes import NoteActor, ProjectPort
+                from .research_notes import NoteActor
                 from .research_notes import dispatch as notes_dispatch
 
                 return notes_dispatch(
@@ -310,10 +351,10 @@ class Plan:
                     self.sources,
                     phase,
                     # The identity is resolved once here, and the note domain's only access to
-                    # project storage is the port below: it reads the project version and the
-                    # declared state, and advances the version after a committed note write.
+                    # project storage is the port below, implemented by the domain that owns
+                    # those tables.
                     actor=NoteActor(client),
-                    project_port=ProjectPort(db, self.project_id),
+                    project_port=ProjectAdapter(db, self.project_id),
                 )
             if self.application.lesson_domain:
                 return self._lessons(db, phase, seal_key)
