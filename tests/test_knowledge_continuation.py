@@ -825,6 +825,124 @@ def test_a_checkout_too_large_to_describe_never_claims_currency(checkouts):
     assert checkouts.check(checkouts.recover())["valid"] is True
 
 
+def test_an_edit_inside_a_collapsed_untracked_directory_is_never_still_valid(checkouts):
+    """Git collapses `?? drafts/`, so the files inside it have to be described one by one.
+
+    The coordinator's second reproduction. `--untracked-files=normal` reports the directory and
+    an edit to an existing file inside it does not move the directory's own stat, so describing
+    the directory instead of its files would call an edited checkout current.
+    """
+    folder = checkouts.first / "drafts"
+    folder.mkdir()
+    source = folder / "new.py"
+    source.write_bytes(b"one")
+    package = checkouts.recover()
+    changes = package["worktree"]["changes"]
+    # One collapsed entry, described by the file inside it rather than by the directory stat.
+    assert changes["entries"] == 1 and changes["complete"] is True
+    assert package["worktree"]["counts"]["untracked"] == 1
+    assert checkouts.check(package)["valid"] is True
+    source.write_bytes(b"two")
+    answer = checkouts.check(package)
+    assert answer["valid"] is False and answer["observed"] is True
+    assert answer["reason"] == "workdir_unproven" and answer["differences"] == ["workdir_unproven"]
+    # A fresh recovery of the same bytes is current again, and the next edit is caught the same
+    # way instead of being excused as "the directory has not moved".
+    fresh = checkouts.recover()
+    assert checkouts.check(fresh)["valid"] is True
+    (folder / "second.py").write_bytes(b"three")
+    assert checkouts.check(fresh)["valid"] is False
+    assert checkouts.check(checkouts.recover())["valid"] is True
+
+
+def test_a_directory_stat_is_never_a_version_of_the_files_inside_it(checkouts):
+    """The directory's own metadata is not what makes a collapsed entry current or stale."""
+    folder = checkouts.first / "drafts"
+    folder.mkdir()
+    source = folder / "new.py"
+    source.write_bytes(b"one")
+    package = checkouts.recover()
+    os.utime(folder, None)
+    assert checkouts.check(package)["valid"] is True
+    source.write_bytes(source.read_bytes() + b"two")
+    assert checkouts.check(package)["valid"] is False
+
+
+def test_a_verification_bound_with_an_untracked_directory_is_never_current_after_an_edit(checkouts):
+    """A binding inherits the same conclusion: the fingerprint of the files inside is compared."""
+    imported(checkouts)
+    folder = checkouts.first / "drafts"
+    folder.mkdir()
+    source = folder / "new.py"
+    source.write_bytes(b"one")
+    checkouts.write(checkouts.state(recent_verification=[bound(commit=checkouts.head())]))
+    assert checkouts.recover()["state"]["recent_verification"][0]["scope"] == "current"
+    source.write_bytes(b"two")
+    after = checkouts.recover()["state"]["recent_verification"][0]
+    assert after["scope"] == "workdir_changed"
+    assert after["facts"] is not None and after["dirty"] is True
+
+
+def test_an_undescribable_untracked_directory_never_claims_currency(checkouts):
+    """A nested checkout keeps its state in its own `.git`, which this service never reads."""
+    imported(checkouts)
+    nested = checkouts.first / "vendor" / "nested"
+    nested.mkdir(parents=True)
+    git(nested, "init", "-q")
+    (nested / "keep.txt").write_bytes(b"nested\n")
+    package = checkouts.recover()
+    changes = package["worktree"]["changes"]
+    assert changes["entries"] == 1 and changes["complete"] is False
+    answer = checkouts.check(package)
+    assert answer["valid"] is False and answer["reason"] == "workdir_unproven"
+    # A verification cannot be bound to a state that could never be compared later.
+    with pytest.raises(Fault, match="workdir_unproven"):
+        checkouts.write(checkouts.state(recent_verification=[bound(commit=checkouts.head())]))
+    remove_tree(checkouts.first / "vendor")
+    recovered = checkouts.recover()
+    assert recovered["worktree"]["changes"]["complete"] is True
+    assert checkouts.check(recovered)["valid"] is True
+
+
+def test_a_crowded_untracked_directory_is_never_described_partially(checkouts):
+    """The same bound covers the files inside a collapsed directory, so nothing is half-known."""
+    imported(checkouts)
+    folder = checkouts.first / "drafts"
+    folder.mkdir()
+    for index in range(workdir.CHANGE_LIMIT + 1):
+        (folder / f"note-{index}.md").write_bytes(b"x\n")
+    package = checkouts.recover()
+    changes = package["worktree"]["changes"]
+    assert changes["entries"] == 1 and changes["complete"] is False
+    answer = checkouts.check(package)
+    assert answer["valid"] is False and answer["reason"] == "workdir_unproven"
+    with pytest.raises(Fault, match="workdir_unproven"):
+        checkouts.write(checkouts.state(recent_verification=[bound(commit=checkouts.head())]))
+
+
+def test_untracked_file_contents_are_never_read_while_fingerprinting(checkouts, monkeypatch):
+    """A collapsed directory is described by metadata only, and never charged to the read budget."""
+    folder = checkouts.first / "drafts"
+    folder.mkdir()
+    big = folder / "big.bin"
+    big.write_bytes(b"x" * (4 * 262144))
+    reads = []
+    real_read = workdir.read_file
+
+    def spy(project, locator, *arguments, **kwargs):
+        reads.append(locator)
+        return real_read(project, locator, *arguments, **kwargs)
+
+    monkeypatch.setattr(workdir, "read_file", spy)
+    imported(checkouts)
+    package = checkouts.recover()
+    # Only the registered digest was ever opened: a file far past the registered byte budget is
+    # described by its metadata and cannot make the collection fail or pay for it.
+    assert reads == ["docs/design.md"]
+    assert package["worktree"]["changes"]["complete"] is True
+    assert big.stat().st_size == 4 * 262144
+
+
 def test_check_rejects_index_and_revision_drift(checkouts):
     imported(checkouts)
     package = checkouts.recover()
@@ -1071,6 +1189,139 @@ def test_an_inherited_git_configuration_cannot_install_a_helper(checkouts, monke
     # The inherited definition is invisible to the collector: it is neither listed as a driver
     # that had to be neutralized nor able to run.
     assert "probe" not in package["worktree"]["git"]["helpers"]
+
+
+def test_helper_names_keep_the_complete_driver_and_refuse_what_cannot_be_overridden():
+    """Discovery never truncates a dotted subsection, and never claims an impossible override.
+
+    A driver name is the whole subsection, so `filter.probe.dot.clean` belongs to `probe.dot` and
+    not to `probe`; anything that cannot be written as one unambiguous `-c` key is refused rather
+    than reported as neutralized. `config --null --list` separates key and value with a newline.
+    """
+
+    def record(key, value="x"):
+        return f"{key}\n{value}".encode() + b"\x00"
+
+    listing = (
+        record("filter.probe.dot.clean")
+        + record("filter.probe.dot.process")
+        + record("diff.probe.dot.textconv")
+        + record("filter.lfs.required", "true")
+        + record("diff.renames", "true")
+    )
+    assert workdir.helper_names(listing) == {"probe.dot", "lfs"}
+    # Two drivers that share a prefix are two drivers.
+    assert workdir.helper_names(
+        record("filter.probe.clean") + record("filter.probe.dot.clean")
+    ) == {"probe", "probe.dot"}
+    # Git splits a `-c` key at its first `=`, so this name cannot be addressed by any override.
+    with pytest.raises(Fault, match="workdir_helper_unrepresentable"):
+        workdir.helper_names(record("filter.a=b.clean"))
+    # The `filter` section has no plain variables: a variable this service does not know cannot
+    # be shown to be inert.
+    with pytest.raises(Fault, match="workdir_helper_unrepresentable"):
+        workdir.helper_names(record("filter.probe.unknown"))
+    # A `diff` section does mix plain variables with driver keys, and only command/textconv name
+    # a program.
+    assert workdir.helper_names(record("diff.renames", "true") + record("diff.algorithm")) == set()
+
+
+def test_a_dotted_filter_driver_name_is_never_left_executable(checkouts, monkeypatch):
+    """A filter subsection may contain dots: the complete name has to be neutralized.
+
+    The coordinator's second reproduction. The control call proves the fixture really makes Git
+    run the repository program, and the spy proves every call carries the override for the
+    complete driver name instead of a truncated one that would leave it executable.
+    """
+    marker = checkouts.first / "dotted-filter-marker.txt"
+    (checkouts.first / ".gitattributes").write_bytes(b"src/app.py filter=probe.dot\n")
+    git(
+        checkouts.first,
+        "config",
+        "filter.probe.dot.clean",
+        "echo EXECUTED > dotted-filter-marker.txt; cat",
+    )
+    (checkouts.first / "src/app.py").write_bytes(b"print('changed')\n")
+    control = plain_status(checkouts.first)
+    assert control.returncode == 0 and b"M src/app.py" in control.stdout, control.stdout
+    assert marker.exists(), "the fixture filter never ran, so this test would prove nothing"
+    marker.unlink()
+    commands = []
+    real_command = workdir.command
+
+    def spy(entry, *arguments, guard=()):
+        commands.append(real_command(entry, *arguments, guard=guard))
+        return real_command(entry, *arguments, guard=guard)
+
+    monkeypatch.setattr(workdir, "command", spy)
+    imported(checkouts)
+    package = checkouts.recover()
+    assert package["worktree"]["counts"]["modified"] == 1
+    helpers = package["worktree"]["git"]["helpers"]
+    assert "probe.dot" in helpers and "probe" not in helpers
+    flattened = [argument for command in commands for argument in command]
+    for expected in (
+        "filter.probe.dot.clean=",
+        "filter.probe.dot.process=",
+        "filter.probe.dot.smudge=",
+        "filter.probe.dot.required=false",
+    ):
+        assert expected in flattened, expected
+    assert marker.exists() is False
+    assert checkouts.check(package)["valid"] is True
+    assert marker.exists() is False
+
+
+def test_a_dotted_process_filter_driver_name_is_never_executed(checkouts):
+    """Git prefers the `process` form when it exists, so a dotted name has to cover it too."""
+    marker = checkouts.first / "dotted-process-marker.txt"
+    (checkouts.first / ".gitattributes").write_bytes(b"src/app.py filter=probe.dot\n")
+    git(
+        checkouts.first,
+        "config",
+        "filter.probe.dot.process",
+        "echo PROCESS > dotted-process-marker.txt; cat",
+    )
+    (checkouts.first / "src/app.py").write_bytes(b"print('changed')\n")
+    assert plain_status(checkouts.first).returncode == 0
+    assert marker.exists(), "the fixture process filter never ran, so this proves nothing"
+    marker.unlink()
+    imported(checkouts)
+    package = checkouts.recover()
+    assert "probe.dot" in package["worktree"]["git"]["helpers"]
+    assert package["worktree"]["counts"]["modified"] == 1
+    checkouts.check(package)
+    assert marker.exists() is False
+
+
+def test_a_helper_name_that_cannot_be_overridden_is_refused(checkouts):
+    """A driver that no override can address is refused, never reported as neutralized.
+
+    Git splits a `-c` key at its first `=`, so `filter.a=b.clean` cannot be reached by
+    `-c filter.a=b.clean=`; the only honest answer is to refuse the collection. The control call
+    proves the fixture driver really does run under an ordinary `git status`.
+    """
+    imported(checkouts)
+    package = checkouts.recover()
+    assert checkouts.check(package)["valid"] is True
+    marker = checkouts.first / "unsafe-filter-marker.txt"
+    (checkouts.first / ".gitattributes").write_bytes(b"src/app.py filter=a=b\n")
+    config = checkouts.first / ".git" / "config"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + '[filter "a=b"]\n\tclean = echo EXECUTED > unsafe-filter-marker.txt; cat\n',
+        encoding="utf-8",
+    )
+    (checkouts.first / "src/app.py").write_bytes(b"print('changed')\n")
+    assert plain_status(checkouts.first).returncode == 0
+    assert marker.exists(), "the fixture filter never ran, so this test would prove nothing"
+    marker.unlink()
+    answer = checkouts.check(package)
+    assert answer["valid"] is False and answer["observed"] is False
+    assert answer["reason"] == "workdir_helper_unrepresentable" and answer["differences"] == []
+    with pytest.raises(Fault, match="workdir_helper_unrepresentable"):
+        checkouts.recover()
+    assert marker.exists() is False
 
 
 def test_output_caps_stop_the_child_instead_of_buffering_it(checkouts, tmp_path, monkeypatch):

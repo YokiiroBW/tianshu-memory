@@ -15,14 +15,19 @@ program for Git to run while *reading* (a `filter` clean/process driver chosen b
 driver name is therefore discovered from the merged configuration and overridden on the command
 line, so no repository, user or system configuration can make a collection execute code; the
 child also receives a fixed environment instead of the service's, so no `GIT_*` variable can
-inject one. Output is capped *while* the child runs rather than after it exits, and the size of
-each registered file is charged to the cumulative read budget before it is read.
+inject one. A driver name that cannot be written as one unambiguous override is refused instead
+of being reported as neutralized. Output is capped *while* the child runs rather than after it
+exits, and the size of each registered file is charged to the cumulative read budget before it is
+read. Git collapses a wholly untracked directory into a single status record, so a collapsed
+entry is described by the metadata of the files inside it rather than by the directory's own
+stat, with anything that cannot be described within the same bound reported as incomplete.
 """
 
 import hashlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -55,11 +60,27 @@ STATUS_LIMIT = 262144
 LOG_LIMIT = 65536
 VERSION_LIMIT = 256
 HELPER_LIMIT = 65536
+# A driver name has to survive being written as one `-c` key, and Git splits that key at its first
+# `=`; a name containing one therefore cannot be neutralized unambiguously (the override would
+# land on a *different* key while the real driver stayed executable). Such names, control
+# characters and over-long names are refused instead of being reported as neutralized.
+HELPER_NAME_LIMIT = 64
+UNSAFE_HELPER = "=\x00\r\n\t"
 # A checkout with more changed entries than this is described by counts alone: the fingerprint
-# stops and says so instead of walking an unbounded working tree.
+# stops and says so instead of walking an unbounded working tree. The same bound covers the files
+# inside a collapsed untracked directory, whose tree is walked no deeper than this.
 CHANGE_LIMIT = 512
+WALK_DEPTH = 16
+NESTED_REPOSITORY = ".git"
 CHANGE_MODE = "stat_only"
 FIELDS = "id path branch clients files max_bytes"
+# The terminal variable of a `filter`/`diff` driver key, matched as a whole from the longest form
+# down: a driver subsection may itself contain dots (`filter.probe.dot.clean`), so splitting the
+# key at its first dot would truncate the name to `probe`, leave `filter.probe.dot.clean` running
+# and still claim the driver had been neutralized.
+FILTER_VARIABLES = ("clean.required", "smudge.required", "clean", "smudge", "process", "required")
+DIFF_VARIABLES = ("command", "textconv")
+HELPER_VARIABLES = {"filter": FILTER_VARIABLES, "diff": DIFF_VARIABLES}
 # The child environment is an allowlist, not the service environment: a `GIT_CONFIG_COUNT`,
 # `GIT_CONFIG_KEY_*`, `GIT_DIR`, `GIT_EXTERNAL_DIFF` or `GIT_ASKPASS` in the service environment
 # could otherwise define a program for Git to run. Git still finds its own system and user
@@ -255,6 +276,67 @@ def environment():
     }
 
 
+def unsafe_helper(name):
+    """Whether a driver name cannot be written as one unambiguous override key.
+
+    Git splits a `-c` key at its first `=`, so `filter.a=b.clean=` defines something else
+    entirely while `filter.a=b.clean` stays executable. A name that cannot be expressed is a
+    reason to refuse the collection, never a reason to report a driver as neutralized.
+    """
+    if not name or len(name) > HELPER_NAME_LIMIT:
+        return True
+    return any(character in name for character in UNSAFE_HELPER)
+
+
+def helper_driver(remainder, variables):
+    """The driver name of one config key remainder, or nothing when its variable is not known.
+
+    The variable is matched as a whole from the longest form down, so a subsection that contains
+    dots keeps its complete name: `filter.probe.dot.clean` is driver `probe.dot`, not `probe`.
+    Every key that can make Git run a program ends in one of these variables, so no executable
+    driver can be lost here, and a name that cannot be written as one unambiguous override is
+    refused instead of being reported as neutralized.
+    """
+    lowered = remainder.lower()
+    for variable in variables:
+        if lowered.endswith("." + variable):
+            name = remainder[: -(len(variable) + 1)]
+            if not name:
+                return None
+            require(not unsafe_helper(name), "workdir_helper_unrepresentable", 503)
+            return name
+    return None
+
+
+def helper_names(raw):
+    """Every configured `filter`/`diff` driver name in one `config --null --list` listing.
+
+    Values are dropped as they are read: only names leave this function. The `filter` section has
+    no plain variables - every key in it belongs to a driver - so a key whose variable this
+    service does not know cannot be shown to be inert and is refused rather than assumed
+    harmless. The `diff` section mixes plain variables (`diff.renames`) with driver keys and only
+    `command`/`textconv` name a program, so an unknown `diff.<x>.<y>` is left alone.
+    """
+    names = set()
+    for record in raw.split(b"\x00"):
+        if not record:
+            continue
+        key = record.split(b"\n", 1)[0].decode("utf-8", "replace")
+        section, dot, remainder = key.partition(".")
+        if not dot:
+            continue
+        lowered = section.lower()
+        variables = HELPER_VARIABLES.get(lowered)
+        if variables is None:
+            continue
+        name = helper_driver(remainder, variables)
+        if name is not None:
+            names.add(name)
+        elif lowered == "filter" and "." in remainder:
+            raise Fault("workdir_helper_unrepresentable", 503)
+    return names
+
+
 def helpers(entry):
     """Every configured `filter`/`diff` driver name, discovered read-only and neutralized later.
 
@@ -265,19 +347,11 @@ def helpers(entry):
     rather than by a pattern argument: an argument full of regular-expression punctuation would
     be re-parsed by the command interpreter when the configured Git is a `cmd` shim, and a
     silently altered pattern is exactly the kind of quiet difference this guard exists to
-    prevent. Values are dropped as they are read; only names are kept.
+    prevent.
     """
     status, raw = run(entry, ("config", "--null", "--list"), HELPER_LIMIT)
     require(status in {0, 1}, "workdir_git_failed", 503)
-    names = set()
-    for record in raw.split(b"\x00"):
-        if not record:
-            continue
-        key = record.split(b"\n", 1)[0].decode("utf-8", "replace")
-        section, _, remainder = key.partition(".")
-        name = remainder.split(".", 1)[0]
-        if section in {"filter", "diff"} and name:
-            names.add(name)
+    names = helper_names(raw)
     require(len(names) <= MAX_HELPERS, "workdir_helpers_unbounded", 503)
     return tuple(sorted(names))
 
@@ -476,6 +550,102 @@ def _change_stat(root, path):
     return [info.st_size, info.st_mtime_ns, info.st_mode]
 
 
+def _joined(prefix, name):
+    """One repository-relative POSIX path, built without touching the file system."""
+    return f"{prefix}/{name}" if prefix else name
+
+
+def _link(path):
+    """Whether one path is a link or a junction, which a walk refuses to enter."""
+    if os.path.islink(path):
+        return True
+    return hasattr(os.path, "isjunction") and os.path.isjunction(path)
+
+
+def _walk(directory, prefix, code, room, records, depth):
+    """File-level metadata of one collapsed directory tree; `False` when it cannot be complete.
+
+    Git collapses a wholly untracked directory into one `?? dir/` record, and that record's own
+    stat is not a version of the files inside it: rewriting an existing child leaves the
+    directory metadata untouched, so a fingerprint built from it would call an edited checkout
+    unchanged. Every child is therefore described by its own size, mtime and mode plus a digest of
+    its repository-relative path - never by its content, and never by a path that leaves the
+    package. Anything that cannot be described within the same bound (more entries than one
+    observation may describe, a tree deeper than the walk limit, a nested checkout that keeps its
+    state in its own `.git`, a junction, or a directory this service may not read) makes the whole
+    description incomplete, which every caller reads as "cannot be proven".
+    """
+    if depth > WALK_DEPTH:
+        return False
+    try:
+        with os.scandir(directory) as stream:
+            children = []
+            for child in stream:
+                # Reading stops at the same bound the rest of the description obeys, so a
+                # directory holding more entries than one observation may describe costs a bounded
+                # amount of work and says so instead of being described partially.
+                children.append(child)
+                if len(children) > room[0]:
+                    return False
+    except OSError:
+        return False
+    children.sort(key=lambda child: child.name)
+    for child in children:
+        if child.name == NESTED_REPOSITORY:
+            return False
+        try:
+            info = child.stat(follow_symlinks=False)
+            junction = not child.is_symlink() and _link(child.path)
+        except OSError:
+            return False
+        if junction:
+            # A junction is a directory this service must not walk into; describing only its own
+            # metadata would let a change inside it look like no change at all. A symbolic link is
+            # different: Git reports one as a file and never follows it either, so its own
+            # metadata is the whole truth about it.
+            return False
+        path = _joined(prefix, child.name)
+        records.append(
+            [
+                code,
+                hashlib.sha256(path.encode()).hexdigest(),
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_mode,
+            ]
+        )
+        room[0] -= 1
+        if stat.S_ISDIR(info.st_mode) and not _walk(
+            child.path, path, code, room, records, depth + 1
+        ):
+            return False
+    return True
+
+
+def _collapsed(root, path, code, room):
+    """`(records, complete)` for one collapsed untracked directory: its files, never its own stat.
+
+    The directory Git reported has to still be an enterable directory: if it vanished, became a
+    file or became a link between the status call and this walk, the entry cannot be described by
+    what is inside it, and a single directory stat would be exactly the substitution that must
+    not happen.
+    """
+    target = root / Path(path)
+    if _link(target):
+        return [], False
+    try:
+        info = os.lstat(target)
+    except (OSError, ValueError):
+        return [], False
+    if not stat.S_ISDIR(info.st_mode):
+        return [], False
+    records = []
+    complete = _walk(target, path.rstrip("/"), code, room, records, 0)
+    # A directory Git reported as untracked but that holds nothing readable cannot be described
+    # either: an empty description would make the entry itself disappear from the fingerprint.
+    return records, complete and bool(records)
+
+
 def change_facts(entry, raw):
     """A bounded, content-free fingerprint of the current uncommitted state of one checkout.
 
@@ -483,23 +653,34 @@ def change_facts(entry, raw):
     on the registered digest list can be rewritten again to the same size with the same status
     counts, and an old package would still look current. Git already reports every changed path
     in the status output this collector reads, so each record is reduced to its status code, a
-    digest of its path and its stat metadata. Two observations of one checkout can therefore be
-    compared without reading any content, without reading an untracked file and without putting
-    a path into the package. A checkout with more changed entries than the cap is reported as
-    incomplete, which callers treat as "cannot be proven" instead of "unchanged".
+    digest of its path and its stat metadata; a path Git collapsed into a directory is described
+    by the metadata of the files inside it instead. Two observations of one checkout can therefore
+    be compared without reading any content, without reading an untracked file and without putting
+    a path into the package. A checkout with more changed entries than the cap - or with a
+    collapsed directory that cannot be described within it - is reported as incomplete, which
+    callers treat as "cannot be proven" instead of "unchanged".
     """
     records = status_records(raw)
     root = Path(entry["path"])
     bounded = records[:CHANGE_LIMIT]
-    facts = [
-        [code, hashlib.sha256(path.encode()).hexdigest(), *_change_stat(root, path)]
-        for code, path in bounded
-    ]
+    room = [CHANGE_LIMIT - len(bounded)]
+    facts, complete = [], True
+    for code, path in bounded:
+        relative = Path(path)
+        if relative.is_absolute() or ".." in relative.parts:
+            facts.append([code, hashlib.sha256(path.encode()).hexdigest(), None, None, None])
+            continue
+        if path.endswith("/"):
+            children, described = _collapsed(root, path, code, room)
+            facts += children
+            complete = complete and described
+            continue
+        facts.append([code, hashlib.sha256(path.encode()).hexdigest(), *_change_stat(root, path)])
     facts.sort(key=lambda item: item[1])
     return {
         "mode": CHANGE_MODE,
         "entries": len(records),
-        "complete": len(records) == len(bounded),
+        "complete": complete and len(records) == len(bounded),
         "fingerprint": hashlib.sha256(canonical(facts).encode()).hexdigest(),
     }
 

@@ -65,6 +65,7 @@ UNOBSERVABLE = (
     "workdir_file_too_large",
     "workdir_byte_budget",
     "workdir_helpers_unbounded",
+    "workdir_helper_unrepresentable",
 )
 PACKAGE_FIELDS = (
     "status project_id worktree history index state units omissions budget revision "
