@@ -158,6 +158,11 @@ class Store:
 
         return migrate_lessons(self, backup_path)
 
+    def migrate_research_notes(self, backup_path):
+        from .research_notes_migration import migrate as migrate_research_notes
+
+        return migrate_research_notes(self, backup_path)
+
     @staticmethod
     def require_user_actions(db):
         from .domain import require

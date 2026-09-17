@@ -12,6 +12,7 @@ from .knowledge import KnowledgeApplication
 from .knowledge_directories_migration import migrate as migrate_directories
 from .knowledge_migration import migrate
 from .lessons_migration import migrate as migrate_lessons
+from .research_notes_migration import migrate as migrate_research_notes
 from .store import Store
 
 
@@ -25,6 +26,8 @@ def main():
     upgrade.add_argument("--backup", required=True)
     plans = commands.add_parser("migrate-directories")
     plans.add_argument("--backup", required=True)
+    notes = commands.add_parser("migrate-research-notes")
+    notes.add_argument("--backup", required=True)
     for name in ("action", "mcp"):
         command = commands.add_parser(name)
         command.add_argument("--client", required=True)
@@ -33,7 +36,12 @@ def main():
             command.add_argument("file")
     args = parser.parse_args()
     try:
-        if args.command in {"migrate", "migrate-lessons", "migrate-directories"}:
+        if args.command in {
+            "migrate",
+            "migrate-lessons",
+            "migrate-directories",
+            "migrate-research-notes",
+        }:
             config = strict_json(Path(args.config).read_bytes())
             store = Store(
                 config["database_path"],
@@ -43,6 +51,7 @@ def main():
                 "migrate": migrate,
                 "migrate-lessons": migrate_lessons,
                 "migrate-directories": migrate_directories,
+                "migrate-research-notes": migrate_research_notes,
             }[args.command](store, args.backup)
         elif args.command == "mcp":
             from .knowledge_mcp import create_server

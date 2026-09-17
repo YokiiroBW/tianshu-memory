@@ -271,6 +271,30 @@ class SourceContext:
     def blocks(self, reference):
         return self.evidence.reference(reference)
 
+    def observe(self, reference):
+        """Record the expectation for one unit, answering whether it is currently valid.
+
+        `blocks` is the strict check a write needs: a unit that is not current raises. A read
+        needs the opposite shape — it must be able to describe a citation that has expired
+        without failing the whole request — but it still has to make the capture phase record
+        what it saw. This returns that answer instead of raising, and only ever for the citation
+        kinds the phase can judge; the caller decides what an expired citation means.
+        """
+        try:
+            self.blocks(reference)
+        except Fault:
+            return False
+        return True
+
+    def revision_unchanged(self):
+        """Whether the project revision is still the one this context captured.
+
+        A narrow public read for callers that verify their own evidence units but must still
+        confirm that no other project write happened in between. It reads one row and performs
+        no external I/O, so it is safe in a phase that must not touch the filesystem.
+        """
+        return self._revision() == self.revision
+
     def current_hash(self, document_id, version):
         """The current hash of one referenced document version, by source kind.
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .knowledge_directories_migration import install as install_directories
 from .lessons_migration import install as install_lessons
+from .research_notes_migration import install as install_research_notes
 
 SCHEMA = """
 CREATE TABLE knowledge_projects (id TEXT PRIMARY KEY, registration TEXT NOT NULL,
@@ -65,14 +66,16 @@ def migrate(store, backup_path):
         db.execute("INSERT INTO metadata VALUES ('knowledge_schema','1')")
         db.execute("INSERT INTO metadata VALUES ('knowledge_seal_key',?)", (secrets.token_hex(32),))
         db.execute("UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'")
-        # The same reviewed step installs the lesson book, the promoted experience book and
-        # the registered-directory plan book.
+        # The same reviewed step installs the lesson book, the promoted experience book, the
+        # registered-directory plan book and the research-note book.
         install_lessons(db)
         install_directories(db)
+        install_research_notes(db)
     return {
         "schema": 3,
         "knowledge_schema": 1,
         "lessons_schema": 1,
         "knowledge_directories_schema": 1,
+        "research_notes_schema": 1,
         "backup": str(backup),
     }

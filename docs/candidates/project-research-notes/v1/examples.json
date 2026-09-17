@@ -1,0 +1,191 @@
+[
+  {
+    "name": "note_record",
+    "envelope": {
+      "operation": "note_record",
+      "project_id": "alpha",
+      "arguments": {
+        "key": "receipt-retry",
+        "expected_version": 0,
+        "note": {
+          "question": "Must a retry confirm the receipt before resending?",
+          "source_statements": [
+            {
+              "kind": "claim",
+              "statement": "The source argues a resend must confirm the receipt first.",
+              "source": {
+                "block_id": "document:6cc293b993ceaa93821cc5759368aec7ed92efa731b9d16d4c0fd3e39f162c65:1:000",
+                "document_id": "document:6cc293b993ceaa93821cc5759368aec7ed92efa731b9d16d4c0fd3e39f162c65",
+                "version": 1,
+                "hash": "018cd040fb4ec2456f574e3a989ec6585471b69741c86cdf5b1ed158249ae410"
+              }
+            },
+            {
+              "kind": "limitation",
+              "statement": "The source only covers the single-host case.",
+              "source": {
+                "block_id": "document:6cc293b993ceaa93821cc5759368aec7ed92efa731b9d16d4c0fd3e39f162c65:1:001",
+                "document_id": "document:6cc293b993ceaa93821cc5759368aec7ed92efa731b9d16d4c0fd3e39f162c65",
+                "version": 1,
+                "hash": "018cd040fb4ec2456f574e3a989ec6585471b69741c86cdf5b1ed158249ae410"
+              }
+            }
+          ],
+          "inferences": [
+            "Waiting for the receipt is consistent with the observed duplicate delivery."
+          ],
+          "open_questions": [
+            "Whether the receipt table is authoritative during a partition is undecided."
+          ],
+          "decision": {
+            "summary": "This project decides the retry path confirms the receipt first.",
+            "basis": [
+              {
+                "kind": "source",
+                "reference": {
+                  "block_id": "document:6cc293b993ceaa93821cc5759368aec7ed92efa731b9d16d4c0fd3e39f162c65:1:000",
+                  "document_id": "document:6cc293b993ceaa93821cc5759368aec7ed92efa731b9d16d4c0fd3e39f162c65",
+                  "version": 1,
+                  "hash": "018cd040fb4ec2456f574e3a989ec6585471b69741c86cdf5b1ed158249ae410"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "note": "Six kinds of content stay separate; the decision carries an explicit basis."
+  },
+  {
+    "name": "note_record_without_decision",
+    "envelope": {
+      "operation": "note_record",
+      "project_id": "alpha",
+      "arguments": {
+        "key": "open-research",
+        "dedupe": "first-pass",
+        "expected_version": 0,
+        "note": {
+          "question": "Is the receipt table authoritative during a partition?",
+          "source_statements": [
+            {
+              "kind": "claim",
+              "statement": "The source describes the receipt table as eventually consistent.",
+              "source": {
+                "block_id": "document:6cc293b993ceaa93821cc5759368aec7ed92efa731b9d16d4c0fd3e39f162c65:1:002",
+                "document_id": "document:6cc293b993ceaa93821cc5759368aec7ed92efa731b9d16d4c0fd3e39f162c65",
+                "version": 1,
+                "hash": "018cd040fb4ec2456f574e3a989ec6585471b69741c86cdf5b1ed158249ae410"
+              }
+            }
+          ],
+          "inferences": [],
+          "open_questions": [
+            "The partition behaviour is not described by the source."
+          ]
+        }
+      }
+    },
+    "note": "A note without a decision is research in progress, not a project decision."
+  },
+  {
+    "name": "note_revise",
+    "envelope": {
+      "operation": "note_revise",
+      "project_id": "alpha",
+      "arguments": {
+        "key": "receipt-retry",
+        "dedupe": "revise-after-second-source",
+        "note_id": "note:4b1f9b0b9f6f1c4c1b7f9a5e4a1e2b7c0d9a8e7f6c5b4a39281706f5e4d3c2b1",
+        "expected_version": 1,
+        "note": {
+          "question": "Must a retry confirm the receipt before resending, on every host?",
+          "source_statements": [
+            {
+              "kind": "claim",
+              "statement": "The second source extends the rule to multi-host delivery.",
+              "source": {
+                "block_id": "document:9ab3f0d6e5c4b3a29180f7e6d5c4b3a29180f7e6d5c4b3a29180f7e6d5c4b3a2:1:000",
+                "document_id": "document:9ab3f0d6e5c4b3a29180f7e6d5c4b3a29180f7e6d5c4b3a29180f7e6d5c4b3a2",
+                "version": 1,
+                "hash": "1f2e3d4c5b6a798807162534435261708f9e0a1b2c3d4e5f60718293a4b5c6d7"
+              }
+            }
+          ],
+          "inferences": [
+            "The single-host limitation of the first version no longer holds."
+          ],
+          "open_questions": []
+        }
+      }
+    },
+    "note": "A revision appends an immutable version and replaces the whole version content."
+  },
+  {
+    "name": "note_withdraw",
+    "envelope": {
+      "operation": "note_withdraw",
+      "project_id": "alpha",
+      "arguments": {
+        "key": "receipt-retry",
+        "dedupe": "withdraw-after-supersession",
+        "note_id": "note:4b1f9b0b9f6f1c4c1b7f9a5e4a1e2b7c0d9a8e7f6c5b4a39281706f5e4d3c2b1",
+        "expected_version": 2,
+        "reason": "superseded by the newer research"
+      }
+    },
+    "note": "Withdrawal is recorded as a version; the note leaves the search index."
+  },
+  {
+    "name": "note_query",
+    "envelope": {
+      "operation": "note_query",
+      "project_id": "alpha",
+      "arguments": {
+        "text": "receipt retry",
+        "budget_bytes": 8192
+      }
+    },
+    "note": "A note is returned whole with all of its citations, or omitted whole."
+  },
+  {
+    "name": "note_recover",
+    "envelope": {
+      "operation": "note_recover",
+      "project_id": "alpha",
+      "arguments": {
+        "text": "receipt",
+        "budget_bytes": 16384
+      }
+    },
+    "note": "The short package carries goal, unfinished items, revision, registration and seal — never worktree facts."
+  },
+  {
+    "name": "note_status",
+    "envelope": {
+      "operation": "note_status",
+      "project_id": "alpha",
+      "arguments": {
+        "note_id": "note:4b1f9b0b9f6f1c4c1b7f9a5e4a1e2b7c0d9a8e7f6c5b4a39281706f5e4d3c2b1",
+        "version": 1
+      }
+    },
+    "note": "A historical version is readable, together with the current state of its citations."
+  },
+  {
+    "name": "note_check",
+    "envelope": {
+      "operation": "note_check",
+      "project_id": "alpha",
+      "arguments": {
+        "package": {
+          "revision": 3,
+          "registration": "b9d1c2f3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5",
+          "seal": "7c6b5a4938271605f4e3d2c1b0a99887766554433221100ffeeddccbbaa998877",
+          "notes": []
+        }
+      }
+    },
+    "note": "A local package must be checked before it is reused; any change invalidates it."
+  }
+]

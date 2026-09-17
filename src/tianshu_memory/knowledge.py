@@ -32,6 +32,10 @@ READ = {
     "directory_scan",
     "continuation_recover",
     "continuation_check",
+    "note_query",
+    "note_recover",
+    "note_status",
+    "note_check",
 }
 WRITE = {"import", "delete", "write_state", "directory_apply"}
 # Continuation reads a registered working directory instead of a registered scan directory.
@@ -53,6 +57,18 @@ PREVIEW_READS = {"directory_scan", "continuation_recover", "continuation_check"}
 # a separate module. Global promotion/review is its own explicit permission.
 LESSON_WRITE = {"lesson_record", "lesson_revise", "lesson_retire", "experience_withdraw"}
 PROMOTE = {"experience_promote"}
+# The versioned research-note book is its own module with its own operations. It reuses the
+# project's registered sources and permissions instead of growing a second source library.
+NOTE_OPERATIONS = {
+    "note_record",
+    "note_revise",
+    "note_withdraw",
+    "note_query",
+    "note_recover",
+    "note_status",
+    "note_check",
+}
+NOTE_WRITE = {"note_record", "note_revise", "note_withdraw"}
 EVIDENCE_OPERATIONS = {
     "lesson_record": "write",
     "lesson_revise": "write",
@@ -67,7 +83,7 @@ EVIDENCE_OPERATIONS = {
     "experience_revoke": "review",
 }
 # Every operation that carries an idempotency key and records its result.
-IDEMPOTENT = WRITE | LESSON_WRITE | PROMOTE
+IDEMPOTENT = WRITE | LESSON_WRITE | PROMOTE | NOTE_WRITE
 # Marker of a client/key binding that is persisted before the first side effect of a long
 # operation. It is a claim, never a result: an identical request may resume it, and any other
 # request under the same key is refused before it reads or writes anything.
@@ -280,6 +296,20 @@ class Plan:
 
     def __call__(self, db, phase, seal_key=None, *, prepared=None, client=None):
         try:
+            if self.application.note_domain:
+                from .research_notes import dispatch as notes_dispatch
+
+                return notes_dispatch(
+                    self.application,
+                    db,
+                    self.operation,
+                    self.project_id,
+                    self.project,
+                    self.args,
+                    seal_key,
+                    self.sources,
+                    phase,
+                )
             if self.application.lesson_domain:
                 return self._lessons(db, phase, seal_key)
             return self.application._dispatch(
@@ -334,6 +364,9 @@ class KnowledgeApplication:
         self.projects = {}
         self.authorized_projects = []
         self.lesson_domain = False
+        # One dispatch belongs to exactly one domain module; the planner sets both flags before
+        # any phase runs, and the plan reads them rather than re-deciding from the operation.
+        self.note_domain = False
 
     def string(self, value, maximum):
         string(value, maximum)
@@ -372,7 +405,7 @@ class KnowledgeApplication:
         # access, and every project whose data is read must be separately registered here.
         extra = EXTRA_PERMISSION.get(operation)
         require(
-            operation in (READ | WRITE | set(EVIDENCE_OPERATIONS))
+            operation in (READ | WRITE | NOTE_OPERATIONS | set(EVIDENCE_OPERATIONS))
             and operation in permissions
             and (extra is None or extra in permissions)
             and project_id in projects
@@ -553,9 +586,18 @@ class KnowledgeApplication:
             return result
 
     def _planner(self, operation):
-        """Select the domain module, snapshot routine and evidence-project resolver."""
-        from . import lessons
+        """Select the domain module, snapshot routine and evidence-project resolver.
 
+        Each domain module owns one operation family and one schema gate; this method only
+        chooses which of them a request is routed to. No rule of any family is restated here.
+        """
+        from . import lessons, research_notes
+
+        if operation in NOTE_OPERATIONS:
+            self.lesson_domain = False
+            self.note_domain = True
+            return research_notes.snapshot, Plan.build, lambda args: ()
+        self.note_domain = False
         if operation in EVIDENCE_OPERATIONS:
             self.lesson_domain = True
             return (

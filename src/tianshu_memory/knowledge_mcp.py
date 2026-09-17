@@ -270,4 +270,78 @@ def create_server(config_path, client, credential_env):
             },
         )
 
+    @server.tool(annotations=write)
+    def note_record(project_id: str, key: str, expected_version: int, note: dict) -> dict:
+        """Record one versioned research note: research question, source statements with the
+        exact source version and unit they cite, the operator's own inferences, open questions
+        and — only when explicitly stated — a project decision with its basis. Project-only;
+        never a model suggestion, never an automatic promotion of an inference to a decision."""
+        return execute(
+            "note_record",
+            project_id,
+            {"key": key, "expected_version": expected_version, "note": note},
+        )
+
+    @server.tool(annotations=write)
+    def note_revise(
+        project_id: str, key: str, note_id: str, expected_version: int, note: dict
+    ) -> dict:
+        """Append a new version of a research note. Earlier versions and the citations they
+        were recorded with stay readable; only the identity that recorded the note may revise
+        it."""
+        return execute(
+            "note_revise",
+            project_id,
+            {
+                "key": key,
+                "note_id": note_id,
+                "expected_version": expected_version,
+                "note": note,
+            },
+        )
+
+    @server.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+        )
+    )
+    def note_withdraw(
+        project_id: str, key: str, note_id: str, expected_version: int, reason: str
+    ) -> dict:
+        """Retract a research note: a new version records the retraction, the note leaves the
+        query index, and notes that cited it stop being current."""
+        return execute(
+            "note_withdraw",
+            project_id,
+            {
+                "key": key,
+                "note_id": note_id,
+                "expected_version": expected_version,
+                "reason": reason,
+            },
+        )
+
+    @server.tool(annotations=read)
+    def note_query(project_id: str, text: str, budget_bytes: int = 8192) -> dict:
+        """Search this project's current research notes with the current state of every citation
+        they carry. A note is returned whole or not at all, and never restates the checkout."""
+        return execute("note_query", project_id, {"text": text, "budget_bytes": budget_bytes})
+
+    @server.tool(annotations=read)
+    def note_recover(project_id: str, text: str, budget_bytes: int = 8192) -> dict:
+        """Short sealed package of the declared project state and the current research notes;
+        check it before reusing a cached copy."""
+        return execute("note_recover", project_id, {"text": text, "budget_bytes": budget_bytes})
+
+    @server.tool(annotations=read)
+    def note_status(project_id: str, note_id: str, version: int) -> dict:
+        """Read one stored note version — current or historical — with the current state of
+        each citation, so an earlier conclusion can still be traced to what it cited."""
+        return execute("note_status", project_id, {"note_id": note_id, "version": version})
+
+    @server.tool(annotations=read)
+    def note_check(project_id: str, package: dict) -> dict:
+        """Validate an issued note package against the current sources and project revision."""
+        return execute("note_check", project_id, {"package": package})
+
     return server

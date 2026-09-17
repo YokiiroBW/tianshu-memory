@@ -1618,10 +1618,13 @@ def test_cli_and_official_sdk_stdio_roundtrip(checkouts):
                 await session.initialize()
                 tools = await session.list_tools()
                 names = {tool.name for tool in tools.tools}
-                assert len(tools.tools) == 22
+                # 22 through TS-083 plus the seven research-note tools of TS-084.
+                assert len(tools.tools) == 29
                 assert {
                     "knowledge_continuation_recover",
                     "knowledge_continuation_check",
+                    "note_recover",
+                    "note_check",
                 } <= names
                 response = await session.call_tool(
                     "knowledge_continuation_recover",
