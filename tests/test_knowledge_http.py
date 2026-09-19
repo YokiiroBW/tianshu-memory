@@ -915,9 +915,7 @@ def test_citation_graph_rules_survive_the_transport(entry, notes):
     )
     assert combined.status_code == 200, combined.text
     assert combined.json()["cited_notes"] == 2
-    status = entry.operation(
-        "note_status", {"note_id": combined.json()["note_id"], "version": 1}
-    )
+    status = entry.operation("note_status", {"note_id": combined.json()["note_id"], "version": 1})
     assert status.status_code == 200
     assert [item["kind"] for item in status.json()["citations"]] == [
         "source",
