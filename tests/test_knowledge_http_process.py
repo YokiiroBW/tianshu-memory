@@ -2,9 +2,14 @@
 
 This file starts the actual `knowledge_cli serve` command as a child process on an explicit free
 port and talks to it over a real socket, so the wiring under test is the wiring an operator would
-run: argparse, the credential environment variable, uvicorn's binding, the ASGI application and
-the SQLite file on disk. Nothing here is simulated by an in-process test double, and every
-operation is compared against the same operation through the existing `action` CLI.
+run: argparse, uvicorn's binding, the ASGI application and the SQLite file on disk. Nothing here
+is simulated by an in-process test double, and every operation is compared against the same
+operation through the existing `action` CLI.
+
+No secret is placed in the child's environment. The only credential this entry ever uses is the
+`Authorization: Bearer` value a request presents, so the child is started exactly as the card's
+command line says — `--client` and `--port` — and the tests prove that a correct Bearer is served,
+a wrong one is refused by the domain, and a missing one is refused by the transport.
 """
 
 import json
@@ -13,6 +18,7 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -33,13 +39,14 @@ from test_research_notes import (
 from tianshu_memory.domain import canonical
 
 CLIENT = "alpha-writer"
-CREDENTIAL_ENV = "TIANSHU_PROJECT_SECRET"
 BETA_CLIENT = "beta-writer"
-BETA_CREDENTIAL_ENV = "TIANSHU_BETA_SECRET"
 COMMAND = ["-m", "tianshu_memory.knowledge_cli"]
 ACTION = "/local/v1/project-knowledge/action"
 READY_STATE = "listening"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# The CLI's own `action` command still reads a credential from the environment; that entrypoint is
+# untouched, so the parity comparison keeps using it.
+CLI_CREDENTIAL_ENV = "TIANSHU_PROJECT_SECRET"
 
 
 def free_port():
@@ -53,17 +60,19 @@ def request_body(operation, arguments, project="alpha"):
 
 
 @contextmanager
-def serving(notes, port=None, *, client=CLIENT, credential=SECRET, credential_env=CREDENTIAL_ENV):
+def serving(notes, port=None, *, client=CLIENT, credential=SECRET):
     """Start the real command as a child process and stop it again, always.
 
-    Only the identity binding is chosen by the test: the command, the port and the credential
-    environment variable are the ones an operator would type, and the child runs from the
-    repository root exactly as the documented command does.
+    Only the identity binding and the port are chosen by the test: the command is the one an
+    operator would type, the child runs from the repository root, and its environment carries no
+    knowledge credential at all.
     """
     port = free_port() if port is None else port
-    env = {key: value for key, value in os.environ.items() if key != credential_env}
-    if credential is not None:
-        env[credential_env] = credential
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not (key.startswith("TIANSHU") and ("SECRET" in key or "CREDENTIAL" in key))
+    }
     env["PYTHONUTF8"] = "1"
     process = subprocess.Popen(
         [
@@ -74,8 +83,6 @@ def serving(notes, port=None, *, client=CLIENT, credential=SECRET, credential_en
             "serve",
             "--client",
             client,
-            "--credential-env",
-            credential_env,
             "--port",
             str(port),
         ],
@@ -134,11 +141,11 @@ def action(notes, operation, arguments, *, project="alpha", name="action.json"):
             "--client",
             CLIENT,
             "--credential-env",
-            CREDENTIAL_ENV,
+            CLI_CREDENTIAL_ENV,
             str(path),
         ],
         cwd=REPO_ROOT,
-        env=dict(os.environ, TIANSHU_PROJECT_SECRET=SECRET, PYTHONUTF8="1"),
+        env=dict(os.environ, **{CLI_CREDENTIAL_ENV: SECRET}, PYTHONUTF8="1"),
         capture_output=True,
         timeout=60,
     )
@@ -152,6 +159,36 @@ def package_of(client, text="receipt"):
     response = send(client, "note_recover", {"text": text, "budget_bytes": 16384})
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def test_real_http_process_serves_a_bearer_with_no_secret_in_its_environment(notes):
+    """The three credential verdicts over a real socket, with no server-side secret anywhere.
+
+    The child process is started with every knowledge credential removed from its environment, so
+    the only thing that can authorize a request is the Bearer value the request itself carries.
+    A correct one is served, a wrong one is refused by the domain (422 with the domain's own
+    code), and a missing one is refused by the transport (401) — three different layers, three
+    different statuses, and nothing configured on the server.
+    """
+    imported(notes)
+    body = request_body("query", {"text": "receipt", "budget_bytes": 8192})
+    with serving(notes) as (client, port):
+        assert client.post(ACTION, json=body).status_code == 200
+        wrong = httpx.post(
+            f"http://127.0.0.1:{port}{ACTION}",
+            json=body,
+            headers={"Authorization": f"Bearer {SECRET}-not-the-real-one"},
+            timeout=20,
+            trust_env=False,
+        )
+        assert wrong.status_code == 422
+        assert wrong.json() == {"status": "failed", "code": "unauthorized"}
+        absent = httpx.post(
+            f"http://127.0.0.1:{port}{ACTION}", json=body, timeout=20, trust_env=False
+        )
+        assert absent.status_code == 401
+        assert absent.json() == {"status": "failed", "code": "unauthorized"}
+        assert absent.headers["cache-control"] == "no-store"
 
 
 def test_real_http_process_agrees_with_the_existing_domain_entrypoint(notes):
@@ -339,7 +376,8 @@ def test_real_http_process_refuses_without_side_effects(notes):
         }
         forged = write | {"client": "operator"}
         forged_response = client.post(ACTION, json=forged)
-        assert forged_response.status_code == 422
+        # A body field this entry does not act on is the entry's own verdict on the request text.
+        assert forged_response.status_code == 400
         assert forged_response.json() == {"status": "failed", "code": "invalid_input"}
         # Another project is a real project this client is not registered for, so the domain
         # refuses it on the client's own project list rather than on the project's existence.
@@ -377,27 +415,17 @@ def test_real_http_process_survives_parallel_requests(notes):
     the four admission slots of each entry are genuinely contended while every accepted response
     still carries only the project its own client is registered for.
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     imported(notes)
     imported(notes, "beta")
-    listeners = {
-        "alpha": (CLIENT, SECRET, CREDENTIAL_ENV),
-        "beta": (BETA_CLIENT, OTHER_SECRET, BETA_CREDENTIAL_ENV),
-    }
+    listeners = {"alpha": (CLIENT, SECRET), "beta": (BETA_CLIENT, OTHER_SECRET)}
     with (
         serving(notes) as alpha,
-        serving(
-            notes,
-            client=listeners["beta"][0],
-            credential=listeners["beta"][1],
-            credential_env=listeners["beta"][2],
-        ) as beta,
+        serving(notes, client=BETA_CLIENT, credential=OTHER_SECRET) as beta,
     ):
         ports = {"alpha": alpha[1], "beta": beta[1]}
 
         def read(project, text):
-            _, secret, _ = listeners[project]
+            _, secret = listeners[project]
             with httpx.Client(
                 base_url=f"http://127.0.0.1:{ports[project]}",
                 timeout=30,
@@ -444,10 +472,152 @@ def test_real_http_process_survives_parallel_requests(notes):
         )
 
 
+def read_response(connection, *, timeout=30):
+    """Read one complete HTTP response from a raw socket: status line, headers and body.
+
+    A single `recv` can return the headers without the body, so the declared `Content-Length` is
+    read before the answer is judged.
+    """
+    connection.settimeout(timeout)
+    raw = b""
+    while b"\r\n\r\n" not in raw:
+        chunk = connection.recv(65536)
+        if not chunk:
+            return raw
+        raw += chunk
+    head, _, body = raw.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value.strip())
+    while len(body) < length:
+        chunk = connection.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+    return head + b"\r\n\r\n" + body
+
+
+def status_of(raw):
+    return int(raw.split(b"\r\n")[0].split(b" ")[1])
+
+
+def body_of(raw):
+    return json.loads(raw.partition(b"\r\n\r\n")[2].decode("utf-8"))
+
+
+def test_real_http_process_refuses_a_fifth_request_before_reading_its_body(notes):
+    """A real socket, four held bodies, and a fifth request that is refused before its body.
+
+    The four holders open a request, write only part of the body and then stop writing, so the
+    server is genuinely parked reading them and every admission slot is taken. The fifth request is
+    sent on a fresh connection with no body at all and must be answered 503 without the server
+    waiting for one: the answer can only arrive if the entry refused it before reading. Afterwards
+    the held bodies are completed and all four are served, so the bound released exactly what it
+    held.
+    """
+    imported(notes)
+    request = canonical(request_body("query", {"text": "receipt", "budget_bytes": 8192})).encode()
+
+    def headers(length, port):
+        return (
+            b"Host: 127.0.0.1:" + str(port).encode() + b"\r\n"
+            b"Authorization: Bearer " + SECRET.encode() + b"\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(length).encode() + b"\r\n\r\n"
+        )
+
+    with serving(notes) as (_, port):
+        errors = []
+        held = []
+
+        def hold():
+            try:
+                connection = socket.create_connection(("127.0.0.1", port), timeout=30)
+                connection.sendall(
+                    b"POST "
+                    + ACTION.encode()
+                    + b" HTTP/1.1\r\n"
+                    + headers(len(request), port)
+                    + request[:16]
+                )
+                held.append(connection)
+            except OSError as error:  # pragma: no cover - only on a broken environment
+                errors.append(error)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _: hold(), range(4)))
+        assert not errors and len(held) == 4
+        # All four connections are inside the server, holding their slots with an unfinished body.
+        time.sleep(1.0)
+        # A fifth request announces no body and sends none: the entry must answer it immediately.
+        probe = socket.create_connection(("127.0.0.1", port), timeout=30)
+        probe.sendall(b"POST " + ACTION.encode() + b" HTTP/1.1\r\n" + headers(0, port))
+        started = time.monotonic()
+        answer = read_response(probe)
+        elapsed = time.monotonic() - started
+        assert status_of(answer) == 503, answer[:200]
+        assert body_of(answer) == {"status": "failed", "code": "overloaded"}, answer[:400]
+        # It was not parked waiting for a body it never sent, and it never read one.
+        assert elapsed < 5, elapsed
+        probe.close()
+        # Completing the held bodies serves all four, so the bound released what it held.
+        for connection in held:
+            connection.sendall(request[16:])
+            served = read_response(connection)
+            assert status_of(served) == 200, served[:200]
+            assert body_of(served)["blocks"], served[:400]
+            connection.close()
+        # And the entry is idle again: a normal request is served.
+        with httpx.Client(
+            base_url=f"http://127.0.0.1:{port}",
+            timeout=20,
+            trust_env=False,
+            headers={"Authorization": f"Bearer {SECRET}"},
+        ) as fresh:
+            assert (
+                send(fresh, "query", {"text": "receipt", "budget_bytes": 8192}).status_code == 200
+            )
+
+
+def test_real_http_process_recovers_from_an_abandoned_request(notes):
+    """A client that disappears mid-body does not cost the entry a slot or its health.
+
+    The connection is closed after a partial body, which is what a crashed connector looks like.
+    The entry must keep serving: the next real request is answered normally, which is only possible
+    if the abandoned one gave its admission slot back.
+    """
+    imported(notes)
+    request = canonical(request_body("query", {"text": "receipt", "budget_bytes": 8192})).encode()
+    with serving(notes) as (client, port):
+        abandoned = socket.create_connection(("127.0.0.1", port), timeout=30)
+        abandoned.sendall(
+            b"POST " + ACTION.encode() + b" HTTP/1.1\r\n"
+            b"Host: 127.0.0.1:" + str(port).encode() + b"\r\n"
+            b"Authorization: Bearer " + SECRET.encode() + b"\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(request)).encode() + b"\r\n\r\n" + request[:16]
+        )
+        time.sleep(0.5)
+        abandoned.close()
+        # The entry is still alive and still serving, so the abandoned request released its slot.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            answer = send(client, "query", {"text": "receipt", "budget_bytes": 8192})
+            if answer.status_code == 200:
+                break
+            assert answer.status_code == 503, answer.text
+            time.sleep(0.1)
+        assert answer.status_code == 200, answer.text
+        assert answer.json()["blocks"]
+        assert client.get("/health").json()["state"] == READY_STATE
+
+
 @pytest.mark.parametrize(
     "tail",
     [
-        ["serve", "--client", CLIENT, "--credential-env", CREDENTIAL_ENV],
+        ["serve", "--client", CLIENT],
         ["serve", "--client", CLIENT, "--port", "0"],
     ],
 )
@@ -456,16 +626,24 @@ def test_real_process_refuses_to_start_without_an_explicit_valid_port(notes, tai
     process = subprocess.run(
         [sys.executable, *COMMAND, "--config", str(notes.path), *tail],
         cwd=REPO_ROOT,
-        env=dict(os.environ, TIANSHU_PROJECT_SECRET=SECRET, PYTHONUTF8="1"),
+        env=dict(os.environ, PYTHONUTF8="1"),
         capture_output=True,
         timeout=60,
     )
     assert process.returncode != 0
-    assert b"serve" in process.stderr
+    if "--port" in tail:
+        # A real port that is not a usable port is refused by the entry itself, with its code.
+        assert json.loads(process.stdout) == {
+            "status": "failed",
+            "code": "invalid_configuration",
+        }
+    else:
+        # Without a port at all, argparse refuses before anything runs: no default exists.
+        assert b"--port" in process.stderr
 
 
-def test_real_process_refuses_to_start_without_its_credential(notes):
-    """A process that cannot present its client's credential refuses instead of serving 401s."""
+def test_real_process_refuses_to_serve_an_unregistered_client(notes):
+    """A process whose fixed client is not registered refuses to start instead of serving 401s."""
     process = subprocess.run(
         [
             sys.executable,
@@ -474,9 +652,7 @@ def test_real_process_refuses_to_start_without_its_credential(notes):
             str(notes.path),
             "serve",
             "--client",
-            CLIENT,
-            "--credential-env",
-            "TIANSHU_ABSENT_CREDENTIAL",
+            "not-registered",
             "--port",
             str(free_port()),
         ],
@@ -486,10 +662,7 @@ def test_real_process_refuses_to_start_without_its_credential(notes):
         timeout=60,
     )
     assert process.returncode == 1
-    assert json.loads(process.stdout) == {
-        "status": "failed",
-        "code": "missing_service_credential",
-    }
+    assert json.loads(process.stdout) == {"status": "failed", "code": "unregistered_client"}
 
 
 def test_real_process_refuses_to_start_without_a_configuration(notes):
@@ -502,13 +675,11 @@ def test_real_process_refuses_to_start_without_a_configuration(notes):
             "serve",
             "--client",
             CLIENT,
-            "--credential-env",
-            CREDENTIAL_ENV,
             "--port",
             str(free_port()),
         ],
         cwd=REPO_ROOT,
-        env=dict(os.environ, TIANSHU_PROJECT_SECRET=SECRET, PYTHONUTF8="1"),
+        env=dict(os.environ, PYTHONUTF8="1"),
         capture_output=True,
         timeout=60,
     )

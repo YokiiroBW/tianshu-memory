@@ -7,7 +7,8 @@ A thin transport for one already-integrated application. It adds no rule of its 
   field of a request body, query string or header can choose who the caller is;
 - the credential is whatever `Authorization: Bearer` carried, exactly as the CLI and MCP
   entrypoints pass their credential, so `knowledge.clients` stays the only authority for a
-  digest, a project list and a permission list;
+  digest, a project list and a permission list. No server-side secret is configured here, and no
+  environment variable is read;
 - no database, source context, project adapter or other product client is held here, and the
   domain never imports this module.
 
@@ -17,28 +18,40 @@ evidence freshness and the transaction boundary — is decided inside the domain
 
 The boundaries enforced here are transport concerns only:
 
+- admission before everything: one of four slots is taken *before* a single byte of the body is
+  read, so the bound covers the whole admitted request — reading its body *and* the synchronous
+  execute it starts. A request that arrives with every slot busy is refused immediately with 503
+  and never reads its body, so there is no waiting queue and no second, unbounded queue of slow
+  bodies. A slot is given up when the read failed or no synchronous call was ever started, and
+  otherwise only when that call has really returned: a read timeout, a disconnect or an execute
+  wait timeout ends the *response*, never the work, and never frees a slot that still has work in
+  it;
+- two independent 10 second phases: reading the request body, and waiting for the synchronous
+  execute. Either one that expires is reported as 408 `request_timeout` and never as a claim that
+  the operation was cancelled;
 - strictly bounded request reading: at most 262144 bytes counted while streaming, never from
-  `Content-Length`, within a 10 second read deadline;
-- at most 4 executes running at once; a request that arrives while all four are busy is refused
-  immediately with 503 instead of waiting in a queue, and a slot is released only once the
-  synchronous call it guards has really returned — a timeout or a disconnect never speaks for
-  work that is still running, and no write is retried here;
+  `Content-Length`;
 - loopback only: the Host must name 127.0.0.1 or localhost on the port this process was told to
   serve, a browser `Origin` request is refused, there is no CORS or cookie surface, and no proxy
   forwarding header is trusted;
 - no OpenAPI/docs/redoc route, no response without `no-store`, and failure bodies that expose
   only a stable code — never a path, a credential, SQL or source text.
 
-Failures are reported in one envelope, `{"status": "failed", "code": "<stable code>"}`. The status
-tells a caller how to react, and the code tells it what happened: 401 for a missing or mismatched
-credential, 503 for saturation and for a dependency that is down, and 408/413/415 for a deadline, an
-oversized body and a media type this entry does not carry. Everything else — including a body whose
-shape or argument the domain refuses — is 422 with the refusing layer's own code, so a caller never
-has to guess whether a 4xx meant "I could not read your request" or "I read it and refused it".
+Failures are reported in one envelope, `{"status": "failed", "code": "<stable code>"}`, and the
+status says which *layer* refused the request, never which permission class was missing:
+
+- this module's own verdicts on the request itself keep their transport status: 400 for a
+  malformed body or a bad field, 413 for a body over the limit, 415 for a media type or operation
+  this entry does not carry, 408 for either phase's deadline, 401 for a missing or malformed
+  `Authorization: Bearer`, 400 for a Host or `Origin` this entry does not serve, 503 for
+  saturation and for a dependency that is down;
+- *everything* the domain's own `execute` refuses is 422 with the domain's own code, whatever the
+  code happens to be called. A code name is never used to guess which layer raised it: a domain
+  refusal named `invalid_input` is a 422, and this module's own malformed-body verdict with the
+  same name is a 400, because they come from different places.
 """
 
 import asyncio
-import os
 import sqlite3
 from pathlib import Path
 
@@ -46,6 +59,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import ClientDisconnect
 
 from .domain import Fault, require, strict_json
 from .knowledge import KnowledgeApplication
@@ -70,9 +84,11 @@ ALLOWED_OPERATIONS = frozenset(
     }
 )
 MAX_BODY_BYTES = 262144
-# The deadline covers reading the request and the execute call together, so one request can
-# never occupy its admission slot indefinitely.
+# Two independent phases, each bounded on its own: reading the request body, and waiting for the
+# synchronous execute the request started. Together with the four slots this is what keeps one
+# request from occupying the process indefinitely.
 READ_TIMEOUT_SECONDS = 10.0
+EXECUTE_TIMEOUT_SECONDS = 10.0
 MAX_ACTIVE_EXECUTES = 4
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 MAX_CLIENT_LENGTH = 128
@@ -83,48 +99,47 @@ NO_STORE = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
 }
-# 400/413/415 are transport verdicts and 503 says this process cannot serve the request now
-# (all slots busy, or the storage the domain needs is unusable). Every refusal the domain itself
-# raised is reported in one 422 envelope with its own code, so a caller never has to guess a
-# permission class from a status code.
+# Every refusal the domain's execute raises is reported as 422 with its own code, so a caller
+# never has to guess a permission class — or a layer — from a status code.
 DOMAIN_STATUS = 422
-# The codes the transport itself decides, and the status each is reported with.
-TRANSPORT_CODES = frozenset(
-    {
-        "invalid_host",
-        "browser_origin_refused",
-        "request_timeout",
-        "request_too_large",
-        "unsupported",
-    }
-)
-TRANSPORT_STATUS = {
-    "invalid_host": 400,
-    "browser_origin_refused": 400,
-    "request_timeout": 408,
-    "request_too_large": 413,
-    "unsupported": 415,
-}
-DEPENDENCY_CODES = frozenset({"overloaded", "dependency_unavailable", "dependency_or_input_error"})
+# The statuses this module's own verdicts are reported with. The failure of a dependency (a
+# missing table, an unreadable file) is `dependency_unavailable`, not one of these.
+STATUS_DEPENDENCY = 503
+STATUS_SATURATED = 503
+STATUS_DEADLINE = 408
+STATUS_BEARER = 401
+STATUS_BODY = 400
+STATUS_AUTHORITY = 400
+STATUS_TOO_LARGE = 413
+STATUS_MEDIA = 415
 
 
-def failed(code: str, status: int) -> JSONResponse:
-    """The only failure shape this entry returns: a status and a stable code."""
-    return JSONResponse({"status": "failed", "code": code}, status_code=status, headers=NO_STORE)
+class Refusal(Fault):
+    """A `Fault` that came out of the domain's `execute` and is reported as a 422.
 
-
-class Credential:
-    """The service credential, read from the operator's environment variable per request.
-
-    Reading it at every request instead of caching it at startup is what lets a rotated or
-    cleared variable stop working without a restart. The value never enters a log or a response.
+    The domain's own refusals carry their natural status (a missing credential is a 401 there, a
+    malformed argument a 400). On this wire every one of them is a 422 with its code preserved,
+    and the only reliable way to know that a refusal came from the domain is to mark it where it
+    crosses the `execute` boundary: a code name is not a layer. `domain.Fault` itself is the
+    product's shared vocabulary and is not modified.
     """
 
-    def __init__(self, name: str):
-        self.name = name
+    def __init__(self, code):
+        super().__init__(code, DOMAIN_STATUS)
+        self.code = code
+        # Set explicitly rather than inherited: this type *is* the statement "the domain refused
+        # it", and the status is the same for every one of them whatever the domain said.
+        self.status = DOMAIN_STATUS
 
-    def __call__(self):
-        return os.environ.get(self.name)
+
+def transport(code, status):
+    """This module's own verdict on a request, carrying the status it is reported with."""
+    return Fault(code, status)
+
+
+def failed(code, status) -> JSONResponse:
+    """The only failure shape this entry returns: a status and a stable code."""
+    return JSONResponse({"status": "failed", "code": code}, status_code=status, headers=NO_STORE)
 
 
 def load_config(config_path, client):
@@ -139,22 +154,28 @@ def load_config(config_path, client):
     try:
         raw = path.read_bytes()
     except OSError:
-        raise Fault("invalid_configuration", 503) from None
+        raise transport("invalid_configuration", STATUS_DEPENDENCY) from None
     try:
         config = strict_json(raw)
     except ValueError:
-        raise Fault("invalid_configuration", 503) from None
-    require(isinstance(config, dict), "invalid_configuration", 503)
+        raise transport("invalid_configuration", STATUS_DEPENDENCY) from None
+    require(isinstance(config, dict), "invalid_configuration", STATUS_DEPENDENCY)
     knowledge = config.get("knowledge")
-    require(isinstance(knowledge, dict), "invalid_configuration", 503)
+    require(isinstance(knowledge, dict), "invalid_configuration", STATUS_DEPENDENCY)
     principal = knowledge.get("clients", {}).get(client)
-    require(isinstance(principal, dict) and bool(principal.get("permissions")), "unauthorized", 401)
+    # A client that is not a registered principal cannot be served at all: the process refuses to
+    # start rather than answer every request with a credential refusal while looking healthy.
+    require(
+        isinstance(principal, dict) and bool(principal.get("permissions")),
+        "unregistered_client",
+        STATUS_BEARER,
+    )
     return config
 
 
 def serve_port(port):
     """The one port this process was told to serve; the Host check is built on it."""
-    require(type(port) is int and 1 <= port <= 65535, "invalid_configuration", 400)
+    require(type(port) is int and 1 <= port <= 65535, "invalid_configuration", STATUS_AUTHORITY)
     return port
 
 
@@ -169,7 +190,7 @@ def check_host(host, port):
     name, separator, declared = authority.rpartition(":")
     if not separator:
         name, declared = authority, ""
-    require(name in LOOPBACK_HOSTS and declared == str(port), "invalid_host", 400)
+    require(name in LOOPBACK_HOSTS and declared == str(port), "invalid_host", STATUS_AUTHORITY)
 
 
 def check_origin(request):
@@ -182,51 +203,76 @@ def check_origin(request):
     require(
         request.headers.get("origin") is None and request.headers.get("sec-fetch-site") is None,
         "browser_origin_refused",
-        400,
+        STATUS_AUTHORITY,
     )
 
 
 def bearer(request):
-    """The credential exactly as the caller presented it, or a refusal."""
+    """The credential exactly as the caller presented it, or a refusal.
+
+    The presented value *is* the credential: it is handed to the existing `execute`, which
+    compares it against `knowledge.clients`. This entry holds no secret of its own and reads no
+    environment variable, so nothing here can authorize a request that the domain would not.
+    """
     header = request.headers.get("authorization")
     require(
         isinstance(header, str) and header.startswith("Bearer ") and len(header) > len("Bearer "),
         "unauthorized",
-        401,
+        STATUS_BEARER,
     )
     return header[len("Bearer ") :]
 
 
-async def read_body(request, timeout):
+def check_media_type(request):
+    """Only a JSON body is carried here."""
+    media_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    require(media_type == "application/json", "unsupported", STATUS_MEDIA)
+
+
+async def read_body(request, deadline):
     """Read at most `MAX_BODY_BYTES`, counting streaming chunks within a read deadline.
 
     `Content-Length` is never trusted: the limit is enforced on the bytes that actually arrive,
-    and a body that keeps arriving past it is refused with 413.
+    and a body that keeps arriving past it is refused with 413. A body that stops arriving is a
+    408, and a body the peer abandoned is a 400 — all three are verdicts about the request, and
+    the caller of this function still holds its admission slot while they are reached.
     """
     body = bytearray()
     try:
-        async with asyncio.timeout(timeout):
+        async with asyncio.timeout(deadline):
             async for chunk in request.stream():
                 body.extend(chunk)
                 if len(body) > MAX_BODY_BYTES:
-                    raise Fault("request_too_large", 413)
+                    raise transport("request_too_large", STATUS_TOO_LARGE)
     except TimeoutError:
-        raise Fault("request_timeout", 408) from None
+        raise transport("request_timeout", STATUS_DEADLINE) from None
     except Fault:
         raise
+    except ClientDisconnect:
+        # The peer went away mid-body. This is not a completed request, and it is reported as the
+        # malformed input it is rather than as a defect of this process.
+        raise transport("invalid_input", STATUS_BODY) from None
     except (ValueError, RuntimeError):
-        # A truncated or abandoned body is an input failure, never a completed request.
-        raise Fault("invalid_input", 400) from None
+        # A truncated or otherwise unusable body is never a completed request either.
+        raise transport("invalid_input", STATUS_BODY) from None
     return bytes(body)
 
 
 def parse_body(raw):
-    """One strict JSON object carrying exactly the three request fields."""
+    """One strict JSON object carrying exactly the three request fields.
+
+    These are this module's own verdicts on the request text, so they keep the transport statuses
+    the card fixes for input: a non-JSON body is a 415 at the media-type check, and a JSON body
+    whose shape or fields this entry will not act on is a 400. The domain's identically named
+    `invalid_input` refusal stays a 422 with its own code — see `Refusal`.
+    """
     try:
         payload = strict_json(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
-        raise Fault("invalid_input", 400) from None
-    require(isinstance(payload, dict) and set(payload) == REQUEST_FIELDS, "invalid_input", 400)
+        raise transport("invalid_input", STATUS_BODY) from None
+    require(
+        isinstance(payload, dict) and set(payload) == REQUEST_FIELDS, "invalid_input", STATUS_BODY
+    )
     operation, project_id, arguments = (
         payload["operation"],
         payload["project_id"],
@@ -237,28 +283,38 @@ def parse_body(raw):
     require(
         isinstance(operation, str) and isinstance(project_id, str) and isinstance(arguments, dict),
         "invalid_input",
-        400,
+        STATUS_BODY,
     )
-    require(operation in ALLOWED_OPERATIONS, "unsupported", 415)
-    require(0 < len(project_id) <= 128, "invalid_input", 400)
+    require(operation in ALLOWED_OPERATIONS, "unsupported", STATUS_MEDIA)
+    require(0 < len(project_id) <= MAX_CLIENT_LENGTH, "invalid_input", STATUS_BODY)
     return payload
 
 
-def create_app(config_path, client, port, *, credential=None, read_timeout=None):
+def create_app(config_path, client, port, *, body_timeout=None, execute_timeout=None):
     """Build the entry for one fixed knowledge client on one explicit loopback port.
 
     The factory refuses to build an application whose private configuration is missing or
     unparseable, whose named client is not registered, or whose port is not a real port: a
-    process that cannot serve its client must not start and then look alive.
+    process that cannot serve its client must not start and then look alive. It holds no
+    credential: every request presents its own, and the domain decides whether it authorizes
+    anything.
+
+    The two phase limits exist so a test can exercise a deadline without waiting ten seconds. The
+    wire contract is the defaults; production never passes them.
     """
     load_config(config_path, client)
-    require(isinstance(client, str) and 0 < len(client) <= MAX_CLIENT_LENGTH, "invalid_input", 400)
+    require(
+        isinstance(client, str) and 0 < len(client) <= MAX_CLIENT_LENGTH,
+        "invalid_input",
+        STATUS_BODY,
+    )
     port = serve_port(port)
-    if credential is None:
-        credential = Credential("TIANSHU_PROJECT_CREDENTIAL")
-    require(callable(credential), "invalid_configuration", 400)
-    deadline = READ_TIMEOUT_SECONDS if read_timeout is None else float(read_timeout)
-    require(deadline > 0, "invalid_configuration", 400)
+    read_deadline = READ_TIMEOUT_SECONDS if body_timeout is None else float(body_timeout)
+    execute_deadline = (
+        EXECUTE_TIMEOUT_SECONDS if execute_timeout is None else float(execute_timeout)
+    )
+    require(read_deadline > 0, "invalid_configuration", STATUS_AUTHORITY)
+    require(execute_deadline > 0, "invalid_configuration", STATUS_AUTHORITY)
 
     app = FastAPI(
         title="Tianshu project knowledge (restricted loopback entry)",
@@ -268,29 +324,53 @@ def create_app(config_path, client, port, *, credential=None, read_timeout=None)
         openapi_url=None,
     )
     app.state.knowledge_client = client
-    app.state.credential = credential
-    # The only mutable transport state: how many executes are running, plus one optional call
-    # observer. Neither carries a project, a credential or a request body between requests.
+    # The only mutable transport state: how many admitted requests are in flight, plus two
+    # optional observation points. None of them carries a project, a credential or a request body
+    # between requests.
     app.state.active = 0
     app.state.observer = None
+    app.state.settle = None
 
     def claim_slot():
-        """Take one of the bounded execute slots, or report that none is free.
+        """Take one of the four admission slots, or report that none is free.
 
         This is a plain counter rather than a semaphore with a waiting queue: the policy is that a
         request arriving when every slot is busy is *refused*, never parked, so there is nothing
-        to wait on. The counter is only ever touched from the event loop (the worker thread never
-        releases a slot itself), so no lock is needed to keep it exact.
+        to wait on. The claim happens before the body is read and is never deferred to after it:
+        a check that ran early and claimed late would let a burst of requests slip through the gap
+        between the two and put an unbounded number of slow bodies in flight. The counter is only
+        ever touched from the event loop (the worker thread never releases a slot itself), so no
+        lock is needed to keep it exact and no request can be counted twice.
         """
         if app.state.active >= MAX_ACTIVE_EXECUTES:
             return False
         app.state.active += 1
         return True
 
-    def release_slot():
-        app.state.active -= 1
+    class Lease:
+        """One request's ownership of one admission slot, released exactly once.
 
-    def released(task):
+        The slot has three possible owners in sequence — the request frame while it reads the body
+        and waits, the running call itself if the response ends first, and nobody once either has
+        finished — and a request can end in ways its own code never sees (a cancellation while the
+        body is still arriving). Keeping the ownership in one object with one `release` makes every
+        path land on the same single decrement: a request can neither leak its slot nor give it
+        back twice, which would let the process run more work than the bound allows.
+        """
+
+        def __init__(self):
+            self.owner = "request"
+
+        def hand_off(self):
+            """Give the slot to the running call, which will release it when it really returns."""
+            self.owner = "call"
+
+        def release(self):
+            if self.owner == "request":
+                self.owner = "nobody"
+                app.state.active -= 1
+
+    def released(task, lease):
         """Free the slot an abandoned call was holding, and consume its outcome.
 
         The caller is gone by then, so nothing can be reported; the only honest thing left is to
@@ -301,7 +381,8 @@ def create_app(config_path, client, port, *, credential=None, read_timeout=None)
             task.exception()
         except BaseException:  # noqa: BLE001 - a cancelled worker still needs its slot back
             pass
-        release_slot()
+        lease.owner = "request"
+        lease.release()
 
     def application():
         """One request's own application, built and thrown away.
@@ -315,39 +396,55 @@ def create_app(config_path, client, port, *, credential=None, read_timeout=None)
         return KnowledgeApplication(config_path)
 
     def call(body, presented):
-        """Run one operation through this request's own application."""
-        observer = app.state.observer
-        if observer is None:
-            return application().execute(body, client=client, credential=presented)
-        # The observer replaces the call, never a rule of it: it receives the same body and the
-        # same presented credential a production request would, and an observation that does not
-        # perform the call simply performs nothing.
-        return observer(body, presented, application)
+        """Run one operation through this request's own application, marking a domain refusal.
 
-    async def run_operation(body, presented):
-        """One operation, bounded by an admission slot its call itself releases."""
-        if not claim_slot():
-            # No queue and no wait: this process is already running as many operations as it is
-            # allowed to, and the caller is told to come back rather than being parked.
-            raise Fault("overloaded", 503)
-        work = asyncio.ensure_future(run_in_threadpool(call, body, presented))
+        This is the boundary the card asks for: whatever the domain's `execute` raises is marked
+        *here*, where it crosses out of the domain, and everything else this module raises later —
+        a saturated entry, an expired phase, an unreadable body — is its own verdict and keeps its
+        own status. No code name is ever consulted to decide which layer spoke.
+        """
+        observer = app.state.observer
         try:
-            # Shielding keeps this frame's cancellation — a disconnect, or the deadline below —
-            # from cancelling the worker call, so a response can end while its operation runs on.
-            return await asyncio.wait_for(asyncio.shield(work), timeout=deadline)
+            if observer is None:
+                result = application().execute(body, client=client, credential=presented)
+                settle = app.state.settle
+                if settle is not None:
+                    settle()
+                return result
+            # The observer replaces the call, never a rule of it: it receives the same body and
+            # the same presented credential a production request would, and an observation that
+            # does not perform the call simply performs nothing.
+            return observer(body, presented, application)
+        except Fault as error:
+            raise Refusal(error.code) from None
+
+    async def run_operation(body, presented, lease):
+        """Run the synchronous call while this request's slot is held until it really returns.
+
+        The waiting is shielded, so ending the *response* — the deadline below, or a disconnect —
+        never cancels the worker that is already writing. The slot therefore has exactly three
+        exits: the call finished, the call was cancelled before it could start, or the response
+        ended first and the call's own completion releases it later. Every path releases once,
+        through the one lease.
+        """
+        work = asyncio.ensure_future(run_in_threadpool(call, body, presented))
+        lease.hand_off()
+        try:
+            # Shielding keeps this frame's cancellation from cancelling the worker call, so the
+            # response can end while the operation runs on and still commits.
+            return await asyncio.wait_for(asyncio.shield(work), timeout=execute_deadline)
         except TimeoutError:
             # The operation is still running and may still commit. This entry never claims it was
             # cancelled and never retries it: the caller replays the same idempotent request, or
             # reads its recorded result, once it has returned.
-            raise Fault("request_timeout", 408) from None
+            raise transport("request_timeout", STATUS_DEADLINE) from None
         finally:
-            # The slot is returned when the *call* is over, never when the response is written: a
-            # timeout or a disconnect must not free a slot that still has work in it, because
-            # that is exactly how a bounded process turns into an unbounded one.
             if work.done():
-                release_slot()
+                work.exception()
+                lease.owner = "request"
+                lease.release()
             else:
-                work.add_done_callback(released)
+                work.add_done_callback(lambda task: released(task, lease))
 
     @app.get(HEALTH_PATH, status_code=200)
     async def health(request: Request):
@@ -355,7 +452,8 @@ def create_app(config_path, client, port, *, credential=None, read_timeout=None)
 
         No project is opened, migrated or read here, so `listening` must never be read as "the
         projects are migrated and readable". Every actual operation still decides that itself and
-        fails closed with the storage error the domain raises.
+        fails closed with the storage error the domain raises. This route neither reads a body nor
+        takes one of the four slots: it does no work that a slot bounds.
         """
         check_host(request.headers.get("host"), port)
         check_origin(request)
@@ -371,29 +469,43 @@ def create_app(config_path, client, port, *, credential=None, read_timeout=None)
         check_host(request.headers.get("host"), port)
         check_origin(request)
         presented = bearer(request)
-        media_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
-        require(media_type == "application/json", "unsupported", 415)
-        body = parse_body(await read_body(request, deadline))
-        return JSONResponse(await run_operation(body, presented), status_code=200, headers=NO_STORE)
+        check_media_type(request)
+        if not claim_slot():
+            # No queue and no wait, and no body is read: this request is refused with the bound
+            # still intact, whatever the sender was still going to write.
+            raise transport("overloaded", STATUS_SATURATED)
+        lease = Lease()
+        try:
+            try:
+                body = parse_body(await read_body(request, read_deadline))
+            except Fault:
+                # The read failed, so no call of this request is running and the slot goes back.
+                raise
+            return JSONResponse(
+                await run_operation(body, presented, lease), status_code=200, headers=NO_STORE
+            )
+        except Fault:
+            raise
+        except (sqlite3.Error, OSError, ValueError, ImportError):
+            raise transport("dependency_unavailable", STATUS_DEPENDENCY) from None
+        finally:
+            # The one place a request that never handed its slot to a call gives it back: a read
+            # that failed, a body that never parsed, a cancellation while the body was arriving, or
+            # the response being written. Once a call owns the slot this is a no-op, so the slot
+            # still lives until that call really returns.
+            lease.release()
 
     @app.exception_handler(Fault)
     async def fault_handler(request: Request, error: Fault):
-        """Transport verdicts keep their own status; refusals become one caller-visible envelope.
+        """Report each refusal with the status of the layer that produced it.
 
-        The card fixes a 422 envelope for refusals, so any domain code carrying one of the
-        transport's own statuses (400 for a too-small byte budget, 413 for an oversized write) is
-        reported as 422 with its code: a caller must never have to guess whether a 400 means "your
-        request was malformed" or "your request was understood and refused". A missing credential
-        is the one identity failure a caller may distinguish, and it is decided here, before any
-        domain call.
+        A `Refusal` is a domain refusal and is always 422 with the domain's code. Anything else
+        raised here is this module's own verdict and keeps the status it was declared with, so the
+        code name is never consulted to decide the layer.
         """
-        if error.code == "unauthorized":
-            return failed(error.code, 401)
-        if error.code in DEPENDENCY_CODES:
-            return failed(error.code, 503)
-        if error.code in TRANSPORT_CODES:
-            return failed(error.code, TRANSPORT_STATUS[error.code])
-        return failed(error.code, DOMAIN_STATUS)
+        if isinstance(error, Refusal):
+            return failed(error.code, DOMAIN_STATUS)
+        return failed(error.code, error.status)
 
     @app.exception_handler(StarletteHTTPException)
     async def framework_handler(request: Request, error: StarletteHTTPException):
@@ -404,7 +516,7 @@ def create_app(config_path, client, port, *, credential=None, read_timeout=None)
         """
         code = {404: "not_found", 405: "method_not_allowed"}.get(error.status_code)
         if code is None:
-            return failed("invalid_input", 400)
+            return failed("invalid_input", error.status_code)
         return failed(code, error.status_code)
 
     @app.exception_handler(sqlite3.Error)
@@ -419,6 +531,6 @@ def create_app(config_path, client, port, *, credential=None, read_timeout=None)
         defect of this module's own — a `TypeError`, an `AttributeError` — is deliberately not
         caught here: reporting the process's own bug as a dependency outage would hide it.
         """
-        return failed("dependency_unavailable", 503)
+        return failed("dependency_unavailable", STATUS_DEPENDENCY)
 
     return app
