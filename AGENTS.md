@@ -20,6 +20,8 @@ TS-033 正式来源入口为 `SourceAuthority` + `SourceTransport`，绑定 sour
 
 本地用户入口：`uv run pytest tests/test_user_actions.py tests/test_trusted_workflow.py -q --basetemp .runtime/tests-ts034-users`。HTTPS 测试前设置 `TIANSHU_TEST_CERT_PYTHON` 指向已有 cryptography 的工具解释器，见 `docs/runtime.md`；完整测试也使用 `.runtime/` 下独立 basetemp。
 
+TS-085 受限 HTTP 入口：`uv run pytest tests/test_knowledge_http.py tests/test_knowledge_http_process.py -q --basetemp .runtime/tests-ts085-http`。前者用进程内 ASGI 客户端覆盖身份/媒体类型/Host-Origin/准入饱和/超时与领域回归，后者真实启动、停止、重启 `uv run python -m tianshu_memory.knowledge_cli --config <私有配置> serve --client <身份> --credential-env <环境变量名> --port <端口>` 子进程并经真实 socket 核对。端口无默认值、只绑 `127.0.0.1`，身份只能来自启动参数。它是内部受限接口候选，不是已发布跨产品合同，也不代表任何网页已联通；见 `docs/project-knowledge-http.md`。
+
 完整本产品：`uv run pytest -q`，包含独立本地 HTTP 子进程启动、停止、重启验证。来源/身份 issuer 使用明确测试替身，不声称跨产品 L0 或真实外部验收。
 
 隔离启动和合同环境变量唯一说明见 README。不要自行发明其他检查层级；完整改动稳定后审查 diff，再从低成本到高成本运行所需检查，成功且输入未变的检查不重复运行。

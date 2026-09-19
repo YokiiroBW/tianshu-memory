@@ -6,6 +6,8 @@ TS-081 在其上追加有版本的项目错题本（触发/症状/原因/修正/
 
 TS-083 追加项目接续包：对一个显式登记的独立工作目录只读核对 Git 仓库/分支/HEAD/脏状态与少量登记文件摘要，把仓库历史、已索引摘要与当前未提交事实分开呈现，并把“最近验证”绑定到实际观测到的提交；`continuation_check` 在切分支、新提交、新未提交改动或索引变化后立即判为失效。见 [项目接续包与工作目录事实核对](docs/project-continuation.md)。
 
+TS-085 追加项目知识与研究笔记的受限 loopback HTTP 入口：固定 10 操作 allowlist、身份只来自启动参数、每请求新建应用实例、请求体 262144 字节与读取+执行 10 秒上限、活动执行最多 4 个且满载立即 503 无等待队列、Host/Origin/无 CORS/无 OpenAPI 边界，除 authority 判定外的拒绝统一为 422 + 领域原码。它是产品内部受限接口候选，不是已发布的跨产品合同，也不代表网页已经联通。见 [项目知识与研究笔记受限 HTTP 入口](docs/project-knowledge-http.md)。
+
 Python 人物与记忆服务，绑定已发布 text-dialogue/v1、profile-memory/v1 与 source-sync/v1 **1.0.0**。提供 SQLite/WAL、完整语义组预算检索、画像查询、修订/遗忘与候选幂等账本。TS-033 增加角色来源账本、物理否定传播、双 owner 读取屏障与真实 HTTPS 来源客户端。
 
 `source_sync` 模式经配置的 Core/Platform HTTPS 接口核验来源；`local_fixture` 保留隔离合成演示。实际测试包含合成 owner 经真实 HTTPS、Memory HTTP 与 SQLite 重启，不代表真实 Core/Platform 产品联合通过。TS-034 提供独立部署凭据认证的本地用户确认、画像批准/发布/撤销入口；未配置时仍不可用。Chat Audit、跨平台账号证明、PostgreSQL 与嵌入检索仍未接入。候选受理不自动生成记忆。
@@ -25,6 +27,7 @@ uv run ruff format --check .
 uv run python -m compileall -q src tests scripts
 uv run pytest tests/test_identity_auth.py tests/test_recall.py tests/test_recall_regressions.py tests/test_revisions_events.py -q
 uv run pytest tests/test_source_transport.py tests/test_source_migration.py tests/test_trusted_workflow.py tests/test_source_sync.py -q
+uv run pytest tests/test_knowledge_http.py tests/test_knowledge_http_process.py -q --basetemp .runtime/tests-ts085-http
 uv run pytest -q
 ```
 

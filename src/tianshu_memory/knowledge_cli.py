@@ -7,7 +7,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .domain import Fault, strict_json
+from .domain import Fault, require, strict_json
 from .knowledge import KnowledgeApplication
 from .knowledge_directories_migration import migrate as migrate_directories
 from .knowledge_migration import migrate
@@ -34,6 +34,13 @@ def main():
         command.add_argument("--credential-env", required=True)
         if name == "action":
             command.add_argument("file")
+    # The restricted HTTP entry: one fixed client, one explicit port, no host option. The
+    # credential stays in the operator's environment, because an argument would be visible in the
+    # process list and a request body is never allowed to name an identity.
+    serve = commands.add_parser("serve")
+    serve.add_argument("--client", required=True)
+    serve.add_argument("--credential-env", required=True)
+    serve.add_argument("--port", type=int, required=True)
     args = parser.parse_args()
     try:
         if args.command in {
@@ -57,6 +64,23 @@ def main():
             from .knowledge_mcp import create_server
 
             create_server(args.config, args.client, args.credential_env).run(transport="stdio")
+            return
+        elif args.command == "serve":
+            from .knowledge_http import Credential, create_app
+
+            credential = Credential(args.credential_env)
+            # A process that cannot present its client's credential would answer every request
+            # with 401 while looking healthy, so it refuses to start instead. The value itself is
+            # never printed and never leaves the operator's environment.
+            require(
+                isinstance(credential(), str) and len(credential()) >= 16,
+                "missing_service_credential",
+                401,
+            )
+            app = create_app(args.config, args.client, args.port, credential=credential)
+            import uvicorn
+
+            uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False)
             return
         else:
             with Path(args.file).open("rb") as stream:
