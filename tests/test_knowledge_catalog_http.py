@@ -500,10 +500,13 @@ def test_cursors_are_bound_to_this_entry_his_operation_and_his_page(catalogue, r
 def test_a_continuation_page_over_http_must_keep_the_premise_it_started_with(catalogue, running):
     """The wire answer for a continuation that contradicts its own cursor carries no block text.
 
-    The three contradictions are refused with the codes the card fixes, and none of them returns a
-    body containing any of the document's text, so a refusal is never a partial page either. The
-    page with the premise the cursor was sealed for is still served, from the position the cursor
-    names, so the refusals are about the contradiction rather than about the page position.
+    The three contradictions are refused with the codes the card fixes — a version or a digest that
+    disagrees with the cursor is `invalid_cursor`, a later page that leaves the digest open is
+    `invalid_input` — and none of them returns a body containing any of the document's text, so a
+    refusal is never a partial page either. The page with the premise the cursor was sealed for is
+    still served, from the position the cursor names, so the refusals are about the contradiction
+    rather than about the page position. A source that really changes under a request which *does*
+    agree with its cursor keeps its own code: that is the document moving, not a rewritten request.
     """
     identifier = document_id(ALPHA, "note-000.md")
     first = operation(
@@ -516,9 +519,9 @@ def test_a_continuation_page_over_http_must_keep_the_premise_it_started_with(cat
     for arguments, code in (
         (
             reading(identifier, cursor=cursor, expected_version=2, expected_hash=digest, limit=2),
-            "stale_evidence",
+            "invalid_cursor",
         ),
-        (reading(identifier, cursor=cursor, expected_hash="0" * 64, limit=2), "stale_evidence"),
+        (reading(identifier, cursor=cursor, expected_hash="0" * 64, limit=2), "invalid_cursor"),
         (reading(identifier, cursor=cursor, expected_hash=None, limit=2), "invalid_input"),
     ):
         refused = operation(running, "document_read", arguments)
@@ -531,6 +534,15 @@ def test_a_continuation_page_over_http_must_keep_the_premise_it_started_with(cat
     assert served.status_code == 200, served.text
     assert served.json()["blocks"]
     assert served.json()["document_id"] == identifier
+    # The same agreeing request, after the source itself was edited: this one is not a contradiction
+    # of the cursor but a document that stopped being current, so it keeps `stale_evidence`.
+    (catalogue.roots[ALPHA] / "note-000.md").write_bytes(b"Edited between the pages.\n")
+    expired = operation(
+        running, "document_read", reading(identifier, cursor=cursor, expected_hash=digest, limit=2)
+    )
+    assert expired.status_code == 422, expired.text
+    assert expired.json() == {"status": "failed", "code": "stale_evidence"}
+    assert not any(text.encode() in expired.content for text in texts)
 
 
 def test_a_source_that_changed_under_the_page_is_refused_with_no_old_text(catalogue, running):

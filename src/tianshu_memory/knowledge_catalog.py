@@ -469,27 +469,59 @@ class Catalog:
             return self.list_documents(shape)
         return self.read_document(shape)
 
-    def _continues(self, bound, document_id, document, version):
-        """Whether this request really continues the page its cursor was sealed for.
+    def _continues(self):
+        """Refuse a continuation page whose request does not repeat the cursor's own premise.
 
-        The cursor proves what the caller was reading; the request says what the caller is asking
-        for now. Both have to name the same document, the same version and the same hash, and the
-        request may not name a version or a hash of its own that disagrees — that is not a page to
-        continue but a different request, refused as an invalid cursor. The request's own premise is
-        checked against the document first, so a caller pointing at a version or a digest the
-        document no longer has still gets `stale_evidence` rather than a cursor verdict.
+        `document_id`, `expected_version` and `expected_hash` all belong to the *request*, and a
+        continuation page repeats them; the cursor sealed the same three values when the walk
+        started. A request that disagrees with the cursor is a request for a different page than
+        the one presented — a stale token reused against rewritten arguments — and the card fixes
+        that answer as `invalid_cursor`, whatever the database now holds. A later page may not leave
+        the hash open either: without it the caller would be continuing a walk it never bound to a
+        digest, which is the one thing the cursor is for.
+
+        This comparison never touches the database and never names a document row, so it can — and
+        does — run before anything is read about the document. Checking the request against the
+        *current* document first would answer `stale_evidence` for a request that simply does not
+        match its own cursor, which is a different fact about a different thing.
         """
+        bound = self.bound
+        if bound is None:
+            return
         require(
-            bound.get("document_id") == document_id
-            and bound.get("version") == document["version"]
+            bound.get("document_id") == self.args["document_id"]
             and bound.get("version") == self.args["expected_version"]
-            and bound.get("hash") == version["hash"],
+            and bound.get("hash") == self.args["expected_hash"],
             "invalid_cursor",
             400,
         )
-        # A first page may leave the hash open; a later one may not. Without it the caller would be
-        # continuing a walk it never bound to a digest, which is the one thing the cursor is for.
         require(self.args["expected_hash"] is not None, "invalid_input", 400)
+
+    def _current(self, document_id):
+        """Refuse a read of a version that is not this document's current, readable one.
+
+        This is everything about the request that only the database can answer, and it is deliberately
+        narrow: the document exists in this project and is readable at all, its stored version has a
+        version row, and — on a first page, where the caller names the version itself — that version
+        is the one the caller named. The caller's *agreement with its own cursor* has already been
+        settled by `_continues` before this runs, and the source's real freshness is settled after it.
+        """
+        document = self._document(document_id)
+        version = None
+        if document is not None:
+            version = self.db.execute(
+                "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
+                (document_id, document["version"]),
+            ).fetchone()
+        structural = (
+            document is not None and version is not None and not unavailable(document, self.project)
+        )
+        if structural and self.bound is None:
+            structural = document["version"] == self.args["expected_version"] and (
+                self.args["expected_hash"] is None or self.args["expected_hash"] == version["hash"]
+            )
+        require(structural, "stale_evidence", 409)
+        return document, version
 
     def _announce_read(self):
         """Record the source this read must have re-read, so the external phase reads it.
@@ -497,29 +529,11 @@ class Catalog:
         This is the catalogue's whole part in the phase between the two transactions. Only the
         current, structurally readable version of the named document is announced, and a document
         no read could ever serve is refused here rather than after a pointless file read. The page
-        position is settled first: a request that contradicts the cursor it presented fails before
-        anything is read, exactly as it would in the serving phase.
+        position is settled first — a request that contradicts the cursor it presented fails before
+        anything at all is looked up, in the same order the serving phase uses.
         """
-        document = self._document(self.args["document_id"])
-        version = None
-        if document is not None:
-            version = self.db.execute(
-                "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
-                (document["id"], document["version"]),
-            ).fetchone()
-        require(
-            document is not None
-            and version is not None
-            and not unavailable(document, self.project)
-            and document["version"] == self.args["expected_version"]
-            and (
-                self.args["expected_hash"] is None or self.args["expected_hash"] == version["hash"]
-            ),
-            "stale_evidence",
-            409,
-        )
-        if self.bound is not None:
-            self._continues(self.bound, self.args["document_id"], document, version)
+        self._continues()
+        document, version = self._current(self.args["document_id"])
         if document["kind"] == "file":
             self.reader.capture(document, version["hash"])
 
@@ -614,45 +628,24 @@ class Catalog:
         """One keyset page of the current version's complete blocks of one document.
 
         A continuation page carries the same premise the first page did — the caller names the
-        version and the hash it is reading. The cursor repeats that premise so a page cannot be
-        continued after the document moved; it does not replace it. A request whose own
-        `expected_version`/`expected_hash` disagree with the cursor is a request that no longer
-        describes the page it is asking for, and it is refused as an invalid cursor rather than
-        answered with text the caller did not ask for.
+        document, the version and the hash it is reading — and the cursor repeats that premise so a
+        page cannot be continued after the document moved. The order of the three questions is the
+        card's order: the request must agree with its own cursor (`invalid_cursor`, or `invalid_input`
+        when a later page leaves the hash open), then the document must be the current readable one
+        (`stale_evidence`), and only then is the source's real freshness read and compared. A request
+        that contradicts its cursor is refused before any document is even looked up, so it can never
+        be answered with a `stale_evidence` verdict about a document it did not describe.
         """
+        self._continues()
         document_id = self.args["document_id"]
         bound = self.bound
-        document = self._document(document_id)
-        # The caller's own version and hash binding, and any document that is not the current one,
-        # are decided before a single block is assembled. A deleted document, a withdrawn URL, a
-        # changed file and a superseded version all land here, so no historical text leaves.
-        version = None
-        if document is not None:
-            version = self.db.execute(
-                "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
-                (document_id, document["version"]),
-            ).fetchone()
-        require(
-            document is not None
-            and version is not None
-            and document["version"] == self.args["expected_version"]
-            and (
-                self.args["expected_hash"] is None or self.args["expected_hash"] == version["hash"]
-            )
-            and not unavailable(document, self.project),
-            "stale_evidence",
-            409,
-        )
-        if bound is not None:
-            self._continues(bound, document_id, document, version)
+        document, version = self._current(document_id)
         # A file-backed version is current only once its bytes have really been read and found to
         # hash to the recorded digest. The external phase re-read the locator this dispatch
         # announced, so this comparison is what turns that read into evidence: a file edited,
         # replaced or removed between the two transactions fails here and never yields text.
-        structural = True
         if document["kind"] == "file":
-            structural = fresh(self.read, document, version["hash"])
-        require(structural, "stale_evidence", 409)
+            require(fresh(self.read, document, version["hash"]), "stale_evidence", 409)
         last_id = (bound or {}).get("last_id")
         require(last_id is None or isinstance(last_id, str), "invalid_cursor", 400)
         # The same one-bound keyset as the directory, and the same named index for the same reason:

@@ -717,11 +717,14 @@ def test_cursor_is_bound_to_operation_client_project_page_and_revision(catalogue
 def test_a_continuation_page_may_not_contradict_the_cursor_it_presents(catalogue):
     """The cursor repeats the premise of the walk; it does not replace the caller's own.
 
-    A caller that asks for a later page of version 1 while naming version 2, a digest that is not
-    the one it is continuing, or no digest at all, is not asking to continue this walk. Every one
-    of those is refused before the blocks are read, and the same request with the premise the cursor
-    was sealed for still pages, so the refusals are about the contradiction and not about the page
-    position being unusable.
+    A caller that asks for a later page of version 1 while naming version 2, or a digest that is not
+    the one it is continuing, is not asking to continue this walk: the request disagrees with the
+    cursor it presented, so it is an invalid cursor rather than a verdict about the document. Both
+    the version and the digest are compared with the cursor's own sealed values before the document
+    is even looked up, so neither can be answered with `stale_evidence` about a page the caller did
+    not describe. A later page that leaves the digest open is refused as invalid input, and the same
+    request with the premise the cursor was sealed for still pages — so the refusals are about the
+    contradiction and not about the page position being unusable.
     """
     units = [{"spans": [[index + 1, index + 1]], "text": f"Block {index}."} for index in range(3)]
     identifier, value = seeded_blocks(
@@ -733,10 +736,10 @@ def test_a_continuation_page_may_not_contradict_the_cursor_it_presents(catalogue
     assert [block["text"] for block in first["blocks"]] == ["Block 0.", "Block 1."]
     # A version the caller names that the cursor did not seal. The document's current version is
     # still 1, so this is the caller contradicting the cursor rather than the document having moved.
-    with pytest.raises(Fault, match="stale_evidence"):
+    with pytest.raises(Fault, match="invalid_cursor"):
         read_page(catalogue, identifier, cursor, expected_version=2, expected_hash=value, limit=2)
     # A digest that is not the one this walk is continuing.
-    with pytest.raises(Fault, match="stale_evidence"):
+    with pytest.raises(Fault, match="invalid_cursor"):
         read_page(catalogue, identifier, cursor, expected_hash="0" * 64, limit=2)
     # The first page may leave the digest open; no later page may.
     with pytest.raises(Fault, match="invalid_input"):
@@ -750,14 +753,15 @@ def test_a_continuation_page_may_not_contradict_the_cursor_it_presents(catalogue
     assert [block["text"] for block in second["blocks"]] == ["Block 2."]
     assert second["next_cursor"] is None and second["omissions"] == []
     # And the contradiction is still refused after a page was served in between.
-    with pytest.raises(Fault, match="stale_evidence"):
+    with pytest.raises(Fault, match="invalid_cursor"):
         read_page(catalogue, identifier, cursor, expected_version=2, expected_hash=value, limit=2)
 
 
 def test_a_contradicted_continuation_costs_no_page_of_the_document(catalogue):
     """A refused continuation is refused whole: no partial page, and no text from any version.
 
-    The refusal happens before the page is assembled from blocks, so the response can never carry
+    The refusal happens before the page is assembled from blocks — and, for a contradiction of the
+    request's own premise, before the document is looked up at all — so the response can never carry
     the head of a page the caller did not ask for. Nothing of the document's text appears in the
     failure either, which is what makes the refusal safe to log.
     """
@@ -769,13 +773,76 @@ def test_a_contradicted_continuation_costs_no_page_of_the_document(catalogue):
     cursor = first["next_cursor"]
     assert cursor is not None
     for arguments, code in (
-        ({"expected_version": 2, "expected_hash": value}, "stale_evidence"),
-        ({"expected_hash": "0" * 64}, "stale_evidence"),
+        ({"expected_version": 2, "expected_hash": value}, "invalid_cursor"),
+        ({"expected_hash": "0" * 64}, "invalid_cursor"),
         ({"expected_hash": None}, "invalid_input"),
     ):
         with pytest.raises(Fault, match=code) as refused:
             read_page(catalogue, identifier, cursor, limit=1, **arguments)
+        assert refused.value.code == code
         assert not any(unit["text"] in str(refused.value) for unit in units)
+
+
+def test_the_read_refusal_order_is_the_card_order(catalogue):
+    """The four ways a continuation page can be refused, in the order the card fixes them.
+
+    Each of these is a different fact and each gets its own code: the request leaves the digest open
+    (`invalid_input`), the request disagrees with the cursor it presented (`invalid_cursor`, whatever
+    the document holds), the project moved between the pages (`cursor_stale`), or the document and its
+    source really did move (`stale_evidence`). The order matters because a rewritten request must not
+    be reported as a document fact, and a document fact must not be reported as a rewritten request.
+    """
+    units = [{"spans": [[index + 1, index + 1]], "text": f"Block {index}."} for index in range(3)]
+    identifier, value = seeded_blocks(
+        catalogue.store, ALPHA, catalogue.roots[ALPHA], "ordered.md", units
+    )
+    first = read_page(catalogue, identifier, limit=2)
+    cursor = first["next_cursor"]
+    assert cursor is not None and first["hash"] == value
+    # One request that disagrees with the cursor in each of its two fields, plus one that leaves the
+    # digest open. All three come before the document is consulted, so each gets its own code.
+    with pytest.raises(Fault, match="invalid_cursor"):
+        read_page(catalogue, identifier, cursor, expected_version=2, expected_hash=value, limit=2)
+    with pytest.raises(Fault, match="invalid_cursor"):
+        read_page(catalogue, identifier, cursor, expected_hash="f" * 64, limit=2)
+    with pytest.raises(Fault, match="invalid_input"):
+        read_page(catalogue, identifier, cursor, expected_hash=None, limit=2)
+    # Nothing here runs before authorization: the very same contradicting request is refused for an
+    # identity whose credential does not verify, so no document is looked up on its behalf.
+    with pytest.raises(Fault, match="unauthorized"):
+        catalogue.run(
+            "document_read",
+            {
+                "document_id": identifier,
+                "expected_version": 2,
+                "expected_hash": value,
+                "limit": 2,
+                "budget_bytes": 32768,
+                "cursor": cursor,
+            },
+            credential="synthetic-wrong-credential-value",
+        )
+    # A project revision that moved between the pages is the cursor's own staleness, not a request
+    # error: the very same request that succeeds below is now refused as `cursor_stale`.
+    assert read_page(catalogue, identifier, cursor, expected_hash=value, limit=2)["blocks"]
+    with catalogue.store.transaction() as db:
+        db.execute("UPDATE knowledge_projects SET revision=revision+1 WHERE id=?", (ALPHA,))
+    with pytest.raises(Fault, match="cursor_stale"):
+        read_page(catalogue, identifier, cursor, expected_hash=value, limit=2)
+    with catalogue.store.transaction() as db:
+        db.execute("UPDATE knowledge_projects SET revision=revision-1 WHERE id=?", (ALPHA,))
+    # The document itself moving is the last of the four, and it stays `stale_evidence` however the
+    # caller names it — as long as the caller still agrees with the cursor it presented.
+    with catalogue.store.transaction() as db:
+        db.execute("UPDATE knowledge_documents SET version=2 WHERE id=?", (identifier,))
+    with pytest.raises(Fault, match="stale_evidence"):
+        read_page(catalogue, identifier, cursor, expected_hash=value, limit=2)
+    # A deleted source and a document whose version row is gone land in the same place.
+    with catalogue.store.transaction() as db:
+        db.execute("UPDATE knowledge_documents SET version=1 WHERE id=?", (identifier,))
+    (catalogue.roots[ALPHA] / "ordered.md").unlink()
+    with pytest.raises(Fault, match="stale_evidence"):
+        read_page(catalogue, identifier, cursor, expected_hash=value, limit=2)
 
 
 def test_read_cursor_binds_the_document_version_and_hash(catalogue):
@@ -786,22 +853,31 @@ def test_read_cursor_binds_the_document_version_and_hash(catalogue):
     first = read_page(catalogue, identifier, limit=2)
     cursor = first["next_cursor"]
     assert cursor is not None
-    # A read cursor belongs to one document.
+    # A read cursor belongs to one document. Every continuation below presents the same limit the
+    # cursor was sealed for, so the refusal is about the field under test and not about the page.
     other = catalogue.alpha[0]
     with pytest.raises(Fault, match="invalid_cursor"):
-        read_page(catalogue, other, cursor, expected_hash=first["hash"])
+        read_page(catalogue, other, cursor, expected_hash=first["hash"], limit=2)
     # The element limit and the byte budget are sealed with the cursor.
     with pytest.raises(Fault, match="invalid_cursor"):
         read_page(catalogue, identifier, cursor, expected_hash=first["hash"], limit=4)
     with pytest.raises(Fault, match="invalid_cursor"):
         read_page(catalogue, identifier, cursor, expected_hash=first["hash"], budget=8192)
-    # The cursor sealed version 1. Once the document has moved to version 2 the position it names
-    # no longer exists in the document the caller is walking, so the walk is refused instead of
-    # being continued into another version's blocks.
+    # The cursor sealed version 1. Once the document has moved to version 2 the position it names no
+    # longer describes the document the caller is walking. Every request below continues the page it
+    # presents — same cursor, same limit, the version and digest the cursor sealed — so the only
+    # thing that changed is the document, and the answer is `stale_evidence` rather than a verdict
+    # about the request.
     with catalogue.store.transaction() as db:
         db.execute("UPDATE knowledge_documents SET version=2 WHERE id=?", (identifier,))
+    with pytest.raises(Fault, match="stale_evidence"):
+        read_page(catalogue, identifier, cursor, expected_hash=first["hash"], limit=2)
+    # Naming the version the document moved to does not make the stale cursor usable either: that
+    # request disagrees with the cursor it presented, which is the cursor's own verdict.
     with pytest.raises(Fault, match="invalid_cursor"):
-        read_page(catalogue, identifier, cursor, expected_hash=first["hash"])
+        read_page(
+            catalogue, identifier, cursor, expected_version=2, expected_hash=first["hash"], limit=2
+        )
 
 
 def test_budget_is_enforced_on_the_whole_serialized_page(catalogue):

@@ -90,6 +90,20 @@
 写错的版本或摘要，也不会因为调用方指向另一版本就继续把旧版本正文发出去。文档本身的当前版本已经改变
 （调用方的前提与库内事实不符）仍是 `stale_evidence`。
 
+**四种拒绝的先后顺序是固定的**（同一次请求只报最先成立的那一种）：
+
+| # | 成立条件 | 码 | 依据 |
+|---|---|---|---|
+| 1 | 非首屏但 `expected_hash` 为 `null` | `invalid_input`（400） | 请求本身不完整 |
+| 2 | 非首屏且 `expected_version`/`expected_hash` 与游标封存值不符 | `invalid_cursor`（400） | 请求与**自己的游标**矛盾；**不查询文档**即可判定 |
+| 3 | 游标已验签、但页间项目 revision 变了 | `cursor_stale`（409） | 目录整体已动 |
+| 4 | 请求与游标一致，但文档当前版本或来源已不是那一份 | `stale_evidence`（409） | 文档/来源真的变了 |
+
+顺序的意义：被改写过参数的请求**不会**被报成"文档变了"，文档真的变了也**不会**被报成"参数写错"。
+第 2 步不触碰 `knowledge_documents`/`knowledge_versions`，所以它不可能泄露某文档是否存在；授权与游标
+验签（含 operation/client/project/revision/limit/预算绑定）都排在第 1 步之前，撤权或伪造身份仍然先得到
+`unauthorized`/`forbidden`。
+
 ### 两者都不返回
 
 `root`、`host`、`locator`、绝对路径、URL 的 query 部分、`provenance`、其他项目的任何标识、凭据摘要、
@@ -144,7 +158,9 @@
 绑定是**双向**的：游标封存的 `document_id`/`version`/`hash` 必须与调用方这一请求自己给的
 `expected_version`/`expected_hash` 一致，否则是 `invalid_cursor`。游标的职责是证明"上一页读的是哪一份"，
 不是替调用方决定"这一页该读哪一份"——用游标覆盖请求前提，就等于调用方指向另一版本时仍把旧版本正文
-发出去。
+发出去。这个比较只用到游标与请求本身，读不到任何文档行，因此它发生在**查询文档之前**：一个与自己的
+游标矛盾的请求得到的是 `invalid_cursor`（"你改写了参数"），而不是 `stale_evidence`（"文档变了"）。
+只有请求与游标一致、而库里的当前版本或来源真的不是那一份时，才落到 `stale_evidence`。
 
 已验签但**页间项目 revision 变了** → `cursor_stale`（领域 409）：目录已经动了，调用方要从第一页重新
 开始，而不是被交给一次过期遍历的剩余部分。同一次请求的三阶段之间变了 → 既有的 `project_conflict`。
@@ -275,11 +291,8 @@ uv run pytest tests/test_knowledge_catalog_migration.py -q --basetemp .runtime/t
 
 ## 11. 与本轮任务卡的差异（如实列出）
 
-1. **游标同时绑定 `budget_bytes`**：卡只点名 `limit`；实现把预算一并封入游标，改预算续页即
-   `invalid_cursor`，因为一页按一个预算装配，不该被换个预算重放后还声称遵守了它。响应**不**包含 `limit`
-   字段——`limit` 只属于请求与游标绑定（首轮实现曾多返回 `limit`，已按验收意见移除）。
-2. **两条 SQL 点名索引（`INDEXED BY`）**：卡要求计划前缀 `SEARCH`、无临时排序；实测放任 planner 在键集
+1. **两条 SQL 点名索引（`INDEXED BY`）**：卡要求计划前缀 `SEARCH`、无临时排序；实测放任 planner 在键集
    靠近表头时可能改走 `id` 主键再过滤 `project_id`，故语句点名索引，并由同一次请求内的形状自检兜底
    （缺失/错形状 → `dependency_unavailable`）。
-3. **跨项目 `document_read` 是 `stale_evidence`**：与本项目域既有证据规则一致，且拒绝体不报告该文档是否
+2. **跨项目 `document_read` 是 `stale_evidence`**：与本项目域既有证据规则一致，且拒绝体不报告该文档是否
    存在于别处。
