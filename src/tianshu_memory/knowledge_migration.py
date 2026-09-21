@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from .knowledge_catalog_migration import install as install_catalog
 from .knowledge_directories_migration import install as install_directories
 from .lessons_migration import install as install_lessons
 from .research_notes_migration import install as install_research_notes
@@ -67,15 +68,19 @@ def migrate(store, backup_path):
         db.execute("INSERT INTO metadata VALUES ('knowledge_seal_key',?)", (secrets.token_hex(32),))
         db.execute("UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'")
         # The same reviewed step installs the lesson book, the promoted experience book, the
-        # registered-directory plan book and the research-note book.
+        # registered-directory plan book, the research-note book and the two catalog indexes. A
+        # fresh database therefore gets byte-identical catalog indexes to an upgraded one, and no
+        # request path ever runs DDL.
         install_lessons(db)
         install_directories(db)
         install_research_notes(db)
+        install_catalog(db)
     return {
         "schema": 3,
         "knowledge_schema": 1,
         "lessons_schema": 1,
         "knowledge_directories_schema": 1,
         "research_notes_schema": 1,
+        "knowledge_catalog_schema": 1,
         "backup": str(backup),
     }

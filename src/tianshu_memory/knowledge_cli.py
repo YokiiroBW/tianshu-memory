@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .domain import Fault, strict_json
 from .knowledge import KnowledgeApplication
+from .knowledge_catalog_migration import migrate as migrate_catalog
 from .knowledge_directories_migration import migrate as migrate_directories
 from .knowledge_migration import migrate
 from .lessons_migration import migrate as migrate_lessons
@@ -28,6 +29,10 @@ def main():
     plans.add_argument("--backup", required=True)
     notes = commands.add_parser("migrate-research-notes")
     notes.add_argument("--backup", required=True)
+    # The document catalogue needs its own explicit upgrade: two indexes and a version row, on a
+    # database that is stopped first and backed up whole. No request path ever runs this.
+    catalog = commands.add_parser("migrate-catalog")
+    catalog.add_argument("--backup", required=True)
     for name in ("action", "mcp"):
         command = commands.add_parser(name)
         command.add_argument("--client", required=True)
@@ -48,6 +53,7 @@ def main():
             "migrate-lessons",
             "migrate-directories",
             "migrate-research-notes",
+            "migrate-catalog",
         }:
             config = strict_json(Path(args.config).read_bytes())
             store = Store(
@@ -59,6 +65,7 @@ def main():
                 "migrate-lessons": migrate_lessons,
                 "migrate-directories": migrate_directories,
                 "migrate-research-notes": migrate_research_notes,
+                "migrate-catalog": migrate_catalog,
             }[args.command](store, args.backup)
         elif args.command == "mcp":
             from .knowledge_mcp import create_server

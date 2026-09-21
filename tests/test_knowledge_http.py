@@ -39,6 +39,7 @@ from test_research_notes import (
     imported,
     note,
     unit,
+    write_config,
 )
 from test_research_notes import (
     notes as notes,
@@ -47,6 +48,7 @@ from test_research_notes import (
 from tianshu_memory.domain import Fault, canonical
 from tianshu_memory.knowledge_http import (
     ACTION_PATH,
+    ALLOWED_OPERATIONS,
     MAX_ACTIVE_EXECUTES,
     MAX_BODY_BYTES,
     Refusal,
@@ -466,6 +468,57 @@ def test_operations_outside_the_allowlist_are_refused_even_with_permission(notes
             response = operator.operation(forbidden, {"key": "k"}, token=CREDENTIALS["operator"])
             assert response.status_code == 415, forbidden
             assert response.json() == {"status": "failed", "code": "unsupported"}
+
+
+def test_the_allowlist_carries_exactly_the_twelve_frozen_operations(notes, entry):
+    """The two catalogue operations arrived by this one change, and nothing else moved with them."""
+    assert ALLOWED_OPERATIONS == {
+        "check",
+        "query",
+        "recover",
+        "note_record",
+        "note_query",
+        "note_revise",
+        "note_withdraw",
+        "note_recover",
+        "note_status",
+        "note_check",
+        "document_list",
+        "document_read",
+    }
+    assert len(ALLOWED_OPERATIONS) == 12
+    # A catalogue read through the entry is served on a project that was imported through the same
+    # entry, so the whole route is exercised rather than a read of a fixture row.
+    notes.config["knowledge"]["clients"]["alpha-writer"]["permissions"] = [
+        *notes.config["knowledge"]["clients"]["alpha-writer"]["permissions"],
+        "document_list",
+        "document_read",
+    ]
+    write_config(notes)
+    imported(notes)
+    # The page arguments are exact: the cursor is required and explicit, so a page-1 call names it
+    # as `null` rather than leaving it out.
+    listed = entry.operation("document_list", {"limit": 8, "budget_bytes": 8192, "cursor": None})
+    assert listed.status_code == 200, listed.text
+    carried = listed.json()
+    assert carried["project_id"] == "alpha"
+    assert len(carried["items"]) == 1
+    document = entry.operation(
+        "document_read",
+        {
+            "document_id": carried["items"][0]["document_id"],
+            "expected_version": carried["items"][0]["version"],
+            "expected_hash": None,
+            "limit": 8,
+            "budget_bytes": 8192,
+            "cursor": None,
+        },
+    )
+    assert document.status_code == 200, document.text
+    assert document.json()["blocks"], "a document read through the entry carries its blocks"
+    # The block it hands out carries the same reference the existing query operation returns, so
+    # the entry has not grown a second reading of the same evidence.
+    assert document.json()["blocks"][0]["reference"] == unit(notes)
 
 
 def test_cross_project_reads_and_writes_are_refused(entry, notes):

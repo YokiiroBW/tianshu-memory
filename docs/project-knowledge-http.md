@@ -5,8 +5,11 @@
 任何网页已经联通：平台侧的同源连接器、用户身份映射、页面位置与浏览器验收必须在 TS-090 释放
 所有权后另行双方冻结。此轮不写网页、不加前端引擎，也不改平台代码。
 
-覆盖范围 = 现有 `KnowledgeApplication.execute` 的十个操作，语义与之**逐字相同**；本入口只负责
-传输与有界准入，不复制授权、版本、幂等或引用校验规则。
+覆盖范围 = 现有 `KnowledgeApplication.execute` 的十二个操作，语义与之**逐字相同**；本入口只负责
+传输与有界准入，不复制授权、版本、幂等或引用校验规则。其中 `document_list` / `document_read` 是
+TS-086 新增的项目资料目录与完整语义块分页阅读，接口、权限、预算、游标与迁移边界见
+`docs/project-knowledge-catalog.md`：它们同样是 `execute` 的操作，同样只读，并同样要求该身份在
+`knowledge.clients` 里持有**同名显式 permission**（`query` 权限不隐含枚举或直接读取）。
 
 ## 启动
 
@@ -72,12 +75,18 @@ Host: 127.0.0.1:<本进程端口>    (或 localhost:<本进程端口>)
 {"operation": "note_query", "project_id": "alpha", "arguments": {"text": "receipt", "budget_bytes": 8192}}
 ```
 
-严格十操作 allowlist；其余操作即使该身份持有权限也不能经此入口调用（返回 415 `unsupported`）：
+严格十二操作 allowlist；其余操作即使该身份持有权限也不能经此入口调用（返回 415 `unsupported`）：
 
 | 家族 | 操作 |
 |---|---|
-| 项目知识只读 | `query`、`recover`、`check` |
+| 项目知识只读 | `query`、`recover`、`check`、`document_list`、`document_read` |
 | 研究笔记 | `note_record`、`note_revise`、`note_withdraw`、`note_query`、`note_recover`、`note_status`、`note_check` |
+
+`document_list` / `document_read` 是只读分页操作，**不**改变本入口的任何传输规则：同样的准入、
+同样的每请求 Bearer、同样的媒体类型与字节上限。它们的参数是封闭集合（分页三参数
+`limit`/`budget_bytes`/`cursor` 必须齐全，`cursor` 首屏写 `null`），预算按整个响应序列化后的 UTF-8
+字节判定，超出即 `budget_too_small` 或截断加 `next_cursor`——详见
+`docs/project-knowledge-catalog.md`。
 
 经此入口**不可用**：`import`、`delete`、`write_state`、`status`、`directory_scan`、`directory_apply`、
 `continuation_recover`、`continuation_check`、lesson/experience 系列。没有 HTTP 导入、目录扫描、
@@ -115,6 +124,17 @@ curl.exe -s -X POST http://127.0.0.1:18135/local/v1/project-knowledge/action `
 {"operation":"note_check","project_id":"alpha","arguments":{"package":{...上一步返回的包...}}}
 {"operation":"note_withdraw","project_id":"alpha","arguments":{"key":"n1-withdraw","note_id":"note:...","expected_version":2,"reason":"superseded"}}
 ```
+
+资料目录→完整阅读一次链（同一固定身份）：
+
+```json
+{"operation":"document_list","project_id":"alpha","arguments":{"limit":8,"budget_bytes":32768,"cursor":null}}
+{"operation":"document_read","project_id":"alpha","arguments":{"document_id":"document:...","expected_version":1,"expected_hash":null,"limit":8,"budget_bytes":32768,"cursor":null}}
+{"operation":"document_list","project_id":"alpha","arguments":{"limit":8,"budget_bytes":32768,"cursor":"<上一步返回的 next_cursor>"}}
+```
+
+游标**只能**由同一身份、同一项目、同一操作、同样的 `limit`/`budget_bytes` 继续使用；改任何一个都是
+`invalid_cursor`，页间项目 revision 变化则是 `cursor_stale`（都要从第一页重新开始）。
 
 `key` 是笔记的**稳定身份**，`dedupe` 是**该次调用的幂等键**：一次修订/撤回必须带自己的 `dedupe`，
 否则会与创建它的那次写入同键冲突。这与 CLI/MCP 的行为完全相同。
@@ -222,6 +242,7 @@ curl.exe -s -X POST http://127.0.0.1:18135/local/v1/project-knowledge/action `
 
 ```powershell
 uv run pytest tests/test_knowledge_http.py tests/test_knowledge_http_process.py -q --basetemp .runtime/tests-ts085-http
+uv run pytest tests/test_knowledge_catalog_http.py -q --basetemp .runtime/tests-ts086-catalog-http
 ```
 
 `test_knowledge_http_process.py` 会真实启动/停止/重启 `serve` 子进程，经真实 socket 完成
@@ -235,11 +256,24 @@ uv run pytest tests/test_knowledge_http.py tests/test_knowledge_http_process.py 
 
 `test_knowledge_http.py` 用手写 ASGI 客户端（自己决定正文何时到达、并统计应用向服务器索取正文的
 次数）验证准入先于读体：满载时第 5 条请求 `receive` 次数为 0、`execute` 调用次数不变。另有四个慢体与
-四个慢执行两种饱和、读体超时、断连、调用抛错、以及调用真正返回时释放槽的确定性用例。
+四个慢执行两种饱和、读体超时、断连、调用抛错、以及调用真正返回时释放槽的确定性用例。其中一个用例
+按**精确集合**断言这份 allowlist 就是十二项，并让 `document_list` / `document_read` 经同一入口读到
+一次真实导入留下的块。
+
+`test_knowledge_catalog_http.py` 覆盖两个目录操作的入口层：真实 `response.content` 字节数与
+`budget_bytes` 的比较、真实状态码与媒体类型、跨项目与伪造身份、游标绑定（跨操作、改 `limit`、改一个
+字节）、页间 revision 变化后的 `cursor_stale`、来源被改写后不再返回旧正文、未升级库上的
+`dependency_unavailable` 与同一库里旧操作仍可用。它的最后一个用例**真实启动** `serve` 子进程并经真实
+socket 走"列表 → 阅读列表指名的文档 → 下一页"，然后把同样三个请求经进程内入口在同一数据库上再打一遍
+并逐字比对——**只有这一个用例声称真实 socket**。
 
 边界与线上行为已经用真实进程核对过的几条，写在这里以免误读：
 
 - 未迁移/无笔记的项目：`note_query` 等读操作按领域原码返回 422 `project_uninitialized`，**不是** 500，
   也不是"空结果"。入口不猜测项目状态。
+- 未迁移目录索引（`knowledge_catalog_schema` 缺失或索引形状不对）的库：`document_list` /
+  `document_read` 返回 **503** `dependency_unavailable`，而同一个库上的 `query` 等旧操作照常可用。
 - 请求体字段多一个（例如试图自带 `client`）在**到达领域之前**就被拒：**400** `invalid_input`。身份只能
   由进程启动参数决定；同一个码若来自领域拒绝则是 422，层不同、状态不同。
+- 一个项目之外的 `document_id` 在 `document_read` 上是 **422** `stale_evidence`（"这份资料不是本项目
+  证据"），不是 `forbidden`：拒绝本身不报告该文档是否存在于别处。

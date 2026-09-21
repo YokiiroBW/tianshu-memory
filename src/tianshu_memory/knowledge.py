@@ -37,6 +37,11 @@ READ = {
     "note_recover",
     "note_status",
     "note_check",
+    # The catalogue and the per-document reader are two operations of their own, each with its own
+    # permission name. `query` never implies either: a client that may search by keyword is not
+    # thereby allowed to enumerate a project's documents or to walk one document's blocks.
+    "document_list",
+    "document_read",
 }
 WRITE = {"import", "delete", "write_state", "directory_apply"}
 # Continuation reads a registered working directory instead of a registered scan directory.
@@ -70,6 +75,11 @@ NOTE_OPERATIONS = {
     "note_check",
 }
 NOTE_WRITE = {"note_record", "note_revise", "note_withdraw"}
+# The paginated document catalogue and the complete-block reader: two read operations that page
+# the project's own imported documents. They are their own family because they own their own
+# module, their own schema gate and their own cursor rules, and because neither of them is a
+# keyword search.
+CATALOG_OPERATIONS = {"document_list", "document_read"}
 EVIDENCE_OPERATIONS = {
     "lesson_record": "write",
     "lesson_revise": "write",
@@ -195,6 +205,37 @@ class Evidence:
         }
 
 
+class CatalogEvidence:
+    """The one read the catalogue may make of this module's evidence capability.
+
+    The catalogue pages blocks, and the project domain owns what a block reference proves. That
+    capability is handed over as a port with a single method — `reference` — rather than by
+    passing the whole mutable `KnowledgeApplication`, so the catalogue module can never reach
+    the authorization context, the configuration, the store or any other private method of the
+    module that owns these tables. The rule itself stays here: this adapter calls exactly the
+    same `_reference` that `query`, `recover` and the lesson evidence already use.
+    """
+
+    __slots__ = ("_application", "_db", "_project_id", "_project", "_read")
+
+    def __init__(self, application, db, project_id, project, read):
+        self._application = application
+        self._db = db
+        self._project_id = project_id
+        self._project = project
+        self._read = read
+
+    def reference(self, reference):
+        """The resolved evidence for one block reference, or the domain's own refusal."""
+        exact(reference, "block_id document_id version hash")
+        string(reference["block_id"], 128)
+        integer(reference["version"], 0)
+        string(reference["hash"], 128)
+        return self._application._reference(
+            self._db, self._project_id, self._project, reference, self._read
+        )
+
+
 class FileReader:
     """Phase-aware file validation for the project-knowledge operations.
 
@@ -228,6 +269,24 @@ class FileReader:
 
     def serve(self, document, expected):
         return self.cache.get(document["locator"]) == expected
+
+
+class CatalogReader(FileReader):
+    """The file evidence one catalogue read needs, shared by every phase of one dispatch.
+
+    The catalogue is its own operation family, so it gets its own reader rather than recording a
+    locator on the project reader the other families use, and one reader answers every phase of one
+    dispatch: the capture phase records the single locator the page depends on, the external phase
+    re-reads it outside the transaction, and the serving phase compares what was really on disk
+    with the recorded version hash. A file that is missing, unreadable or changing while it is read
+    answers `None` instead of raising, so a catalogue page reports one stable code for every way its
+    source stopped being current rather than forwarding an error the caller would have to read.
+    """
+
+    def external(self):
+        """Read every recorded locator, outside any transaction."""
+        for locator in self.expected:
+            self.read_locator(locator)
 
 
 class Sources:
@@ -264,11 +323,19 @@ class Sources:
             from .lessons import LessonReader
 
             return LessonReader(project)
+        if self.application.catalog_domain:
+            # The catalogue's pages hold a file expectation across the external phase, so it gets
+            # a reader of its own rather than one whose locators the other families also record.
+            return CatalogReader(project)
         return FileReader(project)
 
     def bind(self, project_id, phase):
         """The reader callable for one phase of one project."""
         return getattr(self.reader(project_id), phase)
+
+    def external(self, project_id):
+        """Read everything one project's reader recorded, outside any transaction."""
+        self.reader(project_id).external()
 
     def context(self, db, project_id, phase):
         """The lesson evidence context for one phase of one project."""
@@ -337,6 +404,30 @@ class Plan:
 
     def __call__(self, db, phase, seal_key=None, *, prepared=None, client=None):
         try:
+            if self.application.catalog_domain:
+                from .knowledge_catalog import dispatch as catalog_dispatch
+
+                # The catalogue owns the page's field projection and every rule of paging; this
+                # module hands it the authorized project, the per-dispatch seal key, the phase's
+                # source reader and the narrow evidence port. It receives no application.
+                return catalog_dispatch(
+                    db,
+                    self.operation,
+                    self.project_id,
+                    self.project,
+                    self.args,
+                    seal_key,
+                    client,
+                    self.sources.bind(self.project_id, phase),
+                    CatalogEvidence(
+                        self.application,
+                        db,
+                        self.project_id,
+                        self.project,
+                        self.sources.bind(self.project_id, phase),
+                    ),
+                    phase,
+                )
             if self.application.note_domain:
                 from .research_notes import NoteActor
                 from .research_notes import dispatch as notes_dispatch
@@ -395,11 +486,17 @@ class Plan:
         """Read every referenced evidence file outside the transaction.
 
         An import has already fetched its source in `_prepare_import`, so its reader has no
-        captured expectations and this is a no-op.
+        captured expectations and this is a no-op. The catalogue records its one expectation on
+        that same reader, so the read happens here — outside the lock — for it exactly as for the
+        other families' captures.
         """
         for reader in self.sources.readers.values():
             for locator in set(self.pending) | set(getattr(reader, "expected", {})):
                 reader.read_locator(locator)
+        # The catalogue records its one expectation on its own reader, which knows how to turn a
+        # missing or changing file into a comparison result rather than an operation error.
+        if self.application.catalog_domain:
+            self.sources.external(self.project_id)
 
 
 class KnowledgeApplication:
@@ -413,6 +510,7 @@ class KnowledgeApplication:
         # One dispatch belongs to exactly one domain module; the planner sets both flags before
         # any phase runs, and the plan reads them rather than re-deciding from the operation.
         self.note_domain = False
+        self.catalog_domain = False
 
     def string(self, value, maximum):
         string(value, maximum)
@@ -636,8 +734,14 @@ class KnowledgeApplication:
         Each domain module owns one operation family and one schema gate; this method only
         chooses which of them a request is routed to. No rule of any family is restated here.
         """
-        from . import lessons, research_notes
+        from . import knowledge_catalog, lessons, research_notes
 
+        if operation in CATALOG_OPERATIONS:
+            self.catalog_domain = True
+            self.note_domain = False
+            self.lesson_domain = False
+            return knowledge_catalog.snapshot, Plan.build, lambda args: ()
+        self.catalog_domain = False
         if operation in NOTE_OPERATIONS:
             self.lesson_domain = False
             self.note_domain = True
@@ -658,6 +762,21 @@ class KnowledgeApplication:
         return self._snapshot, Plan.build, lambda args: ()
 
     @staticmethod
+    def _seal_key(metadata, client, secret):
+        """The per-dispatch cursor/seal key: the database's seal secret bound to this client.
+
+        One derivation serves every family, so a package, a note citation and a catalogue cursor
+        are all sealed under a key that no other client and no other credential can reproduce.
+        The secret itself is generated once at migration and never leaves the transaction that
+        reads it.
+        """
+        return hmac.new(
+            metadata["knowledge_seal_key"].encode(),
+            canonical([client, secret]).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+    @staticmethod
     def _snapshot(db, project_id, project, client, secret, operation):
         metadata = dict(db.execute("SELECT key,value FROM metadata"))
         require(
@@ -665,11 +784,7 @@ class KnowledgeApplication:
             "dependency_unavailable",
             503,
         )
-        seal_key = hmac.new(
-            metadata["knowledge_seal_key"].encode(),
-            canonical([client, secret]).encode(),
-            hashlib.sha256,
-        ).hexdigest()
+        seal_key = KnowledgeApplication._seal_key(metadata, client, secret)
         registered = db.execute(
             "SELECT * FROM knowledge_projects WHERE id=?", (project_id,)
         ).fetchone()

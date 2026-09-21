@@ -22,6 +22,8 @@ TS-033 正式来源入口为 `SourceAuthority` + `SourceTransport`，绑定 sour
 
 TS-085 受限 HTTP 入口：`uv run pytest tests/test_knowledge_http.py tests/test_knowledge_http_process.py -q --basetemp .runtime/tests-ts085-http`。前者用进程内 ASGI 客户端（含手写 ASGI 驱动，可统计应用索取正文的次数）覆盖身份/媒体类型/Host-Origin/准入先于读体/四慢体与四慢执行饱和/读体与执行两段超时/断连/调用抛错/领域回归，后者真实启动、停止、重启 `uv run python -m tianshu_memory.knowledge_cli --config <私有配置> serve --client <身份> --port <端口>` 子进程并经真实 socket 核对（子进程环境不含任何知识凭据）。端口无默认值、只绑 `127.0.0.1`，身份只能来自启动参数，凭据只来自每请求 `Authorization: Bearer`。它是内部受限接口候选，不是已发布跨产品合同，也不代表任何网页已联通；见 `docs/project-knowledge-http.md`。
 
+TS-086 项目资料目录与分页阅读：`uv run pytest tests/test_knowledge_catalog.py tests/test_knowledge_catalog_http.py -q --basetemp .runtime/tests-ts086-catalog` 与 `uv run pytest tests/test_knowledge_catalog_migration.py -q --basetemp .runtime/tests-ts086-migration`。新增只读 `document_list`/`document_read`（各需同名显式 permission，`query` 不隐含），并把受限 HTTP allowlist 由十项增至十二项；迁移是停写后的显式步骤 `uv run python -m tianshu_memory.knowledge_cli --config <私有配置> migrate-catalog --backup <新文件>`，独占备份 + 既有 `Store.transaction()` + schema 3 source-guard 检查点，`store.py`/`source_recovery.py` 零改动，旧备份不可直接盖回；见 `docs/project-knowledge-catalog.md`。
+
 完整本产品：`uv run pytest -q`，包含独立本地 HTTP 子进程启动、停止、重启验证。来源/身份 issuer 使用明确测试替身，不声称跨产品 L0 或真实外部验收。
 
 隔离启动和合同环境变量唯一说明见 README。不要自行发明其他检查层级；完整改动稳定后审查 diff，再从低成本到高成本运行所需检查，成功且输入未变的检查不重复运行。

@@ -12,9 +12,10 @@ A thin transport for one already-integrated application. It adds no rule of its 
 - no database, source context, project adapter or other product client is held here, and the
   domain never imports this module.
 
-The route surface is fixed: one health route and one action route, with a ten-operation
+The route surface is fixed: one health route and one action route, with a twelve-operation
 allowlist. Everything else — authorization, idempotency, version conflicts, byte budgets,
-evidence freshness and the transaction boundary — is decided inside the domain that owns it.
+pagination cursors, evidence freshness and the transaction boundary — is decided inside the
+domain that owns it.
 
 The boundaries enforced here are transport concerns only:
 
@@ -74,6 +75,12 @@ ALLOWED_OPERATIONS = frozenset(
         "query",
         "recover",
         "check",
+        # The paginated directory and the complete-block reader are two more reads of the same
+        # already-integrated application. They change nothing the transport decides: admission,
+        # identity, media type and both deadlines are the same rules, and each of them is still
+        # authorized per request by `knowledge.clients`.
+        "document_list",
+        "document_read",
         "note_record",
         "note_revise",
         "note_withdraw",
