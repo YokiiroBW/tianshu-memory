@@ -13,12 +13,14 @@ import re
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from starlette.concurrency import run_in_threadpool
 
 from tianshu_memory.diagnostics import (
     CHAT_SERVICE,
@@ -517,7 +519,7 @@ def test_the_log_sink_failed_event_goes_to_the_fixed_warning_not_the_file(tmp_pa
 
 
 def test_the_whole_request_lifecycle_is_recorded_once_each(tmp_path):
-    from tianshu_memory.diagnostics import note_authenticated, record_execution
+    from tianshu_memory.diagnostics import anote_authenticated, record_execution
 
     app = FastAPI()
     adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
@@ -526,7 +528,7 @@ def test_the_whole_request_lifecycle_is_recorded_once_each(tmp_path):
 
     @app.post("/local/v1/memory/read")
     async def read():
-        note_authenticated()
+        assert await anote_authenticated() is True
         with record_execution("read"):
             pass
         return JSONResponse({"status": "succeeded"}, headers=dict(NO_STORE))
@@ -708,10 +710,14 @@ def test_the_product_verdict_is_carried_into_the_final_record(tmp_path):
 
 
 def test_the_seams_are_no_ops_without_an_installed_adapter(tmp_path):
-    """A bare `create_app` in a test is untouched by the arrival of diagnostics."""
+    """A bare `create_app` in a test is untouched by the arrival of diagnostics.
+
+    With nothing installed there is no log to confirm and therefore nothing to refuse: the seams
+    report success and write nothing, which is exactly how these entry points behaved before.
+    """
     from tianshu_memory.diagnostics import note_authenticated, note_fault, record_execution
 
-    assert note_authenticated() is None
+    assert note_authenticated() is True
     assert note_fault("not_found") is None
     with record_execution("read"):
         pass
@@ -1131,3 +1137,376 @@ def test_a_pre_latched_sink_refuses_without_writing_and_recovers_by_nothing_impl
     assert effects == []
     assert adapter.available() is False
     assert adapter.log_state() == "log_unavailable"
+
+
+def test_a_slow_authentication_record_never_blocks_the_event_loop(tmp_path):
+    """The second review's finding: fixing the acceptance record left the *auth* record waiting.
+
+    `request.started` was already handed over asynchronously, but the authentication verdict was
+    still written with the blocking form from inside an asynchronous endpoint: a 250 ms disk there
+    stalled a 10 ms heartbeat to 257 ms. The seam is now the loop's own form, so the same 250 ms is
+    spent on a bounded worker while the loop keeps answering — including the real liveness probe,
+    which is the route that exists to answer while everything else is busy.
+
+    Only the authentication record is slow here. Every other record of the request really lands, so
+    this cannot pass by the request failing early.
+    """
+    from tianshu_memory.runtime_probes import ProbeConfig
+    from tianshu_memory.server_runtime import Assembly, install_probe_routes
+
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    effects = []
+    app = FastAPI()
+
+    @app.post("/work")
+    async def work():
+        from tianshu_memory.diagnostics import anote_authenticated
+
+        assert await anote_authenticated() is True
+        effects.append("committed")
+        return JSONResponse({"status": "ok"})
+
+    adapter.install(app)
+    bound(app)
+
+    def settings(runtime):
+        return ProbeConfig(
+            service=CHAT_SERVICE,
+            diagnostics=runtime.diagnostics,
+            config_path=Path("absent.json"),
+            contract_path=None,
+            runtime=runtime,
+        )
+
+    install_probe_routes(app, Assembly(app, adapter, None, probe_factory=settings))
+
+    real = Sink.write
+
+    def slow_authentication(self, line, sequence):
+        if json.loads(line)["event"] == "request.authenticated":
+            time.sleep(0.25)
+        return real(self, line, sequence)
+
+    async def drive():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8080"
+        ) as client:
+            gaps = []
+            clock = [time.monotonic()]
+
+            async def heartbeat():
+                for _ in range(30):
+                    await asyncio.sleep(0.01)
+                    now = time.monotonic()
+                    gaps.append(now - clock[0])
+                    clock[0] = now
+                return max(gaps)
+
+            async def liveness():
+                started = time.monotonic()
+                response = await client.get("/health/live")
+                return response, time.monotonic() - started
+
+            worst, (live, live_elapsed), response = await asyncio.gather(
+                heartbeat(), liveness(), client.post("/work")
+            )
+            return worst, live, live_elapsed, response
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(Sink, "write", slow_authentication))
+        worst, live, live_elapsed, response = asyncio.run(drive())
+        stack.close()
+        adapter.shutdown()
+    assert response.status_code == 200, response.text
+    assert effects == ["committed"]
+    assert live.status_code == 200 and live.json() == {"status": "alive"}
+    assert worst < 0.2, f"a 10 ms heartbeat waited {worst:.3f}s for a 0.25s auth record"
+    assert live_elapsed < 0.2, f"liveness waited {live_elapsed:.3f}s for a 0.25s auth record"
+    events = [line["event"] for line in segment_lines(adapter)]
+    assert events == ["request.started", "request.authenticated", "request.completed"]
+
+
+def test_an_authentication_record_that_cannot_be_confirmed_refuses_before_the_business(tmp_path):
+    """The verdict was reached, so acting on it needs a record of it: no record, no side effect."""
+    from tianshu_memory.diagnostics import anote_authenticated
+
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    effects = []
+    app = FastAPI()
+
+    @app.post("/work")
+    async def work():
+        assert await anote_authenticated() is False
+        raise Fault("log_unavailable", 503)
+
+    adapter.install(app)
+    bound(app)
+    fault_boundary(app)
+    # The acceptance record is the first write and really lands; the authentication record is the
+    # second and is the one that fails.
+    with injected_writes(fail_from=2) as state:
+        with TestClient(app) as client:
+            response = client.post("/work")
+        assert response.status_code == 503, response.text
+        assert response.json()["code"] == "log_unavailable"
+        assert effects == []
+        assert state["attempts"] == 2
+        assert adapter.sink.failure == "log_unavailable"
+        adapter.shutdown()
+
+
+def test_both_authentication_forms_write_the_same_record(tmp_path):
+    """One verdict, one record, two callers: the thread form and the loop form cannot diverge."""
+    from tianshu_memory.diagnostics import anote_authenticated, note_authenticated
+
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    app = FastAPI()
+
+    @app.post("/loop")
+    async def loop_form():
+        assert await anote_authenticated() is True
+        return JSONResponse({"status": "ok"})
+
+    @app.post("/thread")
+    async def thread_form():
+        assert await run_in_threadpool(note_authenticated) is True
+        return JSONResponse({"status": "ok"})
+
+    adapter.install(app)
+    bound(app)
+    with injected_writes() as state:
+        with TestClient(app) as client:
+            assert client.post("/loop").status_code == 200
+            assert client.post("/thread").status_code == 200
+        adapter.shutdown()
+    # Two requests, three records each: the acceptance record, the authentication verdict and the
+    # closing record. The two forms are indistinguishable in the file, which is the point — the
+    # difference between them is where the wait happens, not what is written.
+    assert state["attempts"] == 6
+    events = [line["event"] for line in segment_lines(adapter)]
+    assert events == [
+        "request.started",
+        "request.authenticated",
+        "request.completed",
+        "request.started",
+        "request.authenticated",
+        "request.completed",
+    ]
+    assert {line["outcome"] for line in segment_lines(adapter)} == {"started", "succeeded"}
+
+
+def test_the_async_admission_is_bounded_and_never_moved_to_an_unbounded_pool(tmp_path):
+    """Handing a wait to a worker is not a bound: the pool's own queue would grow instead.
+
+    `asyncio.to_thread` (and any bare `run_in_executor`) parks work on the default executor, whose
+    queue has no ceiling. The writer's `WRITE_QUEUE_LIMIT` would then describe a queue that is not
+    the one the work is actually waiting in. The loop's admission is bounded by the same number, so
+    a burst that outruns the disk is refused and latched rather than accumulated.
+    """
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    admitted = []
+    lock = threading.Lock()
+    peak = [0]
+
+    class Tracked(asyncio.Semaphore):
+        """The adapter's own admission, watched: how many waits got past the gate at once."""
+
+        def __init__(self, value):
+            super().__init__(value)
+            self.holding = 0
+
+        async def acquire(self):
+            await super().acquire()
+            with lock:
+                self.holding += 1
+                peak[0] = max(peak[0], self.holding)
+            return True
+
+        def release(self):
+            with lock:
+                self.holding -= 1
+            super().release()
+
+    async def burst():
+        async def one(index):
+            landed = await adapter.aemit("request.started", level="INFO", outcome="started")
+            with lock:
+                admitted.append(landed)
+
+        await asyncio.gather(*(one(index) for index in range(WRITE_QUEUE_LIMIT * 3)))
+
+    adapter.writes_in_flight = Tracked(WRITE_QUEUE_LIMIT)
+    with injected_writes(delay=0.05):
+        asyncio.run(burst())
+        assert False in admitted, "a burst past the admission must be refused, not queued"
+        assert adapter.sink.failure == "log_capacity"
+        assert adapter.log_state() == "log_capacity"
+        # The ceiling is real and is the writer's own number: at most `WRITE_QUEUE_LIMIT` blocking
+        # waits were ever parked on workers, so the work moved off the loop cannot become a larger,
+        # separate backlog in the executor's queue.
+        assert peak[0] <= WRITE_QUEUE_LIMIT, f"{peak[0]} log waits ran at once"
+        adapter.shutdown()
+    # Nothing was dropped silently: every admitted record is in the file exactly once, numbered
+    # contiguously from one.
+    numbers = sorted(line["sequence"] for line in segment_lines(adapter))
+    assert numbers == list(range(1, len(numbers) + 1))
+    assert 0 < len(numbers) <= WRITE_QUEUE_LIMIT * 2
+
+
+def test_the_writer_owns_the_file_and_a_timed_out_shutdown_never_takes_it(tmp_path, monkeypatch):
+    """The second review's finding: a shutdown that gave up still closed a live writer's handle.
+
+    With a 30 ms budget and a writer held inside a real write, the old code returned after 242 ms
+    having called `sink.close` while the writer was still alive — a second owner of a descriptor, an
+    unbounded `close` on the caller, and a writer that could then reopen the segment it had just
+    lost. Now the writer releases the file itself, when it really exits, and the shutdown reports
+    that it could not confirm the end instead of pretending it had.
+    """
+    from tianshu_memory.diagnostics import WRITER_SHUTDOWN_SECONDS
+
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    assert adapter.emit("runtime.started", level="INFO", outcome="succeeded") is True
+    writer_thread = adapter.writer.thread
+    entered = threading.Event()
+    release = threading.Event()
+    closed_by = []
+    real_write = Sink.write
+    real_close = Sink._close
+
+    def held(self, line, sequence):
+        entered.set()
+        assert release.wait(5), "the test never released the writer"
+        return real_write(self, line, sequence)
+
+    def watched_close(self):
+        closed_by.append(threading.current_thread().name)
+        return real_close(self)
+
+    monkeypatch.setattr("tianshu_memory.diagnostics.WRITER_SHUTDOWN_SECONDS", 0.03)
+    with (
+        patch.object(Sink, "write", held),
+        patch.object(Sink, "_close", watched_close),
+    ):
+        caller = threading.Thread(
+            target=lambda: adapter.emit("runtime.ready", level="INFO", outcome="succeeded")
+        )
+        caller.start()
+        assert entered.wait(5), "the writer never reached the held write"
+        started = time.monotonic()
+        confirmed = adapter.shutdown()
+        elapsed = time.monotonic() - started
+        # The deadline is on the refusal, not on the file: the caller returns promptly, having
+        # confirmed nothing, and has not touched a handle a live writer still owns.
+        assert elapsed < WRITER_SHUTDOWN_SECONDS + 0.5, f"shutdown waited {elapsed:.3f}s"
+        assert confirmed is False
+        assert closed_by == []
+        assert writer_thread.is_alive()
+        release.set()
+        caller.join(5)
+        writer_thread.join(5)
+    assert writer_thread.is_alive() is False
+    assert closed_by == ["tianshu-memory-log-writer"]
+    # The line the writer was holding is not lost and not repeated, and the adapter stays refused:
+    # a shutdown that could not be confirmed never becomes a licence to write again.
+    numbers = [line["sequence"] for line in segment_lines(adapter)]
+    assert numbers == [1, 2]
+    assert adapter.emit("runtime.stopped", level="INFO", outcome="succeeded") is False
+
+
+def test_concurrent_first_events_start_exactly_one_writer(tmp_path):
+    """The second review's finding: the first start had no mutex, so two callers built two writers.
+
+    Every caller here is a real thread and they all arrive together, so the check-then-construct
+    inside `Writer.start` is entered concurrently for real. One writer must exist afterwards, the
+    file must contain each line once, and the numbers must be contiguous — two writers over one
+    handle produced duplicate numbers, not just a wasted thread.
+    """
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    started = []
+    results = []
+    lock = threading.Lock()
+    gate = threading.Barrier(8)
+    real_thread = threading.Thread
+
+    class Watched(real_thread):
+        def start(self):
+            with lock:
+                started.append(self)
+            return super().start()
+
+    def emit_once():
+        gate.wait(10)
+        landed = adapter.emit("runtime.started", level="INFO", outcome="succeeded")
+        with lock:
+            results.append(landed)
+
+    callers = [real_thread(target=emit_once) for _ in range(8)]
+    with patch.object(threading, "Thread", Watched):
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(10)
+        writers = [thread for thread in started if thread.name == "tianshu-memory-log-writer"]
+        assert len(writers) == 1, f"{len(writers)} writers were started over one file"
+        assert adapter.shutdown() is True
+    for writer in writers:
+        writer.join(5)
+    lines = segment_lines(adapter)
+    numbers = [line["sequence"] for line in lines]
+    assert results == [True] * 8
+    assert len(lines) == 8
+    assert numbers == list(range(1, 9))
+    assert len(numbers) == len(set(numbers))
+    # A process that stopped is never handed a second writer over the same sink.
+    assert adapter.emit("runtime.started", level="INFO", outcome="succeeded") is False
+    assert len([thread for thread in started if thread.name == "tianshu-memory-log-writer"]) == 1
+
+
+def test_a_first_event_racing_a_shutdown_never_starts_a_writer_behind_it(tmp_path):
+    """Start and stop interleaved: whoever wins, the process ends with no writer and no lost line.
+
+    Two shapes are covered because they are the two ways a first event and a shutdown can meet: the
+    shutdown arrives first and the event is refused outright, or the event arrives first and its
+    line is written before the writer ends. Neither may produce a second writer, and neither may
+    leave a line the file does not contain.
+    """
+    stopped_first = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path / "a")})
+    assert stopped_first.shutdown() is True
+    assert stopped_first.emit("runtime.started", level="INFO", outcome="succeeded") is False
+    assert segment_lines(stopped_first) == []
+    assert stopped_first.writer.thread is None, "a refused first event must not start a writer"
+
+    started_first = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path / "b")})
+    order = []
+    lock = threading.Lock()
+
+    def emit():
+        landed = started_first.emit("runtime.started", level="INFO", outcome="succeeded")
+        with lock:
+            order.append(("emit", landed))
+
+    def stop():
+        with lock:
+            order.append(("stop", None))
+        started_first.shutdown()
+
+    gate = threading.Barrier(2)
+
+    def run(action):
+        gate.wait(5)
+        action()
+
+    threads = [
+        threading.Thread(target=run, args=(emit,)),
+        threading.Thread(target=run, args=(stop,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert started_first.shutdown() is True
+    lines = segment_lines(started_first)
+    assert [line["sequence"] for line in lines] == list(range(1, len(lines) + 1))
+    # Whichever order the two arrived in, the process is stopped and stays stopped.
+    assert started_first.emit("runtime.ready", level="INFO", outcome="succeeded") is False
+    assert len(segment_lines(started_first)) == len(lines)

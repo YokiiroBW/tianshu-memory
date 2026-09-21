@@ -12,7 +12,7 @@ from .auth import Authenticator
 from .contracts import Contracts
 from .diagnostics import (
     CHAT_SERVICE,
-    note_authenticated,
+    anote_authenticated,
     note_fault,
     record_execution,
 )
@@ -97,17 +97,21 @@ def create_app(*, service=None, auth=None):
             request_id = "request-unavailable"
             try:
                 if service is None or auth is None:
-                    note_authenticated("dependency_unavailable")
+                    await anote_authenticated("dependency_unavailable")
                     raise Fault("dependency_unavailable", 503)
                 authenticated_service, caller = auth.authenticate(
                     request.headers.get("authorization")
                 )
                 if operation not in caller.get("operations", []):
-                    note_authenticated("forbidden")
+                    await anote_authenticated("forbidden")
                     raise Fault("forbidden", 403)
                 # The verdict is recorded here, straight after the same two checks that always
-                # decided it: nothing about who may call what has changed.
-                note_authenticated()
+                # decided it: nothing about who may call what has changed. The wait for that record
+                # happens off the event loop, and a record that could not be confirmed refuses the
+                # request rather than letting an unaccountable call proceed: the credential was
+                # accepted, so acting on it now would be a side effect this process cannot log.
+                if not await anote_authenticated():
+                    raise Fault("log_unavailable", 503)
                 body = bytearray()
                 async for chunk in request.stream():
                     body.extend(chunk)

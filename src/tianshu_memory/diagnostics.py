@@ -576,21 +576,28 @@ class Writer:
     `flush` and `fsync` are blocking calls on a real disk, and running them on the event loop would
     make the log the slowest thing in the process: a 250 ms `fsync` would stall every other
     request, including the liveness probe that exists to answer while everything else is busy. So
-    the blocking work belongs to a thread this process owns, and the event loop only ever (*) hands
-    over a line and waits for the verdict of the one writer that owns the file.
+    the blocking work belongs to a thread this process owns, and the event loop never waits on it
+    at all: it hands a line over through a bounded admission and is told the verdict by a callback
+    on that same loop.
 
     What is bounded, exactly:
 
     - **The queue.** `WRITE_QUEUE_LIMIT` lines may be outstanding. A submission beyond it is
       refused immediately and latches the sink, because parking an unbounded number of requests on
       the log is the failure mode this bound exists to prevent — and it is never a silent drop.
+    - **The threads.** `WRITE_QUEUE_LIMIT` blocking waits may exist at once. Moving a wait to a
+      worker is not by itself a bound: the default executor's queue is unbounded, so a flood that
+      outran the writer would accumulate there instead of in the writer's own queue. The same
+      ceiling covers both, which is what makes the total outstanding work a number rather than a
+      hope.
     - **Every wait.** A submission may wait `WRITER_QUEUE_TIMEOUT_SECONDS` to reach the queue; a
       caller waits at most `WRITER_DEADLINE_SECONDS` for its own line; shutdown waits
       `WRITER_SHUTDOWN_SECONDS` for what is already queued. Each of those is a deadline on a
       refusal, never an assertion that the line was written.
-    - **The writers.** Exactly one thread owns the file, so there is never an old writer and a new
-      one racing over the same segment, and a line that timed out is *not* cancelled: the writer
-      this process owns either persists it or latches it. Nothing is submitted twice.
+    - **The writers.** Exactly one thread owns the file — including the closing of it — so there is
+      never an old writer and a new one racing over the same segment, and a line that timed out is
+      *not* cancelled: the writer this process owns either persists it or latches it. Nothing is
+      submitted twice, and a stopped writer is never rebuilt.
 
     A deadline that expires therefore means "not established", and the caller refuses the business
     work it was about to admit. It never means "probably fine": a line whose persistence could not
@@ -604,15 +611,32 @@ class Writer:
         self.attempted = 0
         self.stopping = threading.Event()
         self.thread = None
+        # One lock for the lifetime of the process, not one per call: `start` is entered
+        # concurrently the first time two threads emit at once, and the check-then-construct below
+        # is only a single decision if both halves happen under the same lock.
+        self.lock = threading.Lock()
+        # Whether a writer has ever been built. It survives the thread exiting, so a process that
+        # has stopped is never handed a second writer over the same sink.
+        self.built = False
 
     def start(self):
-        """Start the single writer, once, from the thread that assembles the process."""
-        if self.thread is not None or not self.sink.durable:
-            return
-        self.thread = threading.Thread(
-            target=self._run, name="tianshu-memory-log-writer", daemon=True
-        )
-        self.thread.start()
+        """Start the single writer, at most once in this process, whatever calls in when.
+
+        The whole decision — has a writer ever been built, is this sink durable, construct it, mark
+        it, start it — is made under one lock. Two threads emitting the first event at the same
+        moment therefore produce one writer and one thread, not two writers over one file handle.
+        """
+        with self.lock:
+            if self.built or not self.sink.durable:
+                return
+            self.built = True
+            thread = threading.Thread(
+                target=self._run, name="tianshu-memory-log-writer", daemon=True
+            )
+            self.thread = thread
+        # Started outside the lock: `Thread.start` runs the first bytecode of the new thread, and
+        # there is no reason for any other caller's `start` to wait behind that.
+        thread.start()
 
     def submit(self, pending):
         """Queue one pending record, or return None because the bounded buffer is already full."""
@@ -625,6 +649,21 @@ class Writer:
             self.sink.fail("log_capacity")
             return None
         return pending
+
+    async def deliver(self, pending):
+        """Hand one record over and report its verdict to the loop, never to a parked coroutine.
+
+        This is the event loop's side of the same queue the synchronous caller uses. The blocking
+        `wait` runs on a worker, and the loop is handed back a future rather than being held inside
+        the writer: no coroutine, no task and no probe response is ever parked waiting for an
+        `fsync`.
+
+        A submission the bounded buffer refuses is answered here instead of on a worker, so a full
+        queue cannot consume a worker just to learn that it is full.
+        """
+        if self.submit(pending) is None:
+            return False
+        return await asyncio.get_running_loop().run_in_executor(None, self.wait, pending)
 
     def wait(self, pending):
         """Whether this exact line reached durable storage. A timeout is a refusal, not a maybe."""
@@ -702,17 +741,36 @@ class Writer:
                 try:
                     pending = self.queue.get_nowait()
                 except queue.Empty:
-                    return
+                    break
                 pending.done.set()
+            # The file is released *here*, by the one thread that ever owned it, and only after
+            # this thread has stopped writing to it. Closing the handle somewhere else would mean a
+            # caller taking a file the writer may still be flushing — a second owner of a descriptor
+            # this class promises has exactly one — and it would put an unbounded `close` on whoever
+            # happened to call shutdown. A shutdown that ran out of patience therefore leaves the
+            # handle exactly where it belongs: it is released when this thread really exits.
+            self.sink.close()
 
     def shutdown(self):
-        """Stop accepting, drain what is already queued, and release the file within a deadline."""
-        if self.thread is None:
-            self.sink.close()
-            return
+        """Stop accepting, drain what is queued, and wait a bounded time for the writer to end.
+
+        Returns True only when the one writer thread has really finished — which is also the moment
+        the file is released, because that thread owns the handle. A False means the writer did not
+        end inside the deadline: it may still be inside a `write` or an `fsync` the kernel has not
+        returned from. That is reported as unconfirmed rather than papered over: the caller must not
+        treat it as a closed file, nothing here closes the handle out from under a live writer, and
+        no second writer is ever built to replace it.
+        """
+        with self.lock:
+            thread = self.thread
+            if thread is None:
+                # No writer was ever built, so nothing else can be holding the file: the process
+                # that assembled this adapter is the only thing that could have, and it did not.
+                self.sink.close()
+                return True
         self.stopping.set()
-        self.thread.join(WRITER_SHUTDOWN_SECONDS)
-        self.sink.close()
+        thread.join(WRITER_SHUTDOWN_SECONDS)
+        return not thread.is_alive()
 
 
 class Diagnostics:
@@ -730,6 +788,7 @@ class Diagnostics:
         "stopping",
         "token_env",
         "writer",
+        "writes_in_flight",
     )
 
     def __init__(
@@ -747,6 +806,11 @@ class Diagnostics:
         self.sink = sink if sink is not None else Sink(settings["log_directory"], self.instance_id)
         self.stopping = threading.Event()
         self.writer = Writer(self)
+        # The async side's admission, built on first use because a semaphore binds to the loop that
+        # awaits it. Its ceiling is the same `WRITE_QUEUE_LIMIT` the writer's own queue uses, so the
+        # number of outstanding log operations is one bound rather than two unrelated ones: a worker
+        # moved off the loop is still a worker this process is paying for.
+        self.writes_in_flight = None
         if self.sink.durable and self.sink.sequence == 0:
             # A process that restarts with the same instance id must not repeat numbers inside the
             # file it is appending to. This is read once, before anything is written, and only ever
@@ -776,9 +840,29 @@ class Diagnostics:
         After this the process is stopping: the writer has stopped accepting, so every later event
         is refused rather than queued for a thread that will never read it. A refused event is a
         refusal of the work it would have described, which is the same rule as everywhere else.
+
+        Returns True only when the writer really ended — and with it released the file — inside the
+        shutdown deadline. False means that could not be confirmed in time; see `Writer.shutdown`.
         """
         self.stopping.set()
-        self.writer.shutdown()
+        return self.writer.shutdown()
+
+    async def ashutdown(self):
+        """`shutdown` for a serving loop: the join happens on a worker, and it is still bounded.
+
+        The wait is bounded twice over — `WRITER_SHUTDOWN_SECONDS` on the join itself and the same
+        figure on the executor call — so a writer stuck in the kernel delays the shutdown of this
+        process by a known amount rather than indefinitely. The verdict is the writer's: True means
+        it really ended and released the file, False means that is unconfirmed.
+        """
+        self.stopping.set()
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, self.writer.shutdown), timeout=WRITER_SHUTDOWN_SECONDS
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            return False
 
     def log_state(self):
         """The readiness verdict for the log itself, without touching the filesystem."""
@@ -868,23 +952,55 @@ class Diagnostics:
     async def aemit(
         self, name, *, level="INFO", outcome="succeeded", error_code=None, duration_ms=None
     ):
-        """`emit` for the event loop: the waiting happens on a worker, never on the loop itself.
+        """`emit` for the event loop: the waiting happens on a bounded worker, never on the loop.
 
         A blocking `fsync` is allowed to take as long as the disk takes; what it is not allowed to
-        do is stop this loop from answering a liveness probe while it does.
+        do is stop this loop from answering a liveness probe while it does. Handing the wait to
+        `asyncio.to_thread` alone would move that problem rather than solve it, because the default
+        executor's queue is unbounded: a burst that outran the writer would pile up there instead,
+        and the writer's own `WRITE_QUEUE_LIMIT` would describe nothing. So admission is bounded
+        first, by the same number, and a caller that cannot get in within the queue deadline is
+        refused and latches the sink exactly as a full queue is.
+
+        Every refusal here is a `False`, never an exception: the caller decides whether the work it
+        was about to admit may happen, which is the same contract `emit` has.
         """
+        if name not in EVENTS:
+            raise ValueError("unregistered diagnostic event")
+        if level not in LEVELS:
+            raise ValueError("unregistered level")
         if not self.sink.durable:
-            return self.emit(
-                name, level=level, outcome=outcome, error_code=error_code, duration_ms=duration_ms
-            )
-        return await asyncio.to_thread(
-            self.emit,
-            name,
-            level=level,
-            outcome=outcome,
-            error_code=error_code,
-            duration_ms=duration_ms,
+            # Nothing to write and nothing that can block: this is an explicitly non-durable
+            # process, and `non_durable` is refused by readiness rather than here.
+            return True
+        if not self.available():
+            self.sink._warn_once()
+            return False
+        if self.stopping.is_set():
+            return False
+        record = self._build(
+            name, level=level, outcome=outcome, error_code=error_code, duration_ms=duration_ms
         )
+        return await self._deliver(record)
+
+    async def _deliver(self, pending):
+        """Admit one built record under the shared ceiling, then wait off the loop."""
+        if self.writes_in_flight is None:
+            self.writes_in_flight = asyncio.Semaphore(WRITE_QUEUE_LIMIT)
+        try:
+            await asyncio.wait_for(
+                self.writes_in_flight.acquire(), timeout=WRITER_QUEUE_TIMEOUT_SECONDS
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            # The bounded admission is full, so this process already has as much log work in
+            # flight as it will pay for. That is a capacity verdict about the log, and it is
+            # refused and latched rather than queued into a second, unbounded one.
+            self.sink.fail("log_capacity")
+            return False
+        try:
+            return await self.writer.deliver(pending)
+        finally:
+            self.writes_in_flight.release()
 
     def _refuse_unaccountable(self):
         """Whether business work must be refused because its record could not be made durable.
@@ -1018,22 +1134,54 @@ class Diagnostics:
         )
 
     def note_authenticated(self, code=None):
-        """Record the authentication verdict of the request being served, exactly once."""
+        """Record the request's authentication verdict from a thread that may synchronously wait.
+
+        This is the form for a business thread — one already inside a worker, where blocking is what
+        the thread is for. An asynchronous entry point must use `anote_authenticated` instead: the
+        two write the same record, and only the second one keeps the event loop free while the disk
+        decides.
+        """
         scope = _scope.get()
         if scope is None or scope.authenticated is not None or not self.available():
-            return
+            return True
         scope.authenticated = code
         if code is None:
-            self.emit("request.authenticated", level="INFO", outcome="succeeded")
-        else:
-            if scope.fault is None:
-                scope.fault = code
-            self.emit(
-                "request.authenticated",
-                level="WARNING",
-                outcome="rejected",
-                error_code=map_fault(code),
-            )
+            return self.emit("request.authenticated", level="INFO", outcome="succeeded")
+        if scope.fault is None:
+            scope.fault = code
+        return self.emit(
+            "request.authenticated",
+            level="WARNING",
+            outcome="rejected",
+            error_code=map_fault(code),
+        )
+
+    async def anote_authenticated(self, code=None):
+        """Record the authentication verdict without parking the event loop on the disk.
+
+        The verdict is written here, straight after the same two checks that always decided it, so
+        nothing about who may call what has changed. What has changed is where the wait happens: on
+        a bounded worker, so a 250 ms disk stalls neither this request nor the liveness probe
+        running beside it.
+
+        A record that cannot be confirmed is reported to the caller, which refuses the request. The
+        check did happen — this is a statement about the log, not about the credential — and a
+        process that cannot record which credential it accepted must not go on to act on it.
+        """
+        scope = _scope.get()
+        if scope is None or scope.authenticated is not None or not self.available():
+            return True
+        scope.authenticated = code
+        if code is None:
+            return await self.aemit("request.authenticated", level="INFO", outcome="succeeded")
+        if scope.fault is None:
+            scope.fault = code
+        return await self.aemit(
+            "request.authenticated",
+            level="WARNING",
+            outcome="rejected",
+            error_code=map_fault(code),
+        )
 
     def note_fault(self, code):
         """Record the product verdict a service layer reached, for the request's final record."""
@@ -1120,10 +1268,24 @@ def record_execution(name):
     return Execution(scope.diagnostics, name)
 
 
+async def anote_authenticated(code=None):
+    """Record the authentication verdict from an asynchronous entry point.
+
+    The event loop's form of `note_authenticated`: the same verdict, the same record, written
+    without stopping the loop. Returns whether that record reached durable storage.
+    """
+    scope = _scope.get()
+    if scope is None:
+        return True
+    return await scope.diagnostics.anote_authenticated(code)
+
+
 def note_authenticated(code=None):
+    """Record the authentication verdict from a synchronous business thread."""
     scope = _scope.get()
     if scope is not None:
-        scope.diagnostics.note_authenticated(code)
+        return scope.diagnostics.note_authenticated(code)
+    return True
 
 
 def note_fault(code):

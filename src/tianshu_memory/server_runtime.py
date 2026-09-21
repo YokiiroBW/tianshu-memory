@@ -361,6 +361,17 @@ class Assembly:
         self.diagnostics.emit("runtime.started", level="INFO", outcome="succeeded")
         self.state = "active"
 
+    async def astarted(self):
+        """`started` for the serving loop: the same record, written without holding the loop.
+
+        The lifecycle lines belong to the process, not to a request, but they are still disk writes:
+        a slow one must not stop this process from answering its liveness probe while it starts. The
+        state transition is made either way — the writer's verdict is about the log, and a process
+        that cannot record its own start is refused by readiness rather than left half-started.
+        """
+        await self.diagnostics.aemit("runtime.started", level="INFO", outcome="succeeded")
+        self.state = "active"
+
     def announce_ready(self, document):
         """Record the first successful readiness verdict, once, and only while active.
 
@@ -375,11 +386,25 @@ class Assembly:
         self.diagnostics.emit("runtime.ready", level="INFO", outcome="succeeded")
         return True
 
+    async def aannounce_ready(self, document):
+        """`announce_ready` for the startup path, off the event loop. Same once-only rule."""
+        if document["status"] != "ready" or self.ready_announced or not self.active:
+            return False
+        self.ready_announced = True
+        await self.diagnostics.aemit("runtime.ready", level="INFO", outcome="succeeded")
+        return True
+
     def stopping(self):
         if self.state == "stopped":
             return
         self.state = "stopping"
         self.diagnostics.emit("runtime.stopping", level="INFO", outcome="started")
+
+    async def astopping(self):
+        if self.state == "stopped":
+            return
+        self.state = "stopping"
+        await self.diagnostics.aemit("runtime.stopping", level="INFO", outcome="started")
 
     def stopped(self):
         if self.state == "stopped":
@@ -387,6 +412,19 @@ class Assembly:
         self.state = "stopped"
         self.diagnostics.emit("runtime.stopped", level="INFO", outcome="succeeded")
         self.diagnostics.shutdown()
+
+    async def astopped(self):
+        """The terminal transition, with both its halves off the event loop.
+
+        The closing record and the shutdown that releases the file are one step: the record is the
+        last thing this process writes, and it is written before the writer is told to stop. Neither
+        the write nor the join is allowed to park the loop, which is why this variant exists at all.
+        """
+        if self.state == "stopped":
+            return True
+        self.state = "stopped"
+        await self.diagnostics.aemit("runtime.stopped", level="INFO", outcome="succeeded")
+        return await self.diagnostics.ashutdown()
 
     def probe_settings(self):
         """The read-only probe settings for this exact assembly, built by the entry point.
@@ -636,14 +674,14 @@ async def _serve(server, assembly):
         # would be exactly the false success the log exists to prevent.
         assembly.diagnostics.emit("runtime.start_failed", level="ERROR", outcome="failed")
         return
-    assembly.started()
+    await assembly.astarted()
     await announce_startup_readiness(assembly)
     try:
         await server.main_loop()
     finally:
-        assembly.stopping()
+        await assembly.astopping()
         await server.shutdown(sockets=getattr(server, "servers", None))
-        assembly.stopped()
+        await assembly.astopped()
 
 
 async def announce_startup_readiness(assembly):
@@ -656,7 +694,9 @@ async def announce_startup_readiness(assembly):
 
     The verdict is read on a worker, never on the event loop, and a process that is not ready says
     nothing here: a not-ready verdict already has its own record at startup, and inventing a
-    lifecycle line for a state this process never reached would be a false success.
+    lifecycle line for a state this process never reached would be a false success. The record that
+    follows a ready verdict is written the same way — off the loop — so the startup path is the last
+    place a slow disk could have stalled the process before it ever served anything.
     """
     try:
         document = await asyncio.wait_for(
@@ -664,5 +704,5 @@ async def announce_startup_readiness(assembly):
             timeout=CHECK_DEADLINE_SECONDS,
         )
     except (TimeoutError, asyncio.TimeoutError, Fault):
-        return
-    assembly.announce_ready(document)
+        return False
+    return await assembly.aannounce_ready(document)

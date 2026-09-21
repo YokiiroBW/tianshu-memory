@@ -1543,8 +1543,14 @@ def test_http_module_calls_only_the_public_execute_and_holds_no_domain_state():
         if isinstance(node, ast.Import)
         for alias in node.names
     }
+    # Two standard-library additions are allowed for the authority rule: `ipaddress` and `re` are
+    # what let a presented `Host` be judged by the interface it names rather than by its spelling,
+    # with the same parser the binding validates its configured names with. Nothing else about this
+    # list changes: no diagnostics, no runtime, no domain state.
     assert imported <= {
         "asyncio",
+        "ipaddress",
+        "re",
         "sqlite3",
         "pathlib",
         "fastapi",

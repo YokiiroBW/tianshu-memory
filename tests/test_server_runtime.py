@@ -21,12 +21,18 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from tianshu_memory.diagnostics import CHAT_SERVICE, CHECKS_BY_SERVICE, Diagnostics
+from tianshu_memory.diagnostics import (
+    CHAT_SERVICE,
+    CHECKS_BY_SERVICE,
+    KNOWLEDGE_SERVICE,
+    Diagnostics,
+)
 from tianshu_memory.domain import Fault, canonical
 from tianshu_memory.runtime_probes import ProbeConfig, readiness
 from tianshu_memory.server_runtime import (
     DEFAULT_HOST,
     Assembly,
+    Binding,
     add_serve_arguments,
     announce_startup_readiness,
     build_assembly,
@@ -854,6 +860,281 @@ def test_a_bare_knowledge_application_still_serves_only_loopback(tmp_path):
         )
         assert refused.status_code == 400, host
         assert refused.json() == {"status": "failed", "code": "invalid_host"}
+
+
+def test_the_inner_authority_rule_is_the_binding_rule():
+    """The second review's finding: a legal bracketed IPv6 authority was refused by the entry.
+
+    `Binding.authority_of` already split `[::1]:8130` correctly and accepted it, while the inner
+    check read the colons in the name as a missing port and cleared the declared one, so a
+    deployment that was reachable as a probe was unusable as a service — the same class of defect
+    the first review found for DNS names, still present for IPv6.
+
+    This is the invariant rather than a case list: for every spelling below, the binding's verdict
+    and the entry's verdict must be the same one. The inner check must not be wider (that would be
+    a bypass) and must not be narrower (that would be the reviewed defect), so the two are held
+    against each other on both sides of the boundary — the names the binding was configured with,
+    and the ones it refuses.
+    """
+    from tianshu_memory.knowledge_http import authority as inner_authority
+
+    port = 8130
+    accepted = [
+        "[::1]",
+        "[0:0:0:0:0:0:0:1]",
+        "[2001:db8::1]",
+        "127.0.0.1",
+        "localhost",
+        "memory.example.test",
+    ]
+    binding = Binding("::1", port, accepted)
+    for name in accepted:
+        assert binding.accepts(f"{name}:{port}") is True, name
+        assert inner_authority(f"{name}:{port}", port, binding.authority_names()) is True, name
+        # The same name on a different port, and the same name with no port at all, are refused by
+        # both. The port is part of the authority, not a decoration on it.
+        assert binding.accepts(f"{name}:{port + 1}") is False, name
+        assert inner_authority(f"{name}:{port + 1}", port, binding.authority_names()) is False, name
+        assert binding.accepts(name) is False, name
+        assert inner_authority(name, port, binding.authority_names()) is False, name
+    for refused in (
+        f"evil.example.test:{port}",
+        f"memory.example.test.evil:{port}",
+        f"[2001:db8::2]:{port}",
+        f"[::ffff:127.0.0.1]:{port}",
+        # A bare IPv6 literal that was never bracketed, whose last hextet looks like a port. Neither
+        # side may read that hextet as one: the name and the port are found the same way in both.
+        f"::1:{port}",
+    ):
+        assert binding.accepts(refused) is False, refused
+        assert inner_authority(refused, port, binding.authority_names()) is False, refused
+
+
+def test_the_inner_rule_still_refuses_an_unconfigured_host_and_keeps_its_own_default(tmp_path):
+    """Widening the parser must not widen the rule: only the configured set is accepted."""
+    from tianshu_memory.knowledge_http import authority as inner_authority
+
+    # With no deployment set, the loopback rule is the whole rule — and it is loopback-complete, so
+    # a bare knowledge application is reachable on both loopback spellings and nothing else.
+    for name in ("127.0.0.1", "localhost", "[::1]", "[0:0:0:0:0:0:0:1]"):
+        assert inner_authority(f"{name}:8130", 8130, None) is True, name
+    for name in ("192.0.2.10", "memory.example.test", "[2001:db8::1]", "0.0.0.0"):
+        assert inner_authority(f"{name}:8130", 8130, None) is False, name
+    # A wildcard is never an authority, and neither is an empty or malformed header.
+    for header in ("", "*", "*.example.test:8130", "[::1:8130", "]", ":8130", "localhost:"):
+        assert inner_authority(header, 8130, frozenset({"*"})) is False, header
+
+
+def test_a_real_tls_socket_serves_the_knowledge_business_and_refuses_the_rest(
+    tmp_path, certificates
+):
+    """The second review's finding: the TLS claim was made with an in-process ASGI client.
+
+    `TestClient` runs the ASGI application directly, so the certificate was loaded and the binding
+    was resolved but no handshake ever happened and no byte crossed a socket. What is asserted here
+    is the deployment itself: a real uvicorn server, a real TLS handshake against the test CA, and
+    a real HTTP request over that connection — one that succeeds on the business route and ones that
+    are refused for their authority, their origin and their port. The plain-HTTP attempt is refused
+    by the handshake rather than by any rule of this product.
+
+    The service is assembled exactly as the knowledge CLI assembles it: the same `create_app`, the
+    same explicit port, the same validated authority names from the same `Binding`, installed with
+    the same `install_networking`. Nothing is stubbed except the diagnostic adapter, which is left
+    non-durable on purpose so this test writes no runtime log.
+    """
+    import hashlib
+    import socket
+    import ssl
+    import threading
+    import time
+
+    import httpx
+    import uvicorn
+
+    from tianshu_memory.knowledge_http import ACTION_PATH, create_app
+    from tianshu_memory.knowledge_migration import migrate as migrate_knowledge
+    from tianshu_memory.store import Store as KnowledgeStore
+
+    client_name = "deployed-connector"
+    credential = "synthetic-deployment-credential"
+    port = 8443
+    contract_directory = (
+        Path(
+            json.loads(
+                (Path(__file__).resolve().parents[1] / ".runtime/workspace-context.json").read_text(
+                    encoding="utf-8"
+                )
+            )["workspace"]
+        )
+        / "contracts/text-dialogue/v1"
+    )
+    from tianshu_memory.contracts import Contracts
+
+    store = KnowledgeStore(tmp_path / "notes.sqlite")
+    store.migrate_profiles(tmp_path / "before-profiles.sqlite")
+    store.migrate_sources(tmp_path / "before-sources.sqlite", Contracts(contract_directory))
+    migrate_knowledge(store, tmp_path / "before-knowledge.sqlite")
+    root = tmp_path / "alpha"
+    root.mkdir()
+    config = {
+        "database_path": str(store.path),
+        "knowledge": {
+            "projects": {
+                "alpha": {"root": str(root), "host": "local", "default_branch": "main", "urls": []}
+            },
+            "clients": {
+                client_name: {
+                    "credential_sha256": hashlib.sha256(credential.encode("utf-8")).hexdigest(),
+                    "projects": ["alpha"],
+                    "permissions": ["import", "note_recover"],
+                }
+            },
+        },
+    }
+    path = tmp_path / "knowledge.json"
+    path.write_text(canonical(config), encoding="utf-8")
+
+    # The project is made real the way any other process makes it real: through the domain's own
+    # entry point, before the socket exists. Nothing here is a test-only shortcut into the schema.
+    from tianshu_memory.knowledge import KnowledgeApplication
+
+    (root / "source.md").write_text("# source\n\nreceipt text\n", encoding="utf-8")
+    imported = KnowledgeApplication(str(path)).execute(
+        {
+            "operation": "import",
+            "project_id": "alpha",
+            "arguments": {
+                "key": "deployment-import",
+                "kind": "file",
+                "locator": "source.md",
+                "expected_version": 0,
+                "groups": None,
+            },
+        },
+        client=client_name,
+        credential=credential,
+    )
+    assert imported["status"] == "imported", imported
+
+    binding = resolve_binding(
+        **binding_arguments(
+            host="127.0.0.1",
+            port=port,
+            certfile=str(certificates / "server.pem"),
+            keyfile=str(certificates / "server.key"),
+            allowed_hosts=[f"localhost:{port}", f"127.0.0.1:{port}"],
+        )
+    )
+    assert binding.accepts(f"localhost:{port}")
+    # The inner rule and the binding agree on every name this deployment was given, which is what
+    # makes the requests below meaningful rather than a coincidence of one spelling.
+    entry = create_app(
+        str(path), client_name, port, authorities=binding.authority_names(), body_timeout=20.0
+    )
+    install_networking(entry, binding)
+    adapter = Diagnostics(KNOWLEDGE_SERVICE, {})
+    adapter.install(entry)
+    assert adapter.durable is False, "this test must not write a runtime log"
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            entry,
+            host=binding.host,
+            port=binding.port,
+            ssl_certfile=str(certificates / "server.pem"),
+            ssl_keyfile=str(certificates / "server.key"),
+            log_level="critical",
+            access_log=False,
+            lifespan="off",
+        )
+    )
+    thread = threading.Thread(target=server.run, name="ts102-real-tls-server", daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            assert thread.is_alive(), "the server thread died during startup"
+            try:
+                with socket.create_connection((binding.host, binding.port), timeout=0.25):
+                    break
+            except OSError:
+                assert time.monotonic() < deadline, (
+                    "the real TLS server never accepted a connection"
+                )
+                time.sleep(0.05)
+
+        trust = ssl.create_default_context(cafile=str(certificates / "ca.pem"))
+        base = f"https://127.0.0.1:{binding.port}"
+        headers = {
+            "Host": f"localhost:{binding.port}",
+            "Authorization": f"Bearer {credential}",
+            "Content-Type": "application/json",
+        }
+        with httpx.Client(verify=trust, timeout=20.0) as client:
+            body = {
+                "operation": "note_recover",
+                "project_id": "alpha",
+                "arguments": {"text": "receipt", "budget_bytes": 16384},
+            }
+            # A real handshake, a real request, and a real business answer over that connection:
+            # the domain's own recovered note package, not a transport verdict about a name.
+            answered = client.post(f"{base}{ACTION_PATH}", json=body, headers=headers)
+            assert answered.status_code == 200, answered.text
+            recovered = answered.json()
+            assert recovered["project_id"] == "alpha", answered.text
+            assert recovered["revision"] == 1, answered.text
+            assert recovered["retrieval"] == "lexical", answered.text
+            assert len(recovered["seal"]) == 64, answered.text
+            assert answered.headers["cache-control"] == "no-store"
+
+            # Everything the binding refuses is refused over the same socket, with the entry's own
+            # verdict: a name nobody configured, the same name on another port, and no port at all.
+            for refused_host in (
+                f"evil.example.test:{binding.port}",
+                f"localhost:{binding.port + 1}",
+                "localhost",
+            ):
+                refused = client.post(
+                    f"{base}{ACTION_PATH}", json=body, headers={**headers, "Host": refused_host}
+                )
+                assert refused.status_code == 400, refused_host
+                assert refused.json() == {"status": "failed", "code": "invalid_host"}, refused_host
+
+            # A browser origin is refused on a legal authority, and a forwarded header cannot name
+            # one: this process is not reachable through a page or a proxy. The two refusals come
+            # from the two rules that own them, and neither is the authority rule giving way.
+            refused_origin = client.post(
+                f"{base}{ACTION_PATH}",
+                json=body,
+                headers={**headers, "Origin": "https://app.example.test"},
+            )
+            assert refused_origin.status_code == 400
+            assert refused_origin.json() == {"status": "failed", "code": "browser_origin_refused"}
+            # A forwarded host header is not consulted at all: with no `Host` of its own the request
+            # names no authority, and the legal name in the forwarded header cannot supply one.
+            forwarded = client.post(
+                f"{base}{ACTION_PATH}",
+                json=body,
+                headers={**headers, "Host": "evil.example.test", "X-Forwarded-Host": "localhost"},
+            )
+            assert forwarded.status_code == 400
+            assert forwarded.json() == {"status": "failed", "code": "invalid_host"}
+
+        # The same port over plain HTTP is not a request this product refuses; it is not a request
+        # at all. Nothing about the authority rules is involved in this verdict.
+        with httpx.Client(timeout=5.0) as plain:
+            with pytest.raises(httpx.TransportError):
+                plain.post(
+                    f"http://127.0.0.1:{binding.port}{ACTION_PATH}", json=body, headers=headers
+                )
+    finally:
+        server.should_exit = True
+        thread.join(20)
+    assert thread.is_alive() is False
+    # The adapter this test installed was given no log directory at all, so the readiness verdict
+    # for the log is `non_durable` rather than a claim about a durable log it never had.
+    assert adapter.durable is False
+    assert adapter.log_state() == "non_durable"
 
 
 def test_the_lifecycle_records_what_really_happened(tmp_path):

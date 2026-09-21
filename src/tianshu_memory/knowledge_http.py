@@ -53,6 +53,8 @@ status says which *layer* refused the request, never which permission class was 
 """
 
 import asyncio
+import ipaddress
+import re
 import sqlite3
 from pathlib import Path
 
@@ -123,7 +125,11 @@ MAX_BODY_BYTES = 262144
 READ_TIMEOUT_SECONDS = 10.0
 EXECUTE_TIMEOUT_SECONDS = 10.0
 MAX_ACTIVE_EXECUTES = 4
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+# A DNS name an operator may legitimately put in an authority list. The same deliberately narrow
+# shape the binding validates its configured names with, and not a general URL parser: anything it
+# does not understand is refused rather than allowed.
+HOSTNAME_PATTERN = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\Z")
 MAX_CLIENT_LENGTH = 128
 # JSON object keys of the request body. Nothing else is read from the request.
 REQUEST_FIELDS = frozenset({"operation", "project_id", "arguments"})
@@ -235,25 +241,106 @@ def check_host(host, port, authorities=None):
     `authorities` is the deployment's own already-validated authority set, and it is the *only*
     thing that can widen this check. A deployment that binds off loopback must present its legal
     names to the shared binding before the socket exists; those same validated names are handed
-    here, so this entry accepts exactly what that binding accepts and nothing more. Nothing is ever
-    derived from a request, a wildcard is never accepted, and the loopback rule below stays the
+    here, so this entry accepts exactly what that binding accepts and nothing more. The presented
+    header goes through the same split and normalization those names went through, which is what
+    makes "exactly" true for an IPv6 deployment rather than only for IPv4 and DNS names. Nothing is
+    ever derived from a request, a wildcard is never accepted, and the loopback rule below stays the
     default for every application that was not assembled for a deployment.
     """
     require(authority(host, port, authorities), "invalid_host", STATUS_AUTHORITY)
 
 
-def authority(host, port, authorities=None):
-    """Whether a presented `Host` names an authority this process may answer on."""
-    text = (host or "").strip().lower()
-    name, separator, declared = text.rpartition(":")
+def split_authority(value):
+    """Split `host[:port]`, keeping an IPv6 literal in its bracketed form.
+
+    This is the same rule the deployment's binding applies, written here because this module must
+    not import the runtime that owns the socket: a `Host` header is a name and a port, and the two
+    halves are found the same way in both places. A bracketed literal is the only way an IPv6
+    address can carry a port at all — `[::1]:8130` is the loopback interface on one port, while
+    `::1:8130` is a bare address that names no port, and reading it as one would make the last
+    hextet a port number.
+
+    `tests/test_server_runtime.py::test_the_inner_authority_rule_is_the_binding_rule` holds the two
+    implementations against each other on the same inputs, so this copy cannot drift from the one
+    the socket is actually bound with.
+    """
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0:
+            return value, ""
+        tail = value[end + 1 :]
+        if tail == "":
+            return value[: end + 1], ""
+        if tail.startswith(":"):
+            return value[: end + 1], tail[1:]
+        return value, ""
+    name, separator, port = value.rpartition(":")
     if not separator or ":" in name:
         # No port at all, or a bare IPv6 literal that was never bracketed.
-        name, declared = text, ""
+        return value, ""
+    return name, port
+
+
+def normalize_name(name):
+    """One authority name in the comparable form the deployment's binding compares.
+
+    The same three outcomes as `server_runtime.normalize_authority`, in the same order, and for the
+    same reason: an IPv6 literal is bracketed and compressed, so `[::1]` and `[0:0:0:0:0:0:0:1]`
+    are one authority rather than two spellings; a hostname is lower-cased and must be shaped like a
+    hostname; and anything else is refused rather than compared as text. Returning None rather than
+    raising keeps this usable inside a boolean verdict.
+
+    Nothing here reads a request to decide what is legal: the value being normalized is the `Host`
+    header, and it is then looked up in the set this process was configured with. A name that is not
+    in that set is refused however well-formed it is.
+    """
+    if name.startswith("["):
+        if not name.endswith("]"):
+            return None
+        literal = ip_literal(name[1:-1])
+        return None if literal is None else f"[{literal}]"
+    if name in LOOPBACK_HOSTS:
+        return name
+    literal = ip_literal(name)
+    if literal is not None:
+        return f"[{literal}]" if ":" in literal else literal
+    if not HOSTNAME_PATTERN.fullmatch(name):
+        return None
+    return name
+
+
+def ip_literal(value):
+    """The canonical text of an IP literal, or None when the value is not one.
+
+    A zone identifier is refused, exactly as the binding refuses it: `fe80::1%eth0` names an
+    interface on one host, not an authority a client anywhere can address.
+    """
+    if not isinstance(value, str) or "%" in value:
+        return None
+    try:
+        return str(ipaddress.ip_address(value)).lower()
+    except ValueError:
+        return None
+
+
+def authority(host, port, authorities=None):
+    """Whether a presented `Host` names an authority this process may answer on.
+
+    The header is split and normalized by the same rules the binding used on the names it accepted,
+    so a legal bracketed IPv6 authority — `[::1]:8130` — is judged by the interface it names rather
+    than by how it was spelled, and a bare IPv6 literal that carries no port is refused instead of
+    having its last hextet read as one.
+    """
+    text = (host or "").strip().lower()
+    name, declared = split_authority(text)
     if declared != str(port):
         return False
+    resolved = normalize_name(name)
+    if resolved is None:
+        return False
     if authorities is None:
-        return name in LOOPBACK_HOSTS
-    return name in authorities
+        return resolved in LOOPBACK_HOSTS
+    return resolved in authorities
 
 
 def check_origin(request):
