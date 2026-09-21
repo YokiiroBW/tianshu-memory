@@ -500,11 +500,17 @@ class Catalog:
     def _current(self, document_id):
         """Refuse a read of a version that is not this document's current, readable one.
 
-        This is everything about the request that only the database can answer, and it is deliberately
-        narrow: the document exists in this project and is readable at all, its stored version has a
-        version row, and — on a first page, where the caller names the version itself — that version
-        is the one the caller named. The caller's *agreement with its own cursor* has already been
-        settled by `_continues` before this runs, and the source's real freshness is settled after it.
+        This is everything about the request that only the database can answer: the document exists
+        in this project and is readable at all, its *stored current* version has a version row, that
+        stored version is the one the caller named, and — when the caller named a digest, which every
+        later page must — that version's recorded digest is the one the caller named.
+
+        Every page is checked, first and continuation alike. A continuation page has already proved
+        by `_continues` that its request repeats the cursor it presented, but that only says the two
+        agree with each other: it says nothing about the document, so a cursor and a request that
+        still name version 1 must not be served version 2's blocks just because the row for version
+        1 is still lying around. The comparison is against the stored facts, not against the cursor,
+        so a page whose document really moved is `stale_evidence` and never a cursor verdict.
         """
         document = self._document(document_id)
         version = None
@@ -513,14 +519,17 @@ class Catalog:
                 "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
                 (document_id, document["version"]),
             ).fetchone()
-        structural = (
-            document is not None and version is not None and not unavailable(document, self.project)
-        )
-        if structural and self.bound is None:
-            structural = document["version"] == self.args["expected_version"] and (
+        require(
+            document is not None
+            and version is not None
+            and not unavailable(document, self.project)
+            and document["version"] == self.args["expected_version"]
+            and (
                 self.args["expected_hash"] is None or self.args["expected_hash"] == version["hash"]
-            )
-        require(structural, "stale_evidence", 409)
+            ),
+            "stale_evidence",
+            409,
+        )
         return document, version
 
     def _announce_read(self):
@@ -629,12 +638,21 @@ class Catalog:
 
         A continuation page carries the same premise the first page did — the caller names the
         document, the version and the hash it is reading — and the cursor repeats that premise so a
-        page cannot be continued after the document moved. The order of the three questions is the
-        card's order: the request must agree with its own cursor (`invalid_cursor`, or `invalid_input`
-        when a later page leaves the hash open), then the document must be the current readable one
-        (`stale_evidence`), and only then is the source's real freshness read and compared. A request
-        that contradicts its cursor is refused before any document is even looked up, so it can never
-        be answered with a `stale_evidence` verdict about a document it did not describe.
+        page cannot be continued after the document moved. The order of the questions is the card's
+        order, and every page asks all of them:
+
+        1. the request must agree with its own cursor (`invalid_cursor`, or `invalid_input` when a
+           later page leaves the hash open) — decided before any document is looked up, so a
+           rewritten request can never be answered with a verdict about a document it did not
+           describe;
+        2. the stored document must *be* the one the request names — current version and recorded
+           digest, on the first page and on every continuation alike (`stale_evidence`);
+        3. only then is the source's real freshness read and compared (`stale_evidence`).
+
+        Step 2 is not a first-page speciality. Agreement with the cursor only says the request and
+        the token repeat each other; it is the stored facts that say whether that version is still
+        this document's, and a stale token must not be served a later version's blocks just because
+        the earlier version's rows are still present.
         """
         self._continues()
         document_id = self.args["document_id"]

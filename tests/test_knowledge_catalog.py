@@ -151,6 +151,41 @@ def seeded(store, project_id, root, locator, text, *, version=1, kind="file", st
     return identity
 
 
+def superseded(store, root, identifier, locator, blocks, *, version=2, digest_value=None):
+    """Store a *complete* next version of a document, then make it the current one.
+
+    Complete is the point: the new version has its own version row, its own blocks and its own source
+    file, so nothing is missing for a reader that decides by the document's version number alone, and
+    the version it replaced keeps its own version row (that row cannot be deleted while its blocks
+    exist). This is the storage state a cursor most easily gets wrong — a later version that is fully
+    present and readable while an older cursor still names the earlier one.
+    """
+    text = "".join(unit["text"] + "\n" for unit in blocks)
+    recorded = write_source(root, locator, text)
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO knowledge_versions VALUES (?,?,?,?,?,?,?)",
+            (
+                identifier,
+                version,
+                digest_value or content_hash(recorded),
+                recorded,
+                recorded.decode("utf-8"),
+                "text/plain",
+                canonical({"kind": "file", "locator": locator}),
+            ),
+        )
+        for index, unit in enumerate(blocks):
+            db.execute(
+                "INSERT INTO knowledge_blocks VALUES (?,?,?,?)",
+                (f"{identifier}:{version}:{index:03d}", identifier, version, canonical(unit)),
+            )
+        db.execute(
+            "UPDATE knowledge_documents SET version=?, locator=? WHERE id=?",
+            (version, locator, identifier),
+        )
+
+
 def seeded_blocks(store, project_id, root, locator, units, *, version=1):
     """Write one document whose blocks are given explicitly, one payload per block.
 
@@ -781,6 +816,118 @@ def test_a_contradicted_continuation_costs_no_page_of_the_document(catalogue):
             read_page(catalogue, identifier, cursor, limit=1, **arguments)
         assert refused.value.code == code
         assert not any(unit["text"] in str(refused.value) for unit in units)
+
+
+def test_every_page_checks_its_premise_against_the_stored_document(catalogue):
+    """A continuation whose document really moved is refused even when the new version is complete.
+
+    Agreement with the cursor only says the request and the token repeat each other. It says nothing
+    about the document, so the stored version and digest are compared on **every** page, not only on
+    the first. The storage state here is the one that catches a page checking only the cursor: a
+    fully present, readable version 2 — its own version row and its own blocks — with the cursor still
+    naming version 1. Nothing is missing for a reader that decides by version number, the source file
+    and its recorded digest are untouched, and the project revision is untouched, so the only thing
+    that has moved is the document itself: `stale_evidence`, with no block text of either version.
+    """
+    units = [
+        {"spans": [[1, 1]], "text": "Version one, block zero."},
+        {"spans": [[2, 2]], "text": "Version one, block one."},
+    ]
+    identifier, value = seeded_blocks(
+        catalogue.store, ALPHA, catalogue.roots[ALPHA], "moved-and-complete.md", units
+    )
+    first = read_page(catalogue, identifier, limit=1)
+    cursor = first["next_cursor"]
+    assert cursor is not None and first["hash"] == value
+    assert [block["text"] for block in first["blocks"]] == ["Version one, block zero."]
+    with catalogue.store.transaction() as db:
+        revision = db.execute(
+            "SELECT revision FROM knowledge_projects WHERE id=?", (ALPHA,)
+        ).fetchone()[0]
+    superseded(
+        catalogue.store,
+        catalogue.roots[ALPHA],
+        identifier,
+        "moved-and-complete-v2.md",
+        [
+            {"spans": [[1, 1]], "text": "Version two, block zero."},
+            {"spans": [[2, 2]], "text": "Version two, block one."},
+        ],
+    )
+    # The later version really is complete and really is served to a caller that asks for it: what
+    # follows is about the stale page, not about version 2 being unreadable.
+    moved = read_page(catalogue, identifier, expected_version=2, limit=1)
+    assert moved["version"] == 2 and [block["text"] for block in moved["blocks"]] == [
+        "Version two, block zero."
+    ]
+    with catalogue.store.transaction() as db:
+        assert (
+            db.execute("SELECT revision FROM knowledge_projects WHERE id=?", (ALPHA,)).fetchone()[0]
+            == revision
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM knowledge_blocks WHERE document_id=? AND version=2",
+                (identifier,),
+            ).fetchone()[0]
+            == 2
+        )
+    with pytest.raises(Fault, match="stale_evidence") as refused:
+        read_page(catalogue, identifier, cursor, expected_hash=value, limit=1)
+    assert refused.value.code == "stale_evidence"
+    for unwanted in ("Version one", "Version two"):
+        assert unwanted not in str(refused.value)
+    # And version 1's own row and blocks are still there, which is exactly why the stored version has
+    # to be compared rather than assumed: their presence is what a cursor-only check would trust.
+    with catalogue.store.transaction() as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM knowledge_versions WHERE document_id=? AND version=1",
+                (identifier,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM knowledge_blocks WHERE document_id=? AND version=1",
+                (identifier,),
+            ).fetchone()[0]
+            == 2
+        )
+
+
+def test_a_page_whose_current_digest_is_not_the_one_it_names_is_refused(catalogue):
+    """The digest half of the same check, on a continuation page rather than the first.
+
+    The document stays at the version the cursor names, so the version comparison alone would let
+    this page through; what moved is the digest recorded for that version. The stored facts are
+    compared on every page, so the page is refused rather than assembled from blocks the caller's
+    digest does not describe.
+    """
+    units = [
+        {"spans": [[1, 1]], "text": "First half."},
+        {"spans": [[2, 2]], "text": "Second half."},
+    ]
+    identifier, value = seeded_blocks(
+        catalogue.store, ALPHA, catalogue.roots[ALPHA], "digest-moved.md", units
+    )
+    first = read_page(catalogue, identifier, limit=1)
+    cursor = first["next_cursor"]
+    assert cursor is not None and first["hash"] == value
+    with catalogue.store.transaction() as db:
+        db.execute(
+            "UPDATE knowledge_versions SET hash=? WHERE document_id=? AND version=1",
+            ("0" * 64, identifier),
+        )
+    # A first page names the digest itself and is refused for the same reason.
+    with pytest.raises(Fault, match="stale_evidence"):
+        read_page(catalogue, identifier, expected_hash=value, limit=1)
+    # The continuation agrees with its cursor, so the cursor is not what refused it: the recorded
+    # digest of the version it names no longer matches, and no block text is returned.
+    with pytest.raises(Fault, match="stale_evidence") as refused:
+        read_page(catalogue, identifier, cursor, expected_hash=value, limit=1)
+    assert refused.value.code == "stale_evidence"
+    assert not any(unit["text"] in str(refused.value) for unit in units)
 
 
 def test_the_read_refusal_order_is_the_card_order(catalogue):

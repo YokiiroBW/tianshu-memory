@@ -545,6 +545,78 @@ def test_a_continuation_page_over_http_must_keep_the_premise_it_started_with(cat
     assert not any(text.encode() in expired.content for text in texts)
 
 
+def test_a_continuation_over_http_is_refused_when_a_full_later_version_exists(catalogue, running):
+    """The wire answer for a page whose document really moved to a complete later version.
+
+    The later version is fully present — its own version row, its own source file, its own blocks —
+    so a server that decided by version number, or that trusted the cursor's agreement with the
+    request, would have a page to serve. Every page compares the stored version and digest with the
+    request, so the stale page is refused as `stale_evidence`, on the first page and on the
+    continuation alike, and no body carries either version's text. The caller who asks for the new
+    version is served normally, so this is about the stale page and not about version 2.
+    """
+    identifier = document_id(ALPHA, "note-000.md")
+    first = operation(
+        running, "document_read", reading(identifier, expected_hash=None, limit=2)
+    ).json()
+    cursor, digest = first["next_cursor"], first["hash"]
+    assert cursor is not None
+    old_texts = [block["text"] for block in first["blocks"]]
+    assert old_texts
+    # A complete, legal version 2: its own version row, its own blocks and its own source bytes, with
+    # version 1's own row and blocks left in place — the state a cursor-only check would misread.
+    new_texts = [f"Version two block {index}: 新版本正文。" for index in range(2)]
+    recorded = "".join(text + "\n" for text in new_texts).encode()
+    (catalogue.roots[ALPHA] / "note-000.md").write_bytes(recorded)
+    with catalogue.store.transaction() as db:
+        db.execute(
+            "INSERT INTO knowledge_versions VALUES (?,?,?,?,?,?,?)",
+            (
+                identifier,
+                2,
+                hashlib.sha256(recorded).hexdigest(),
+                recorded,
+                recorded.decode(),
+                "text/plain",
+                canonical({"kind": "file", "locator": "note-000.md"}),
+            ),
+        )
+        for index, text in enumerate(new_texts):
+            db.execute(
+                "INSERT INTO knowledge_blocks VALUES (?,?,?,?)",
+                (
+                    f"{identifier}:2:{index:03d}",
+                    identifier,
+                    2,
+                    canonical({"spans": [[index + 1, index + 1]], "text": text}),
+                ),
+            )
+        db.execute("UPDATE knowledge_documents SET version=2 WHERE id=?", (identifier,))
+    # The stale page: the request repeats the cursor exactly, so it is the document that moved.
+    stale = operation(
+        running, "document_read", reading(identifier, cursor=cursor, expected_hash=digest, limit=2)
+    )
+    assert stale.status_code == 422, stale.text
+    assert stale.json() == {"status": "failed", "code": "stale_evidence"}
+    for unwanted in [*old_texts, *new_texts]:
+        assert unwanted.encode() not in stale.content
+    # The same premise without a cursor is refused for the same reason.
+    head = operation(running, "document_read", reading(identifier, expected_hash=digest, limit=2))
+    assert head.status_code == 422, head.text
+    assert head.json() == {"status": "failed", "code": "stale_evidence"}
+    # Asking for what is really there is served, and the project revision did not move: only the
+    # document did, which is why this is the document's own verdict and not a cursor verdict.
+    moved = operation(
+        running,
+        "document_read",
+        reading(identifier, expected_version=2, expected_hash=None, limit=2),
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["version"] == 2
+    assert [block["text"] for block in moved.json()["blocks"]] == new_texts
+    assert moved.json()["project_revision"] == first["project_revision"]
+
+
 def test_a_source_that_changed_under_the_page_is_refused_with_no_old_text(catalogue, running):
     identifier = document_id(ALPHA, "note-000.md")
     assert operation(running, "document_read", reading(identifier)).status_code == 200
