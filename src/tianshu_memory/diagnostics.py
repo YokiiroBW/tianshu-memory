@@ -70,13 +70,15 @@ MAX_DIRECTORY_BYTES = 64 * 1024 * 1024 * 1024
 # a unit must never silently redirect a process that was configured in writing.
 LOG_DIRECTORY_ENV = "TIANSHU_LOG_DIR"
 DEFAULT_TOKEN_ENV = "TIANSHU_DIAGNOSTICS_TOKEN"
-# How much persistence work may be outstanding at once. The queue is the only buffer between a
-# request and the one writer, so its size is the bound on how many requests can be waiting on the
-# log: a burst beyond it is refused rather than parked, exactly as an overloaded service refuses.
+# How much persistence work may be outstanding at once, across both producers. The queue is the
+# only buffer between a request and the one writer, so its size is the bound on how many requests
+# can be waiting on the log: a burst beyond it is refused rather than parked, exactly as an
+# overloaded service refuses. The same number is the admission the writer grants, which is what
+# keeps a synchronous caller and an asynchronous one from being two separate budgets.
 WRITE_QUEUE_LIMIT = 64
-# The longest a caller waits for the writer it is not allowed to run itself: how long a single
-# enqueue may block, and how long a caller waits for its own line to be on disk. Both are
-# deadlines on a refusal, never a claim that the line was written.
+# How long the one writer sleeps when there is nothing queued, which is also how promptly it notices
+# a stop request. It is not a caller's wait: no producer ever blocks on the queue, and the longest a
+# caller waits for its own line is `WRITER_DEADLINE_SECONDS`.
 WRITER_QUEUE_TIMEOUT_SECONDS = 0.25
 WRITER_DEADLINE_SECONDS = 2.0
 # The longest shutdown waits for already-queued lines. Past it the process stops anyway and every
@@ -559,15 +561,24 @@ class Sink:
 
 
 class _Pending:
-    """One record handed to the writer, and the verdict the caller is waiting for."""
+    """One record handed to the writer, and the verdict the caller is waiting for.
 
-    __slots__ = ("done", "failed", "persisted", "record")
+    A record that has been admitted is *taken*: from that moment exactly one of three things must
+    settle it — the writer persists it, the writer fails it, or the writer abandons it on the way
+    out — and settling it is also what returns its admission slot. Nothing on the caller's side can
+    take that slot back early, because the caller stopping its wait does not stop the work: the
+    record is still in the queue, or still in the writer's hands, and the capacity it occupies is
+    still spent. `taken` is set only by the code that really spends the slot, never by a caller.
+    """
+
+    __slots__ = ("done", "failed", "persisted", "record", "taken")
 
     def __init__(self, record):
         self.record = record
         self.done = threading.Event()
         self.persisted = False
         self.failed = False
+        self.taken = False
 
 
 class Writer:
@@ -588,12 +599,12 @@ class Writer:
     - **The threads.** `WRITE_QUEUE_LIMIT` blocking waits may exist at once. Moving a wait to a
       worker is not by itself a bound: the default executor's queue is unbounded, so a flood that
       outran the writer would accumulate there instead of in the writer's own queue. The same
-      ceiling covers both, which is what makes the total outstanding work a number rather than a
-      hope.
-    - **Every wait.** A submission may wait `WRITER_QUEUE_TIMEOUT_SECONDS` to reach the queue; a
-      caller waits at most `WRITER_DEADLINE_SECONDS` for its own line; shutdown waits
-      `WRITER_SHUTDOWN_SECONDS` for what is already queued. Each of those is a deadline on a
-      refusal, never an assertion that the line was written.
+      ceiling covers both, and it is held until the *writer* is finished with the record rather
+      than until the caller stops waiting — see `_Pending`.
+    - **Every wait.** A submission is either accepted now or refused now (`admit` never blocks, not
+      even on the loop); a caller waits at most `WRITER_DEADLINE_SECONDS` for its own line;
+      shutdown waits `WRITER_SHUTDOWN_SECONDS` for what is already queued. Each of those is a
+      deadline on a refusal, never an assertion that the line was written.
     - **The writers.** Exactly one thread owns the file — including the closing of it — so there is
       never an old writer and a new one racing over the same segment, and a line that timed out is
       *not* cancelled: the writer this process owns either persists it or latches it. Nothing is
@@ -602,7 +613,32 @@ class Writer:
     A deadline that expires therefore means "not established", and the caller refuses the business
     work it was about to admit. It never means "probably fine": a line whose persistence could not
     be confirmed is latched, not assumed.
+
+    The writer's own lifecycle is one state machine, and it is the reason no caller can ever see half
+    of it:
+
+    - `NEW` — no writer thread has been asked to run. It owns nothing, so a shutdown here has
+      nothing to join and may release the sink itself.
+    - `STARTING` — `Thread.start()` is on the stack. The thread object exists and is published for
+      waiters, but it has not been started yet. A shutdown that arrives now waits for this window to
+      close instead of calling `join` on an unstarted thread, which is the `RuntimeError` the state
+      exists to prevent; the window is bounded by asking `Thread.start` to be quick.
+    - `RUNNING` — the thread has been started. A shutdown sets `STOPPING` and joins it.
+    - `STOPPING` — the stop was requested; the writer is persisting what is already queued, and
+      nothing new is accepted.
+    - `STOPPED` — the writer thread has been started and has ended, so the file has been released by
+      its owner and no second writer is ever built; or the thread was never started at all, in which
+      case this class still owns the file and releases it.
+
+    The transitions are made under `self.lock`, which is a plain mutex and is never held across any
+    system IO.
     """
+
+    NEW = "new"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
 
     def __init__(self, diagnostics):
         self.diagnostics = diagnostics
@@ -610,60 +646,203 @@ class Writer:
         self.queue = queue.Queue(maxsize=WRITE_QUEUE_LIMIT)
         self.attempted = 0
         self.stopping = threading.Event()
-        self.thread = None
-        # One lock for the lifetime of the process, not one per call: `start` is entered
-        # concurrently the first time two threads emit at once, and the check-then-construct below
-        # is only a single decision if both halves happen under the same lock.
+        # The one mutex for this class: it guards the state transitions, the queue insertion that
+        # consumes an admission slot, and the drain-and-settle of the abandoned records. It is never
+        # held across a write, a flush, or a join.
         self.lock = threading.Lock()
-        # Whether a writer has ever been built. It survives the thread exiting, so a process that
-        # has stopped is never handed a second writer over the same sink.
-        self.built = False
+        self.state = self.NEW
+        # How many records have been admitted and not yet settled by the writer. It is the true
+        # measure of outstanding log work, so both producers share it: a synchronous caller and an
+        # asynchronous caller each consume one slot when their record is really queued, and the
+        # slot comes back when the writer is done with that record, never when a caller gives up.
+        self.admitted = 0
+        self.thread = None
+        self.settled = 0
 
-    def start(self):
-        """Start the single writer, at most once in this process, whatever calls in when.
+    # -- admission ---------------------------------------------------------------------------
 
-        The whole decision — has a writer ever been built, is this sink durable, construct it, mark
-        it, start it — is made under one lock. Two threads emitting the first event at the same
-        moment therefore produce one writer and one thread, not two writers over one file handle.
+    def _take(self, pending):
+        """Consume one admission slot for a record that is about to be queued."""
+        pending.taken = True
+        self.admitted += 1
+
+    def _settle(self, pending):
+        """Return the slot of one record the writer is finished with, exactly once.
+
+        Called only by the writer thread, and only for a record that really was admitted. A record
+        the writer never took back — one that was refused, or one whose producer was cancelled
+        before insertion — is settled with `taken` False and changes nothing, which is what keeps
+        this idempotent.
+        """
+        if not pending.taken:
+            return
+        pending.taken = False
+        self.admitted -= 1
+        self.settled += 1
+
+    def slots(self):
+        """How many admission slots are free right now: the writer's own outstanding-work figure."""
+        with self.lock:
+            return WRITE_QUEUE_LIMIT - self.admitted
+
+    def _acquire(self, pending, *, blocking):
+        """Whether one free slot could be taken for `pending`, and what the caller should do next.
+
+        Three verdicts, and the third is the one that matters for cancellation: when the record was
+        not taken, `_settle` must be called on it precisely once by whoever learns that it was not
+        taken. The caller that is already here does that, because it is the only one that will.
+
+        The stop is consulted *here*, under the same lock the shutdown takes, and not only by the
+        producer before it built the record: a stop that arrives while a producer is on its way in
+        must refuse that record rather than accept one that only the shutdown drain could ever
+        write. The queue insertion below is what makes the decision final, because the shutdown sets
+        the stop under this same lock and drains whatever is already in the queue.
         """
         with self.lock:
-            if self.built or not self.sink.durable:
-                return
-            self.built = True
-            thread = threading.Thread(
-                target=self._run, name="tianshu-memory-log-writer", daemon=True
-            )
-            self.thread = thread
-        # Started outside the lock: `Thread.start` runs the first bytecode of the new thread, and
-        # there is no reason for any other caller's `start` to wait behind that.
-        thread.start()
+            if self.stopping.is_set() or self.state == self.STOPPED:
+                return None
+            if self.admitted >= WRITE_QUEUE_LIMIT:
+                self.sink.fail("log_capacity")
+                return None
+            if not blocking and not self._admitted_room_for_a_non_blocking_put():
+                self.sink.fail("log_capacity")
+                return None
+            self._take(pending)
+            try:
+                self.queue.put_nowait(pending)
+            except queue.Full:
+                self.sink.fail("log_capacity")
+                return None
+            self._start()
+            return pending
 
-    def submit(self, pending):
-        """Queue one pending record, or return None because the bounded buffer is already full."""
-        try:
-            self.queue.put(pending, timeout=WRITER_QUEUE_TIMEOUT_SECONDS)
-        except queue.Full:
-            # The one refusal this class makes on its own: the bounded buffer is full, which is a
-            # capacity verdict about the log rather than an unavailable disk. A request refused
-            # here is never admitted, and the record it could not write is never queued twice.
-            self.sink.fail("log_capacity")
+    def _admitted_room_for_a_non_blocking_put(self):
+        """Whether the physical queue also has room, so `put_nowait` cannot be the refusal.
+
+        The caller's own slot count already covers this, and the queue is sized by the same number,
+        so this is a guard rather than a second policy: it keeps the non-blocking producer honest
+        about the queue's real ceiling even if a record is ever abandoned without being dequeued.
+        """
+        return not self.queue.full()
+
+    def admit(self, pending):
+        """Queue one record without ever blocking, or refuse it and latch the sink.
+
+        `None` means the bounded work set is full, the process is stopping, or the sink was already
+        refuted — three forms of the same answer: this process will not take on that line, so the
+        business work it describes must not be admitted either. It is never a silent drop and never
+        a wait: a producer on the event loop may not park, and a producer that must wait is exactly
+        the case this ceiling exists to refuse.
+        """
+        pending = self._acquire(pending, blocking=True)
+        if pending is None:
             return None
         return pending
 
-    async def deliver(self, pending):
-        """Hand one record over and report its verdict to the loop, never to a parked coroutine.
+    def try_admit(self, pending):
+        """`admit` for a caller that must give up its claim before it could ever block.
 
-        This is the event loop's side of the same queue the synchronous caller uses. The blocking
-        `wait` runs on a worker, and the loop is handed back a future rather than being held inside
-        the writer: no coroutine, no task and no probe response is ever parked waiting for an
-        `fsync`.
-
-        A submission the bounded buffer refuses is answered here instead of on a worker, so a full
-        queue cannot consume a worker just to learn that it is full.
+        The only difference from `admit` is that a free admission slot is not enough: the physical
+        queue must have room too. Both producers share the same slot count, so the two cannot
+        disagree about how much outstanding work this process is paying for.
         """
-        if self.submit(pending) is None:
-            return False
-        return await asyncio.get_running_loop().run_in_executor(None, self.wait, pending)
+        return self._acquire(pending, blocking=False)
+
+    # -- lifecycle ---------------------------------------------------------------------------
+
+    def _start(self):
+        """Start the single writer thread, at most once in this process, whatever calls in when.
+
+        Called with `self.lock` held. The whole decision — has a writer ever been started, is this
+        sink durable, construct it, publish it, start it — is one atomic step, so two threads
+        emitting the first event at the same moment produce one writer and one thread rather than
+        two writers over one file handle. The thread object is published before `start()` returns,
+        but the state itself is `STARTING` until it has really been started, so a concurrent
+        shutdown cannot mistake a published object for a running one.
+        """
+        if self.state != self.NEW or not self.sink.durable:
+            return
+        thread = threading.Thread(target=self._run, name="tianshu-memory-log-writer", daemon=True)
+        self.thread = thread
+        self.state = self.STARTING
+        try:
+            thread.start()
+        except BaseException:
+            # The thread never ran, so it owns nothing and there is nothing to join. The sink stays
+            # with this class, which is also what a shutdown in this state expects to find.
+            self.state = self.STOPPED
+            raise
+        self.state = self.RUNNING
+
+    def start(self):
+        """Start the single writer, at most once in this process, whatever calls in when."""
+        with self.lock:
+            self._start()
+
+    def shutdown(self):
+        """Stop accepting, drain what is queued, and wait a bounded time for the writer to end.
+
+        Returns True only when the one writer thread has really finished — which is also the moment
+        the file is released, because that thread owns the handle. A False means the writer did not
+        end inside the deadline: it may still be inside a `write` or an `fsync` the kernel has not
+        returned from. That is reported as unconfirmed rather than papered over: the caller must not
+        treat it as a closed file, nothing here closes the handle out from under a live writer, and
+        no second writer is ever built to replace it.
+
+        A writer whose thread has not been started yet is never joined: the state is consulted under
+        the same lock the start uses, so this can only ever see `NEW` (nothing to join), `RUNNING`
+        (join it), or `STOPPED` (nothing left to join). The `STARTING` window is waited out, and that
+        wait is bounded, so a shutdown cannot be parked forever by a start that never returns.
+        """
+        deadline = time.monotonic() + WRITER_SHUTDOWN_SECONDS
+        with self.lock:
+            self.stopping.set()
+            while self.state == self.STARTING and time.monotonic() < deadline:
+                # `Thread.start` is on someone else's stack. Releasing the lock is what lets it
+                # finish; taking it again is what makes the state below a decision rather than a
+                # guess.
+                self.lock.release()
+                try:
+                    time.sleep(0.001)
+                finally:
+                    self.lock.acquire()
+            if self.state == self.NEW:
+                # No writer was ever started, so nothing else can be holding the file: the process
+                # that assembled this adapter is the only thing that could have, and it did not.
+                # Any record that is somehow queued here is settled rather than left taken.
+                self._abandon_queued()
+                self.state = self.STOPPED
+                self.sink.close()
+                return True
+            if self.state == self.STARTING:
+                # The start did not complete inside the deadline. This is the same "unconfirmed"
+                # verdict as a join that ran out of patience, and it is deliberately not a join:
+                # joining an unstarted thread is the error this whole state machine removes.
+                return False
+            if self.state == self.STOPPED:
+                return not (self.thread is not None and self.thread.is_alive())
+            thread = self.thread
+        thread.join(max(0.0, deadline - time.monotonic()))
+        ended = not thread.is_alive()
+        if ended:
+            with self.lock:
+                self.state = self.STOPPED
+        return ended
+
+    def _abandon_queued(self):
+        """Settle every queued record for a writer that never ran. Called with the lock held."""
+        while True:
+            try:
+                pending = self.queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                pending.failed = True
+            finally:
+                pending.done.set()
+                self._settle(pending)
+
+    # -- the writer thread -------------------------------------------------------------------
 
     def wait(self, pending):
         """Whether this exact line reached durable storage. A timeout is a refusal, not a maybe."""
@@ -682,6 +861,17 @@ class Writer:
             pending.failed = True
             return False
         return pending.persisted and not pending.failed
+
+    async def await_verdict(self, pending):
+        """Wait for one already-admitted record without ever holding the loop.
+
+        The blocking `wait` runs on a worker, and the loop is handed back a future rather than being
+        held inside the writer: no coroutine, no task and no probe response is ever parked waiting
+        for an `fsync`. Cancelling this await cancels only the caller's interest — the record is
+        already admitted, the writer still owns it, and its admission slot is returned by the writer
+        when it is really done. That is what stops a cancelled waiter from manufacturing capacity.
+        """
+        return await asyncio.get_running_loop().run_in_executor(None, self.wait, pending)
 
     def _run(self):
         """Own the file until told to stop: persist, or latch, every record in arrival order.
@@ -733,16 +923,26 @@ class Writer:
                         self.sink.sequence = sequence
                 finally:
                     pending.done.set()
+                    # The record is finished with — persisted, or latched as failed — so this is
+                    # exactly when its admission slot comes back. Not when the caller stopped
+                    # waiting: a cancelled caller leaves the record in the writer's hands, and the
+                    # capacity it occupies has to stay spent until the writer really is done.
+                    self._settle(pending)
         finally:
             # Every line still queued when this thread ends is latched rather than retried: the
             # process is stopping, and pretending these were written is exactly what the latch is
-            # for. Nothing here is re-submitted or re-executed.
+            # for. Nothing here is re-submitted or re-executed, and each of these records returns
+            # its admission slot here too, because the writer is what really gives it back.
             while True:
                 try:
                     pending = self.queue.get_nowait()
                 except queue.Empty:
                     break
-                pending.done.set()
+                try:
+                    pending.failed = True
+                finally:
+                    pending.done.set()
+                    self._settle(pending)
             # The file is released *here*, by the one thread that ever owned it, and only after
             # this thread has stopped writing to it. Closing the handle somewhere else would mean a
             # caller taking a file the writer may still be flushing — a second owner of a descriptor
@@ -750,27 +950,6 @@ class Writer:
             # happened to call shutdown. A shutdown that ran out of patience therefore leaves the
             # handle exactly where it belongs: it is released when this thread really exits.
             self.sink.close()
-
-    def shutdown(self):
-        """Stop accepting, drain what is queued, and wait a bounded time for the writer to end.
-
-        Returns True only when the one writer thread has really finished — which is also the moment
-        the file is released, because that thread owns the handle. A False means the writer did not
-        end inside the deadline: it may still be inside a `write` or an `fsync` the kernel has not
-        returned from. That is reported as unconfirmed rather than papered over: the caller must not
-        treat it as a closed file, nothing here closes the handle out from under a live writer, and
-        no second writer is ever built to replace it.
-        """
-        with self.lock:
-            thread = self.thread
-            if thread is None:
-                # No writer was ever built, so nothing else can be holding the file: the process
-                # that assembled this adapter is the only thing that could have, and it did not.
-                self.sink.close()
-                return True
-        self.stopping.set()
-        thread.join(WRITER_SHUTDOWN_SECONDS)
-        return not thread.is_alive()
 
 
 class Diagnostics:
@@ -788,7 +967,6 @@ class Diagnostics:
         "stopping",
         "token_env",
         "writer",
-        "writes_in_flight",
     )
 
     def __init__(
@@ -806,11 +984,6 @@ class Diagnostics:
         self.sink = sink if sink is not None else Sink(settings["log_directory"], self.instance_id)
         self.stopping = threading.Event()
         self.writer = Writer(self)
-        # The async side's admission, built on first use because a semaphore binds to the loop that
-        # awaits it. Its ceiling is the same `WRITE_QUEUE_LIMIT` the writer's own queue uses, so the
-        # number of outstanding log operations is one bound rather than two unrelated ones: a worker
-        # moved off the loop is still a worker this process is paying for.
-        self.writes_in_flight = None
         if self.sink.durable and self.sink.sequence == 0:
             # A process that restarts with the same instance id must not repeat numbers inside the
             # file it is appending to. This is read once, before anything is written, and only ever
@@ -883,12 +1056,13 @@ class Diagnostics:
         The record is handed to the writer unnumbered on purpose: the number is allocated on the
         thread that writes, so the file's order and the numbers' order cannot disagree however many
         threads call this at once.
+
+        Nothing is started here. The writer is started by the admission of the record that needs it,
+        after that record is really in the queue, so a shutdown can never run between "the writer
+        exists" and "the writer has something to write" — in that order the stop would always win
+        and a record the caller had already been promised would be lost.
         """
         scope = _scope.get()
-        if self.sink.durable:
-            # One writer, started once: the process's first event creates it. Nothing else ever
-            # creates it, so there is never a second writer over the same file.
-            self.writer.start()
         return _Pending(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -940,7 +1114,7 @@ class Diagnostics:
             # now would sit in a queue nothing will read. It is refused instead of being accepted
             # and quietly forgotten.
             return False
-        pending = self.writer.submit(
+        pending = self.writer.admit(
             self._build(
                 name, level=level, outcome=outcome, error_code=error_code, duration_ms=duration_ms
             )
@@ -958,9 +1132,17 @@ class Diagnostics:
         do is stop this loop from answering a liveness probe while it does. Handing the wait to
         `asyncio.to_thread` alone would move that problem rather than solve it, because the default
         executor's queue is unbounded: a burst that outran the writer would pile up there instead,
-        and the writer's own `WRITE_QUEUE_LIMIT` would describe nothing. So admission is bounded
-        first, by the same number, and a caller that cannot get in within the queue deadline is
-        refused and latches the sink exactly as a full queue is.
+        and the writer's own `WRITE_QUEUE_LIMIT` would describe nothing.
+
+        So the admission is the writer's own bounded work set, and it is taken *only* by a record
+        that really reaches the shared queue (`Writer.try_admit`). There is no separate async gate
+        in front of it: a second gate would be a second opinion about capacity, and it would be one
+        the writer cannot see, which is how a cancelled waiter could hand back a slot whose work had
+        not finished. Here the slot belongs to the record, so cancelling this coroutine cannot free
+        anything, and the record the writer is still holding is still counted.
+
+        Nothing in this method ever waits on the queue, so a full log can never park the loop: a
+        record that cannot get in is refused now and latches the sink.
 
         Every refusal here is a `False`, never an exception: the caller decides whether the work it
         was about to admit may happen, which is the same contract `emit` has.
@@ -984,23 +1166,17 @@ class Diagnostics:
         return await self._deliver(record)
 
     async def _deliver(self, pending):
-        """Admit one built record under the shared ceiling, then wait off the loop."""
-        if self.writes_in_flight is None:
-            self.writes_in_flight = asyncio.Semaphore(WRITE_QUEUE_LIMIT)
-        try:
-            await asyncio.wait_for(
-                self.writes_in_flight.acquire(), timeout=WRITER_QUEUE_TIMEOUT_SECONDS
-            )
-        except (TimeoutError, asyncio.TimeoutError):
-            # The bounded admission is full, so this process already has as much log work in
-            # flight as it will pay for. That is a capacity verdict about the log, and it is
-            # refused and latched rather than queued into a second, unbounded one.
-            self.sink.fail("log_capacity")
+        """Admit one built record into the writer's bounded work set, then wait off the loop.
+
+        Cancellation reaches exactly one place: the `await` below. The record stays admitted and the
+        writer stays responsible for it, so this coroutine disappearing changes nothing about the
+        work, the capacity it occupies, or the bytes it produces. Its verdict is simply no longer
+        collected by anyone — which is the honest outcome, because the caller is gone.
+        """
+        admitted = self.writer.try_admit(pending)
+        if admitted is None:
             return False
-        try:
-            return await self.writer.deliver(pending)
-        finally:
-            self.writes_in_flight.release()
+        return await self.writer.await_verdict(admitted)
 
     def _refuse_unaccountable(self):
         """Whether business work must be refused because its record could not be made durable.

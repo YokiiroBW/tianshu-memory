@@ -9,6 +9,7 @@ stopped matching the contract would fail rather than quietly redefine it.
 import asyncio
 import contextlib
 import json
+import queue
 import re
 import threading
 import time
@@ -63,6 +64,11 @@ FIELDS = (
     "error_code",
 )
 LEGAL = "0123456789abcdef0123456789abcdef"
+# How many asynchronous callers the cancellation regression really starts and cancels before it
+# fills the rest of the bounded work set directly. Each of them occupies a worker thread for as long
+# as its wait is held, and the default executor has its own, unrelated ceiling: this is a bound on
+# the test's own resource use, not a statement about the writer's capacity.
+CANCELLED_CALLERS = 6
 
 
 @pytest.fixture
@@ -1300,32 +1306,26 @@ def test_the_async_admission_is_bounded_and_never_moved_to_an_unbounded_pool(tmp
 
     `asyncio.to_thread` (and any bare `run_in_executor`) parks work on the default executor, whose
     queue has no ceiling. The writer's `WRITE_QUEUE_LIMIT` would then describe a queue that is not
-    the one the work is actually waiting in. The loop's admission is bounded by the same number, so
-    a burst that outruns the disk is refused and latched rather than accumulated.
+    the one the work is actually waiting in. So the ceiling is the writer's own admission, and this
+    test watches the thing that would really grow: how many `wait` calls were parked on workers at
+    once. A burst past the ceiling must be refused and latched, not accumulated somewhere else.
     """
     adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
     admitted = []
     lock = threading.Lock()
     peak = [0]
+    parked = [0]
+    real_wait = Writer.wait
 
-    class Tracked(asyncio.Semaphore):
-        """The adapter's own admission, watched: how many waits got past the gate at once."""
-
-        def __init__(self, value):
-            super().__init__(value)
-            self.holding = 0
-
-        async def acquire(self):
-            await super().acquire()
+    def watched_wait(self, pending):
+        with lock:
+            parked[0] += 1
+            peak[0] = max(peak[0], parked[0])
+        try:
+            return real_wait(self, pending)
+        finally:
             with lock:
-                self.holding += 1
-                peak[0] = max(peak[0], self.holding)
-            return True
-
-        def release(self):
-            with lock:
-                self.holding -= 1
-            super().release()
+                parked[0] -= 1
 
     async def burst():
         async def one(index):
@@ -1335,15 +1335,14 @@ def test_the_async_admission_is_bounded_and_never_moved_to_an_unbounded_pool(tmp
 
         await asyncio.gather(*(one(index) for index in range(WRITE_QUEUE_LIMIT * 3)))
 
-    adapter.writes_in_flight = Tracked(WRITE_QUEUE_LIMIT)
-    with injected_writes(delay=0.05):
+    with injected_writes(delay=0.05), patch.object(Writer, "wait", watched_wait):
         asyncio.run(burst())
         assert False in admitted, "a burst past the admission must be refused, not queued"
         assert adapter.sink.failure == "log_capacity"
         assert adapter.log_state() == "log_capacity"
-        # The ceiling is real and is the writer's own number: at most `WRITE_QUEUE_LIMIT` blocking
-        # waits were ever parked on workers, so the work moved off the loop cannot become a larger,
-        # separate backlog in the executor's queue.
+        # The ceiling is the writer's own number: at most `WRITE_QUEUE_LIMIT` waits were ever parked
+        # on workers, so the work moved off the loop cannot become a larger, separate backlog in the
+        # executor's queue.
         assert peak[0] <= WRITE_QUEUE_LIMIT, f"{peak[0]} log waits ran at once"
         adapter.shutdown()
     # Nothing was dropped silently: every admitted record is in the file exactly once, numbered
@@ -1351,6 +1350,240 @@ def test_the_async_admission_is_bounded_and_never_moved_to_an_unbounded_pool(tmp
     numbers = sorted(line["sequence"] for line in segment_lines(adapter))
     assert numbers == list(range(1, len(numbers) + 1))
     assert 0 < len(numbers) <= WRITE_QUEUE_LIMIT * 2
+
+
+def test_a_cancelled_waiter_never_hands_back_capacity_it_did_not_finish(tmp_path):
+    """The third review's finding: cancelling `aemit` freed a slot whose work had not finished.
+    The old code released its own semaphore in a `finally`, so cancelling the waiter gave the
+    capacity back while the record was still in the writer's queue and the writer was still working
+    on it. After cancelling 65 waits the log showed 64 free slots while holding 65 records, and the
+    next `aemit` then blocked the event loop inside a synchronous `queue.put` — a 10 ms heartbeat
+    took 251 ms, which is exactly the failure the bounded design exists to prevent.
+
+    Both halves of that are measured here without waiting on any timing window:
+
+    - Every caller is cancelled once its record is provably admitted and its wait is provably parked
+      on a worker. Nothing else can finish that work, so the capacity it spent must stay spent, and
+      the next call must be *refused at once* rather than parked on a queue.
+    - Every record is still written exactly once, in order, because the writer that owns them is the
+      only thing that settles them — which is also what returns their slots.
+
+    The wait is parked rather than cancelled by a delay, and there is no sleep between the holds: a
+    test that raced the writer would prove nothing about which of the two released the capacity.
+    """
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    real_write = Sink.write
+    real_wait = Writer.wait
+    entered = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    parked = [0]
+    writes = [0]
+
+    class _Stub:
+        """One admitted record's slot, for the capacity this test fills without a real caller."""
+
+        __slots__ = ("done", "failed", "persisted", "record", "taken")
+
+        def __init__(self):
+            self.done = threading.Event()
+            self.failed = False
+            self.persisted = False
+            self.record = {}
+            self.taken = True
+
+    def held(self, line, sequence):
+        # The one write is held for the whole measurement: the writer is then the only thing in this
+        # process that can finish the work, so every slot it is holding really is spent.
+        with lock:
+            writes[0] += 1
+        entered.set()
+        assert release.wait(10), "the test never released the writer"
+        return real_write(self, line, sequence)
+
+    def parked_wait(self, pending):
+        """The one blocking wait every caller's verdict comes from, counted once it is running.
+
+        This is the only place a caller can be cancelled, and it is inside the executor's work
+        function, so the counter below is set when the wait is provably on a worker rather than
+        queued behind one.
+        """
+        with lock:
+            parked[0] += 1
+        return real_wait(self, pending)
+
+    async def scenario():
+        async def until(condition, what, limit=5000):
+            """Wait for a bounded moment, then say exactly what never happened.
+
+            Each spin yields to the loop: a tight poll would never let the very task this is waiting
+            for make its first step, which is the mistake the poll's own failure message reports.
+            """
+            for _ in range(limit):
+                if condition():
+                    return True
+                await asyncio.sleep(0.001)
+            raise AssertionError(f"{what} (parked {parked[0]}, admitted {adapter.writer.admitted})")
+
+        results = {}
+
+        with (
+            patch.object(Sink, "write", held),
+            patch.object(Writer, "wait", parked_wait),
+        ):
+            # One record inside the writer's hands, whose caller goes away.
+            first = asyncio.ensure_future(adapter.aemit("request.started", outcome="started"))
+            await until(lambda: parked[0] == 1, "the first wait never reached a worker")
+            assert entered.is_set(), "the writer never reached its held write"
+            first.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await first
+
+            # Then several more, each cancelled only once its wait is provably running on a worker.
+            # The threads that hold the earlier waits stay occupied — which is what makes them real —
+            # so this is done a bounded number of times rather than once per slot: the executor has
+            # its own thread ceiling and this test is not the place to find it.
+            for index in range(1, CANCELLED_CALLERS):
+                pending = asyncio.ensure_future(adapter.aemit("request.started", outcome="started"))
+                await until(lambda: parked[0] == index + 1, f"wait {index} never reached a worker")
+                pending.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pending
+
+            # The remaining capacity is taken directly, so that the work set really is full while
+            # the writer is still held. These are placeholders rather than records: they are never
+            # dequeued during the measurement, and the writer latches and drops them on the way out.
+            while adapter.writer.admitted < WRITE_QUEUE_LIMIT:
+                slot = _Stub()
+                with adapter.writer.lock:
+                    adapter.writer._take(slot)
+                    adapter.writer.queue.put_nowait(slot)
+
+            results["parked"] = parked[0]
+            results["admitted"] = adapter.writer.admitted
+            results["slots_free"] = adapter.writer.slots()
+            results["writes"] = writes[0]
+
+            # The capacity that was spent must still be spent: this call is refused at once rather
+            # than waiting for a queue it cannot enter.
+            started = time.monotonic()
+            results["refused"] = await adapter.aemit("request.started", outcome="started")
+            results["refusal_seconds"] = time.monotonic() - started
+            results["admitted_after"] = adapter.writer.admitted
+
+            release.set()
+            results["shutdown"] = await adapter.ashutdown()
+
+        return results
+
+    results = asyncio.run(scenario())
+
+    # Every slot is still spent although none of the callers who took one is waiting any more: that
+    # is the whole finding. The old code reported every slot free with the same records still held.
+    assert results["parked"] == CANCELLED_CALLERS, results
+    assert results["admitted"] == WRITE_QUEUE_LIMIT, results
+    assert results["slots_free"] == 0, f"{results['slots_free']} slots came back early: {results}"
+    assert results["writes"] == 1, f"the writer left its only write early: {results}"
+    assert results["refused"] is False, results
+    assert results["admitted_after"] == WRITE_QUEUE_LIMIT, results
+    # The refusal is immediate and the loop is never parked: the old code blocked a whole queue
+    # deadline in `queue.put` here, which is what showed up as a 251 ms heartbeat.
+    assert results["refusal_seconds"] < 0.05, results
+    assert bool(results["shutdown"]) is True, results
+    assert adapter.sink.failure == "log_capacity"
+    # Every real record that was admitted is in the file exactly once, in order, even though every
+    # single caller was cancelled before its verdict arrived. The placeholders ahead of them are
+    # numbered in the same run and in the same order, which is the other half of the same rule: the
+    # writer numbers what it really took, and takes them in arrival order.
+    numbers = [line["sequence"] for line in segment_lines(adapter)]
+    assert numbers == list(range(1, WRITE_QUEUE_LIMIT + 1)), numbers[-3:]
+    assert adapter.writer.admitted == 0
+    assert adapter.writer.slots() == WRITE_QUEUE_LIMIT
+
+
+def test_shutdown_waits_for_a_start_in_progress_and_never_joins_it(tmp_path):
+    """The third review's finding: `shutdown` could join a thread published before `start` ran.
+
+    `Writer.start` published the thread object inside the lock and then called `Thread.start` outside
+    it, so a shutdown arriving in that window saw a thread that existed but had never run, and `join`
+    on it raised `RuntimeError: cannot join thread before it is started`. The state machine removes
+    the window instead of catching the error: the published object is only ever `STARTING`, and a
+    shutdown in that state waits for the start to finish rather than joining it.
+
+    The record here is admitted *before* the window opens — it is genuinely in the queue — so this is
+    the case the shutdown drain exists for: the stop is requested, the shutdown waits, the writer
+    starts inside that wait and persists the line, and the shutdown then confirms the end. Without
+    that ordering the stop would rightly win and refuse the record, which the last check covers.
+    """
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    original = threading.Thread.start
+    admitted = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
+    real_put = queue.Queue.put_nowait
+    result = []
+    outcome = []
+    inside = []
+
+    def watched_put(self, pending):
+        value = real_put(self, pending)
+        admitted.set()
+        return value
+
+    def delayed(self):
+        if self.name == "tianshu-memory-log-writer":
+            entered.set()
+            assert release.wait(5), "the test never released the start"
+        return original(self)
+
+    def stopping():
+        inside.append(adapter.writer.state)
+        outcome.append(adapter.shutdown())
+
+    with (
+        patch.object(queue.Queue, "put_nowait", watched_put),
+        patch.object(threading.Thread, "start", delayed),
+    ):
+        caller = threading.Thread(target=lambda: result.append(adapter.emit("runtime.started")))
+        caller.start()
+        assert admitted.wait(5), "the first record never reached the queue"
+        assert entered.wait(5), "the first emit never reached Thread.start"
+        # The record is queued and the thread object is published but not started. This must not
+        # raise, and it must wait rather than join.
+        stopper = threading.Thread(target=stopping)
+        stopper.start()
+        time.sleep(0.05)
+        assert stopper.is_alive(), "the shutdown must wait out the start window, not join it"
+        assert inside == [Writer.STARTING], inside
+        release.set()
+        caller.join(5)
+        stopper.join(5)
+
+    assert result == [True], result
+    assert outcome == [True], outcome
+    assert adapter.writer.state == Writer.STOPPED
+    assert adapter.writer.thread.is_alive() is False
+    assert [line["sequence"] for line in segment_lines(adapter)] == [1]
+    # And the stop is final: no writer is rebuilt behind it, and nothing is accepted afterwards.
+    assert adapter.emit("runtime.stopped") is False
+    assert [line["sequence"] for line in segment_lines(adapter)] == [1]
+    assert adapter.writer.admitted == 0
+    assert adapter.writer.slots() == WRITE_QUEUE_LIMIT
+
+
+def test_the_unstarted_thread_shutdown_used_to_join_is_exactly_the_reviewer_error():
+    """What the state machine removes, stated as the error it removes.
+
+    The reviewer's probe published the thread, patched `Thread.start` so it paused, and called
+    `join` on the published-but-unstarted thread. That is not a hypothetical shape: it is a real
+    `RuntimeError`. Keeping the reproduction here means the states above are pinned to a failure that
+    really exists, so a later change that publishes a thread before it is started fails this file
+    rather than only the reviewer's probe.
+    """
+    thread = threading.Thread(target=lambda: None)
+    with pytest.raises(RuntimeError) as error:
+        thread.join(1)
+    assert str(error.value) == "cannot join thread before it is started"
 
 
 def test_the_writer_owns_the_file_and_a_timed_out_shutdown_never_takes_it(tmp_path, monkeypatch):
