@@ -814,12 +814,44 @@ class Writer:
                 target=self._run, name="tianshu-memory-log-writer", daemon=True
             )
         except BaseException:
-            self._start_outcome = self.START_FAILED
+            # Publish the failure *here*, under the lock that just observed it, rather than leaving the
+            # state at `NEW` for a later recovery call to notice. A failed construction that leaves
+            # `NEW` behind is a second start attempt waiting to happen: the next producer sees a
+            # writer that has not been built yet, builds one, and starts it — so the process ends up
+            # with a live writer and a healthy `available()`, and the failure that was supposed to
+            # latch is erased. See `_fail_start` for what has to be true before this lock is released.
+            self._fail_start()
             return None, True
         self.thread = thread
         self.state = self.STARTING
         self._lock_held = True
         return thread, False
+
+    def _fail_start(self):
+        """Close the process on a start that failed, atomically with observing it. Under the lock.
+
+        Every fact a later caller could use to talk itself into a second writer has to be settled
+        before this lock is released, because the failure of a start attempt is exactly the moment
+        the one-start-attempt rule is most tempting to break: the state is `NEW` and the sink is
+        still open, which looks indistinguishable from "no one has tried yet".
+
+        So this runs in one step with the exception that caused it: the start outcome is recorded as
+        failed, the thread is dropped, the sink is latched (which is what makes readiness and every
+        later admission refuse), the records that were admitted while the attempt was being made are
+        settled — each one explicitly failed, which is also what returns its admission slot — and the
+        state leaves `NEW`/`STARTING` for `STOPPED`, where `_begin_start` will never build a writer
+        again and a shutdown has nothing to join.
+
+        What is deliberately *not* here is closing the file: this class still owns it, but closing is
+        IO, and this runs with the lock held. The caller that observed the failure does that
+        immediately afterwards, in `_recover_from_start_failure`.
+        """
+        self._lock_held = False
+        self._start_outcome = self.START_FAILED
+        self.thread = None
+        self.sink.fail("log_unavailable")
+        self._abandon_queued()
+        self.state = self.STOPPED
 
     def _start(self):
         """Start the single writer thread, at most once in this process, whatever calls in when.
@@ -835,15 +867,18 @@ class Writer:
         right now" from "the state is merely not `RUNNING` yet" — and give up on the first.
 
         A start that fails is a closed process, not an escaping exception, and both ways it can fail
-        end in the same place: the thread never ran, so it owns nothing and there is nothing to join;
-        what remains is everything already admitted, which the failure path settles and latches.
-        `admit` and `try_admit` then refuse — the callers see a log that is unavailable, which is
-        true, rather than a thread error from a path whose contract says it cannot raise one.
+        end in the same place: `_fail_start` settles it inside the lock that observed the failure, so
+        the thread never ran, it owns nothing, there is nothing to join, and the process is already
+        refusing new records by the time this call returns. `admit` and `try_admit` then report an
+        ordinary refusal — the callers see a log that is unavailable, which is true, rather than a
+        thread error from a path whose contract says it cannot raise one.
 
         A caller that finds a start already under way is not a failure and must not be treated as
         one: it refuses nothing, latches nothing and releases nothing. That is what `failed` from
         `_begin_start` distinguishes — the writer is being built by someone else, so this caller's
-        record waits for that writer exactly like any other record in the queue.
+        record waits for that writer exactly like any other record in the queue. A caller that
+        arrives while another is *failing* is not that case either: `_fail_start` has already moved
+        the state out of `NEW` under the same lock, so it sees a stopped writer and is refused.
         """
         with self.lock:
             thread, failed = self._begin_start()
@@ -854,6 +889,8 @@ class Writer:
         try:
             thread.start()
         except BaseException:
+            with self.lock:
+                self._fail_start()
             self._recover_from_start_failure()
             return
         with self.lock:
@@ -862,28 +899,19 @@ class Writer:
             self.state = self.RUNNING
 
     def _recover_from_start_failure(self):
-        """Fail closed after a writer that could not be started.
+        """Release the file after a start that failed, and nothing else.
 
-        Called with the lock released, so that the settlement inside can take it. The order matters:
-        the sink is latched first, which is what makes every later producer refuse and readiness
-        report the log as unavailable; then the records that were admitted but never handed to a
-        writer are settled, which is what returns their slots and releases any caller already waiting
-        on them; then the file this class still owns is closed, because the writer that would
-        normally close it never ran.
+        The failure itself is already fully published — latched sink, settled records, `STOPPED`
+        state — by `_fail_start`, under the lock that observed it, so that no producer can slip in
+        between and build the writer this process just decided it cannot have. All that is left is
+        the one thing that could not be done there: closing the handle this class still owns, because
+        the writer that would normally own it never ran, and because closing is IO.
 
-        `_seal` owns all of that, so this path and a shutdown that arrives at the same moment take it
-        exactly once between them — it is guarded by the `STARTING` → `STOPPED` transition. Nothing
-        here starts another writer, re-submits anything, or keeps the thread object: the process has
-        exactly as many writers as it managed to start.
+        The close is idempotent, so it is safe for whichever caller observed the failure to do it
+        even if a concurrent shutdown has already reported the writer settled. Nothing here builds a
+        writer, re-submits anything, or touches the state.
         """
-        with self.lock:
-            if self.state in (self.NEW, self.STARTING):
-                self._lock_held = False
-                self._start_outcome = self.START_FAILED
-                self.thread = None
-                # The state stays `STARTING`, which is literally true — a start was attempted and is
-                # over — and is also the branch `_seal` uses for a writer that never got to run.
-                self._seal()
+        self.sink.close()
 
     def start(self):
         """Start the single writer, at most once in this process, whatever calls in when."""
@@ -910,7 +938,9 @@ class Writer:
         One guarded branch decides everything, and it is guarded by a state transition, so two
         threads arriving here — two shutdown callers, or a shutdown racing a failed start — cannot
         both settle the same records, close the same sink, or report different things about the
-        same file.
+        same file. A failed start reaches the `STOPPED` branch rather than the one below it, because
+        `_fail_start` already moved the state there while it held this lock; the `NEW`/`STARTING`
+        branch is what a shutdown arriving before any start has been attempted uses.
 
         `Thread.start` is the only thing here that touches the kernel, and it cannot be holding the
         lock: it releases it before it is called. A failed start is latched as `log_unavailable`,
@@ -926,8 +956,8 @@ class Writer:
         if self.state in (self.NEW, self.STARTING):
             # Nothing was ever handed to a writer: the only records that can be queued here are those
             # admitted while the start was being attempted, and this class still owns the file.
-            if self._start_outcome == self.START_FAILED:
-                self.sink.fail("log_unavailable")
+            # A start that failed never reaches this branch — `_fail_start` moved the state to
+            # `STOPPED` itself, in the same step as observing the failure.
             self._abandon_queued()
             self.thread = None
             self.state = self.STOPPED
@@ -935,7 +965,10 @@ class Writer:
             self.sink.close()
             return True
         if self.state == self.STOPPED:
-            # Already sealed: the writer ended and settled everything, or the failed start did.
+            # Already sealed: the writer ended and settled everything, or a failed start did. The
+            # failed-start file is released by the caller that observed the failure, outside this
+            # lock, so nothing further is owed here — and no record can appear in it afterwards,
+            # because the same failure that stopped the writer also latched the sink.
             if self._start_outcome == self.START_FAILED:
                 return True
             return self.thread is None or not self.thread.is_alive()

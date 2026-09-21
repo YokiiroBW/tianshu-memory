@@ -1697,6 +1697,139 @@ def test_a_writer_that_cannot_be_constructed_fails_closed_instead_of_raising(tmp
     assert adapter.shutdown() is True
 
 
+def test_other_producers_cannot_build_the_writer_after_a_construction_failed(tmp_path):
+    """The fifth review's finding: the window between a failed construction and its recovery.
+
+    `_begin_start` used to record the failure and return while `state` was still `NEW`, and the
+    settlement happened later, in a separate call that had to take the lock again. Inside that window
+    the process looks exactly like one that has not tried to start a writer yet — so another producer
+    claimed the same one start attempt, built a second writer, started it, and both records came back
+    `true`. Measured on the previous candidate, with the reviewer's own probe: two construction
+    attempts, `failure is None`, `available()` true, state `running`.
+
+    The window is held open rather than raced. The holder is parked on the boundary call that both
+    revisions have — the recovery that follows a failed start — and the other producers are released
+    while that call is still inside: on the previous candidate the failure was not published yet at
+    that instant, which is the whole defect; on this revision it already is. So this test does not
+    merely pass now, it fails on the state transition the review rejected.
+
+    Waiting here is the point of the test, so it is bounded rather than forbidden: if the window is
+    never reached, the deadline fails the test instead of hanging it.
+    """
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    attempts = []
+    results = []
+    real_thread = threading.Thread
+
+    def writers_alive():
+        """The writer threads alive right now, by the one name this class gives them."""
+        return [
+            thread for thread in threading.enumerate() if thread.name == "tianshu-memory-log-writer"
+        ]
+
+    writers_before = writers_alive()
+
+    # An explicit arrival count with a deadline, not a `Barrier`: the failure path holds a lock the
+    # other producers need, so they arrive at a point where they cannot proceed and then wait, and a
+    # reusable barrier would let one slow arrival break the rendezvous for everybody else.
+    arrived = threading.Semaphore(0)
+    released = threading.Event()
+    producers = 4
+    schedule = threading.Lock()
+    in_failure_window = threading.Event()
+    window_attempts = []
+    window_states = []
+
+    def construct(*args, **kwargs):
+        # Only the very first construction fails; any later attempt would succeed, which is precisely
+        # what makes this test able to tell "refused" from "quietly replaced the writer with another".
+        if kwargs.get("name") == "tianshu-memory-log-writer":
+            with schedule:
+                attempts.append(1)
+                attempt_number = len(attempts)
+            if attempt_number == 1:
+                raise RuntimeError("synthetic constructor failure")
+        return real_thread(*args, **kwargs)
+
+    def producer(index):
+        arrived.release()
+        released.wait(10)
+        outcome = adapter.emit("request.completed", level="INFO", outcome="succeeded")
+        with schedule:
+            results.append((index, outcome))
+
+    def first():
+        outcome = adapter.emit("request.started", level="INFO", outcome="started")
+        with schedule:
+            results.append(("first", outcome))
+
+    original_recover = adapter.writer._recover_from_start_failure
+
+    def held_recover():
+        # Everything the failure publishes has been published by the time this call is entered — that
+        # is the property under test. The producers run while this call is still inside.
+        with schedule:
+            window_states.append(adapter.writer.state)
+        in_failure_window.set()
+        for _ in range(producers):
+            # Bounded: a producer that never arrives fails the deadline instead of hanging the suite.
+            assert arrived.acquire(timeout=10), "a producer never reached the failure window"
+        with schedule:
+            window_attempts.append(len(attempts))
+        released.set()
+        return original_recover()
+
+    with patch.object(diagnostics.threading, "Thread", construct):
+        with patch.object(adapter.writer, "_recover_from_start_failure", held_recover):
+            holder = threading.Thread(target=first)
+            holder.start()
+            assert in_failure_window.wait(10), "the constructor failure was never observed"
+            others = [
+                threading.Thread(target=producer, args=(index,)) for index in range(producers)
+            ]
+            for thread in others:
+                thread.start()
+            holder.join(15)
+            for thread in others:
+                thread.join(15)
+            assert not holder.is_alive()
+            assert not any(thread.is_alive() for thread in others)
+
+    # The failure was published before the lock was released: while the window was still open, the
+    # only construction attempt this process ever made was the one that failed, and the writer was
+    # already stopped rather than sitting in `NEW` where a second producer could claim it.
+    assert window_states == [Writer.STOPPED], window_states
+    assert window_attempts == [1], window_attempts
+
+    # The failed start is the only one that was ever attempted, and it closed the process.
+    assert attempts == [1], attempts
+    assert sorted(results, key=lambda row: str(row[0])) == [
+        (0, False),
+        (1, False),
+        (2, False),
+        (3, False),
+        ("first", False),
+    ], sorted(results)
+    assert adapter.sink.failure == "log_unavailable"
+    assert adapter.available() is False
+    assert adapter.writer.state == Writer.STOPPED
+    assert adapter.writer._start_outcome == Writer.START_FAILED
+    # No writer was started to replace the one that could not be built. The comparison is against the
+    # writers that existed before this test ran, because a writer another test left behind would make
+    # an absolute count a fact about the whole process rather than about this adapter.
+    assert adapter.writer.thread is None
+    assert adapter.writer.admitted == 0
+    assert adapter.writer.queue.qsize() == 0
+    assert adapter.writer.slots() == WRITE_QUEUE_LIMIT
+    assert writers_alive() == writers_before
+    # And the stop is stable: repeating it neither settles twice nor resurrects anything.
+    assert adapter.shutdown() is True
+    assert adapter.shutdown() is True
+    assert adapter.writer.admitted == 0
+    assert adapter.writer.queue.qsize() == 0
+    assert [line for line in segment_lines(adapter)] == []
+
+
 def test_a_latched_start_refuses_the_real_request_before_the_business_call_runs(tmp_path):
     """The refusal has to reach the HTTP seam, not only `emit`: this is the 503 the card names.
 
