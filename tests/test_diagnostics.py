@@ -9,7 +9,6 @@ stopped matching the contract would fail rather than quietly redefine it.
 import asyncio
 import contextlib
 import json
-import queue
 import re
 import threading
 import time
@@ -23,6 +22,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from starlette.concurrency import run_in_threadpool
 
+from tianshu_memory import diagnostics
 from tianshu_memory.diagnostics import (
     CHAT_SERVICE,
     CORRELATION_HEADER,
@@ -37,6 +37,7 @@ from tianshu_memory.diagnostics import (
     PROBE_PATHS,
     SINK_WARNING,
     WRITE_QUEUE_LIMIT,
+    WRITER_QUEUE_TIMEOUT_SECONDS,
     Diagnostics,
     Sink,
     SinkFull,
@@ -1501,66 +1502,75 @@ def test_a_cancelled_waiter_never_hands_back_capacity_it_did_not_finish(tmp_path
     assert adapter.writer.slots() == WRITE_QUEUE_LIMIT
 
 
-def test_shutdown_waits_for_a_start_in_progress_and_never_joins_it(tmp_path):
-    """The third review's finding: `shutdown` could join a thread published before `start` ran.
+def test_shutdown_returns_unconfirmed_within_its_deadline_when_a_start_is_in_progress(
+    tmp_path, monkeypatch
+):
+    """The third review's finding, and then the fourth review's correction of it.
 
-    `Writer.start` published the thread object inside the lock and then called `Thread.start` outside
-    it, so a shutdown arriving in that window saw a thread that existed but had never run, and `join`
-    on it raised `RuntimeError: cannot join thread before it is started`. The state machine removes
-    the window instead of catching the error: the published object is only ever `STARTING`, and a
-    shutdown in that state waits for the start to finish rather than joining it.
+    `Thread.start` used to publish the thread object inside the lock and then call `Thread.start`
+    outside it, so a shutdown arriving in that window saw a thread that existed but had never run,
+    and `join` on it raised `RuntimeError: cannot join thread before it is started`. The third round
+    removed the error by having the shutdown wait the window out — but it waited for `self.lock`,
+    which the start was holding, and that first acquisition had no deadline at all. A start that
+    never returned therefore parked the shutdown forever, and the "bounded wait" after it could not
+    even begin. Measured on the previous candidate with a 30 ms budget: 260 ms.
 
-    The record here is admitted *before* the window opens — it is genuinely in the queue — so this is
-    the case the shutdown drain exists for: the stop is requested, the shutdown waits, the writer
-    starts inside that wait and persists the line, and the shutdown then confirms the end. Without
-    that ordering the stop would rightly win and refuse the record, which the last check covers.
+    Now the start calls `Thread.start` with the lock released and publishes that fact, so a shutdown
+    never queues behind it: the budget covers the lock acquisition itself, and a start still inside
+    the kernel is answered `False` at once instead of being waited out. The assertions below are
+    about the corrected property — the budget is honoured, the join error still never happens, and
+    exactly one writer is built — and they are deliberately not "the old bug still throws".
+
+    The budget here is larger than `WRITER_QUEUE_TIMEOUT_SECONDS`, which it has to be: the writer
+    only notices the stop when its idle poll returns, so a budget smaller than that poll would mean
+    this test measured the poll rather than the window it exists for.
     """
     adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    monkeypatch.setattr(diagnostics, "WRITER_SHUTDOWN_SECONDS", WRITER_QUEUE_TIMEOUT_SECONDS + 0.2)
     original = threading.Thread.start
-    admitted = threading.Event()
     entered = threading.Event()
     release = threading.Event()
-    real_put = queue.Queue.put_nowait
     result = []
-    outcome = []
-    inside = []
-
-    def watched_put(self, pending):
-        value = real_put(self, pending)
-        admitted.set()
-        return value
+    shutdowns = []
+    writers = []
 
     def delayed(self):
         if self.name == "tianshu-memory-log-writer":
+            writers.append(self)
             entered.set()
             assert release.wait(5), "the test never released the start"
         return original(self)
 
     def stopping():
-        inside.append(adapter.writer.state)
-        outcome.append(adapter.shutdown())
+        began = time.monotonic()
+        verdict = adapter.shutdown()
+        shutdowns.append((verdict, time.monotonic() - began))
 
-    with (
-        patch.object(queue.Queue, "put_nowait", watched_put),
-        patch.object(threading.Thread, "start", delayed),
-    ):
+    with patch.object(threading.Thread, "start", delayed):
         caller = threading.Thread(target=lambda: result.append(adapter.emit("runtime.started")))
         caller.start()
-        assert admitted.wait(5), "the first record never reached the queue"
         assert entered.wait(5), "the first emit never reached Thread.start"
-        # The record is queued and the thread object is published but not started. This must not
-        # raise, and it must wait rather than join.
-        stopper = threading.Thread(target=stopping)
-        stopper.start()
-        time.sleep(0.05)
-        assert stopper.is_alive(), "the shutdown must wait out the start window, not join it"
-        assert inside == [Writer.STARTING], inside
+        # Two shutdown callers, because the deadline is a property of the class rather than of one
+        # lucky caller: neither may block on the start's lock.
+        stoppers = [threading.Thread(target=stopping) for _ in range(2)]
+        for stopper in stoppers:
+            stopper.start()
+        for stopper in stoppers:
+            stopper.join(2)
+        assert not any(stopper.is_alive() for stopper in stoppers), shutdowns
+        elapsed = max(seconds for _, seconds in shutdowns)
+        assert [verdict for verdict, _ in shutdowns] == [False, False], shutdowns
+        # The whole budget is available and none of it is spent waiting on the start: a shutdown that
+        # queued behind the held window would take the window's full length here.
+        assert elapsed < 0.05, f"the shutdown waited on the start window: {elapsed:.3f}s"
+        # Only after the window closes does the start finish; the record that was already queued is
+        # written by the writer it created, and the shutdown after it confirms the real end.
         release.set()
         caller.join(5)
-        stopper.join(5)
+        assert result == [True], result
+        assert len(writers) == 1, f"{len(writers)} writers were started over one file"
 
-    assert result == [True], result
-    assert outcome == [True], outcome
+    assert adapter.shutdown() is True
     assert adapter.writer.state == Writer.STOPPED
     assert adapter.writer.thread.is_alive() is False
     assert [line["sequence"] for line in segment_lines(adapter)] == [1]
@@ -1584,6 +1594,143 @@ def test_the_unstarted_thread_shutdown_used_to_join_is_exactly_the_reviewer_erro
     with pytest.raises(RuntimeError) as error:
         thread.join(1)
     assert str(error.value) == "cannot join thread before it is started"
+
+
+def test_a_writer_that_cannot_be_started_fails_closed_instead_of_raising(tmp_path):
+    """The fourth review's second finding: a failed start let the thread error escape to callers.
+
+    On the previous candidate, `Thread.start` raising left the writer `stopped` with its admitted
+    record still queued and `available()` still true, and the `RuntimeError` travelled out of
+    `emit` into whatever business path had called it. The card is explicit that both the *start* and
+    the *construction* must latch a static error code, refuse new work, and settle what was already
+    admitted. This covers the start; the test below covers the construction.
+    """
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    original = threading.Thread.start
+    escapes = []
+    refusal = []
+
+    def failing(self):
+        if self.name == "tianshu-memory-log-writer":
+            raise RuntimeError("synthetic cannot start new thread")
+        return original(self)
+
+    def producer():
+        refusal.append(adapter.emit("request.completed", level="INFO", outcome="succeeded"))
+
+    with patch.object(threading.Thread, "start", failing):
+        try:
+            landed = adapter.emit("request.started", level="INFO", outcome="started")
+        except BaseException as error:  # noqa: BLE001 - an escaping exception is the finding
+            escapes.append(f"{type(error).__name__}: {error}")
+            landed = "escaped"
+
+        assert escapes == [], escapes
+        assert landed is False, landed
+        # Both producer shapes refuse the same way, and neither waits: nothing here may park.
+        assert adapter.emit("request.completed", level="INFO", outcome="succeeded") is False
+        assert asyncio.run(adapter.aemit("runtime.stopping")) is False
+        callers = [threading.Thread(target=producer) for _ in range(6)]
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(5)
+        assert not any(caller.is_alive() for caller in callers)
+        assert refusal == [False] * 6, refusal
+
+    # The latch is the failure, and it is reported as such rather than as a missing thread.
+    assert adapter.sink.failure == "log_unavailable"
+    assert adapter.available() is False
+    assert adapter.writer.state == Writer.STOPPED
+    # The one start attempt is recorded as failed rather than as never attempted: "there is no live
+    # thread" is equally true of a writer that finished its work, and the two owe a shutdown
+    # different answers about who releases the file.
+    assert adapter.writer._start_outcome == Writer.START_FAILED
+    # Everything that was admitted was settled and its slot returned; nothing is left in the queue.
+    assert adapter.writer.admitted == 0
+    assert adapter.writer.queue.qsize() == 0
+    assert adapter.writer.slots() == WRITE_QUEUE_LIMIT
+    assert [line for line in segment_lines(adapter)] == []
+    # No second writer was built to replace the one that failed, and the stop is stable.
+    assert adapter.writer.thread is None
+    assert adapter.shutdown() is True
+    assert adapter.shutdown() is True
+    assert adapter.writer.admitted == 0
+    assert adapter.writer.queue.qsize() == 0
+
+
+def test_a_writer_that_cannot_be_constructed_fails_closed_instead_of_raising(tmp_path):
+    """The same failure one step earlier: the thread object itself cannot be built.
+
+    `Thread.__init__` raising is the other half of the card's "线程构造" case, and it reaches
+    different code: on the previous candidate the construction sat outside any handler, so an
+    `OSError` or `RuntimeError` from it escaped `emit` with nothing latched and nothing settled.
+    """
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    real_thread = threading.Thread
+    escapes = []
+
+    def exploding(*args, **kwargs):
+        if kwargs.get("name") == "tianshu-memory-log-writer":
+            raise RuntimeError("synthetic cannot construct new thread")
+        return real_thread(*args, **kwargs)
+
+    with patch.object(diagnostics.threading, "Thread", exploding):
+        try:
+            landed = adapter.emit("request.started", level="INFO", outcome="started")
+        except BaseException as error:  # noqa: BLE001 - an escaping exception is the finding
+            escapes.append(f"{type(error).__name__}: {error}")
+            landed = "escaped"
+        assert escapes == [], escapes
+        assert landed is False, landed
+        assert adapter.emit("request.completed", level="INFO", outcome="succeeded") is False
+        assert asyncio.run(adapter.aemit("runtime.stopping")) is False
+
+    assert adapter.sink.failure == "log_unavailable"
+    assert adapter.available() is False
+    assert adapter.writer.state == Writer.STOPPED
+    assert adapter.writer._start_outcome == Writer.START_FAILED
+    assert adapter.writer.admitted == 0
+    assert adapter.writer.queue.qsize() == 0
+    assert adapter.writer.slots() == WRITE_QUEUE_LIMIT
+    assert adapter.writer.thread is None
+    assert adapter.shutdown() is True
+
+
+def test_a_latched_start_refuses_the_real_request_before_the_business_call_runs(tmp_path):
+    """The refusal has to reach the HTTP seam, not only `emit`: this is the 503 the card names.
+
+    A start failure is a log that cannot be written, so a request that needs a log line before its
+    side effect must be refused *before* that side effect — the same contract every other latch in
+    this file already has. The business call runs exactly zero times, and the refusal is the static
+    `log_unavailable` envelope rather than a thread error rendered as a 500.
+    """
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    calls = []
+    app = FastAPI()
+
+    @app.post("/work")
+    async def work():
+        calls.append("committed")
+        return JSONResponse({"status": "succeeded"})
+
+    adapter.install(app)
+    bound(app)
+    original = threading.Thread.start
+
+    def failing(self):
+        if self.name == "tianshu-memory-log-writer":
+            raise RuntimeError("synthetic cannot start new thread")
+        return original(self)
+
+    with patch.object(threading.Thread, "start", failing), TestClient(app) as client:
+        response = client.post("/work", headers={"X-Correlation-Id": "0" * 32})
+    assert response.status_code == 503, response.text
+    assert response.json() == {"status": "failed", "code": "log_unavailable"}
+    assert calls == [], "the refused request never reached the business call"
+    assert adapter.sink.failure == "log_unavailable"
+    assert adapter.writer.admitted == 0
+    assert [line for line in segment_lines(adapter)] == []
 
 
 def test_the_writer_owns_the_file_and_a_timed_out_shutdown_never_takes_it(tmp_path, monkeypatch):

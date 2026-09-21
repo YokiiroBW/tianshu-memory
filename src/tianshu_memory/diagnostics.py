@@ -619,19 +619,25 @@ class Writer:
 
     - `NEW` — no writer thread has been asked to run. It owns nothing, so a shutdown here has
       nothing to join and may release the sink itself.
-    - `STARTING` — `Thread.start()` is on the stack. The thread object exists and is published for
-      waiters, but it has not been started yet. A shutdown that arrives now waits for this window to
-      close instead of calling `join` on an unstarted thread, which is the `RuntimeError` the state
-      exists to prevent; the window is bounded by asking `Thread.start` to be quick.
+    - `STARTING` — a thread object exists and `Thread.start()` has been called on it, with the lock
+      released. It is the only state in which the kernel is creating the thread, and it is published
+      separately from the state (`_lock_held`) precisely because a shutdown must be able to give up
+      on it: waiting for that call to return would spend a deadline on something this process cannot
+      influence. Until it returns there is nothing to join, so a shutdown that arrives now reports
+      "unconfirmed" rather than calling `join` on an unstarted thread — the `RuntimeError` the state
+      exists to prevent.
     - `RUNNING` — the thread has been started. A shutdown sets `STOPPING` and joins it.
     - `STOPPING` — the stop was requested; the writer is persisting what is already queued, and
       nothing new is accepted.
-    - `STOPPED` — the writer thread has been started and has ended, so the file has been released by
-      its owner and no second writer is ever built; or the thread was never started at all, in which
-      case this class still owns the file and releases it.
+    - `STOPPED` — the start attempt is over and cannot be repeated. Either the thread ran and ended,
+      so the file was released by its owner and every record it was given has been settled, or the
+      start failed, in which case this class latched the sink, settled everything already admitted
+      and released the file itself. A writer is never built again after this point.
 
     The transitions are made under `self.lock`, which is a plain mutex and is never held across any
-    system IO.
+    system IO — not a `write`, not a `flush`, and not `Thread.start`. Every wait in `shutdown` is
+    bounded by one deadline that covers the lock acquisition itself, so a start that never returns
+    costs the shutdown its budget and nothing more.
     """
 
     NEW = "new"
@@ -639,6 +645,13 @@ class Writer:
     RUNNING = "running"
     STOPPING = "stopping"
     STOPPED = "stopped"
+
+    # How the one start attempt ended. Recorded rather than inferred, because "there is no live
+    # thread" is true both of a writer that finished its work and of a writer that never ran, and
+    # those two owe a shutdown different answers about the file.
+    START_OK = "started"
+    START_FAILED = "start_failed"
+    START_NONE = "not_attempted"
 
     def __init__(self, diagnostics):
         self.diagnostics = diagnostics
@@ -648,9 +661,18 @@ class Writer:
         self.stopping = threading.Event()
         # The one mutex for this class: it guards the state transitions, the queue insertion that
         # consumes an admission slot, and the drain-and-settle of the abandoned records. It is never
-        # held across a write, a flush, or a join.
+        # held across a write, a flush, a join, or `Thread.start` — see `_start`.
         self.lock = threading.Lock()
         self.state = self.NEW
+        # Whether a start is currently inside `Thread.start`, i.e. inside the kernel. A plain flag
+        # written under the lock and read (never written) by the shutdown's bounded loop: it is how a
+        # shutdown can tell "the kernel is creating the thread" from "the state is not `RUNNING`
+        # yet", and give up on the former immediately instead of waiting for the lock it holds.
+        self._lock_held = False
+        self._start_outcome = self.START_NONE
+        # The thread a shutdown must still join, published by `_seal` under the lock: `None` means
+        # `_seal` already answered, which is why the caller reads both together.
+        self._join_target = None
         # How many records have been admitted and not yet settled by the writer. It is the true
         # measure of outstanding log work, so both producers share it: a synchronous caller and an
         # asynchronous caller each consume one slot when their record is really queued, and the
@@ -697,6 +719,10 @@ class Writer:
         must refuse that record rather than accept one that only the shutdown drain could ever
         write. The queue insertion below is what makes the decision final, because the shutdown sets
         the stop under this same lock and drains whatever is already in the queue.
+
+        The start is called with the lock released, deliberately: see `_start`. A record that is
+        already queued when a start fails is settled by that failure, and this method reports it as
+        an ordinary refusal.
         """
         with self.lock:
             if self.stopping.is_set() or self.state == self.STOPPED:
@@ -713,8 +739,8 @@ class Writer:
             except queue.Full:
                 self.sink.fail("log_capacity")
                 return None
-            self._start()
-            return pending
+        self._start()
+        return pending
 
     def _admitted_room_for_a_non_blocking_put(self):
         """Whether the physical queue also has room, so `put_nowait` cannot be the refusal.
@@ -728,11 +754,11 @@ class Writer:
     def admit(self, pending):
         """Queue one record without ever blocking, or refuse it and latch the sink.
 
-        `None` means the bounded work set is full, the process is stopping, or the sink was already
-        refuted — three forms of the same answer: this process will not take on that line, so the
-        business work it describes must not be admitted either. It is never a silent drop and never
-        a wait: a producer on the event loop may not park, and a producer that must wait is exactly
-        the case this ceiling exists to refuse.
+        `None` means the bounded work set is full, the process is stopping, the writer could not be
+        started, or the sink was already refuted — all of them the same answer: this process will not
+        take on that line, so the business work it describes must not be admitted either. It is never
+        a silent drop, never a wait, and never an exception: a producer on the event loop may not
+        park, and a producer that must wait is exactly the case this ceiling exists to refuse.
         """
         pending = self._acquire(pending, blocking=True)
         if pending is None:
@@ -750,84 +776,238 @@ class Writer:
 
     # -- lifecycle ---------------------------------------------------------------------------
 
+    def _begin_start(self):
+        """Claim the one start attempt and publish the thread. Called under the lock.
+
+        Returns `(thread, failed)`: the thread to start, or `None` plus whether *this* call owned the
+        attempt and the attempt is why there is no thread. `None, False` is the ordinary answer for a
+        caller that arrived while someone else was already starting a writer, or for a sink that is
+        not durable and has no file to own — neither is a failure, and neither may be reported as one.
+
+        Both failures that can follow — a thread that cannot be constructed and a thread that cannot
+        be started — are the caller's to handle, and the caller handles them identically. The
+        construction is deliberately *not* allowed to escape: a process that cannot create the thread
+        that owns its log is a process whose log is unavailable, which is a state this class reports,
+        not an exception its callers have to catch.
+        """
+        if self.state != self.NEW or not self.sink.durable:
+            return None, False
+        try:
+            # Keywords throughout, including `daemon`. `Thread.__init__` is
+            # `(group, target, name, args, kwargs, *, daemon, context)`, so the first positional is
+            # the reserved `group` — passing the target positionally is an `AssertionError`, not a
+            # naming preference.
+            #
+            # `daemon=True` is deliberate, and it is not the same thing as "assign `thread.daemon`
+            # after construction" (which raises `RuntimeError` because the thread already counts as
+            # active). A non-daemon writer would keep the interpreter alive at exit for as long as its
+            # idle poll is still running, and — the part that actually bit this suite — it would keep
+            # the segment handle open after its test finished, so a test runner removing its own
+            # temporary directory fails with a sharing violation. The daemon flag costs nothing here
+            # because nothing depends on the process outliving the writer: `shutdown` joins it and the
+            # file is closed by its owner before the thread ends either way.
+            #
+            # On an interpreter that refuses daemon threads outright ("daemon threads are disabled in
+            # this (sub)interpreter") the construction fails, and that reaches the caller as the same
+            # fail-closed `log_unavailable` as any other start failure instead of as an exception.
+            thread = threading.Thread(
+                target=self._run, name="tianshu-memory-log-writer", daemon=True
+            )
+        except BaseException:
+            self._start_outcome = self.START_FAILED
+            return None, True
+        self.thread = thread
+        self.state = self.STARTING
+        self._lock_held = True
+        return thread, False
+
     def _start(self):
         """Start the single writer thread, at most once in this process, whatever calls in when.
 
-        Called with `self.lock` held. The whole decision — has a writer ever been started, is this
-        sink durable, construct it, publish it, start it — is one atomic step, so two threads
-        emitting the first event at the same moment produce one writer and one thread rather than
-        two writers over one file handle. The thread object is published before `start()` returns,
-        but the state itself is `STARTING` until it has really been started, so a concurrent
-        shutdown cannot mistake a published object for a running one.
+        The decision is atomic and the *call* is not: the check, the construction and the publication
+        all happen under `self.lock`, so two threads emitting the first event at the same moment
+        produce one writer and one thread rather than two writers over one file handle — but
+        `Thread.start` itself runs with the lock released. That ordering is the point. A start that
+        takes the lock and does not give it back until the kernel has created the thread is a start
+        that can make the shutdown deadline meaningless: the shutdown would be waiting for the lock,
+        not for the writer, and no amount of budgeting inside the lock can help it. `_lock_held` is
+        how that stretch is published instead, so a shutdown can tell "a start is inside the kernel
+        right now" from "the state is merely not `RUNNING` yet" — and give up on the first.
+
+        A start that fails is a closed process, not an escaping exception, and both ways it can fail
+        end in the same place: the thread never ran, so it owns nothing and there is nothing to join;
+        what remains is everything already admitted, which the failure path settles and latches.
+        `admit` and `try_admit` then refuse — the callers see a log that is unavailable, which is
+        true, rather than a thread error from a path whose contract says it cannot raise one.
+
+        A caller that finds a start already under way is not a failure and must not be treated as
+        one: it refuses nothing, latches nothing and releases nothing. That is what `failed` from
+        `_begin_start` distinguishes — the writer is being built by someone else, so this caller's
+        record waits for that writer exactly like any other record in the queue.
         """
-        if self.state != self.NEW or not self.sink.durable:
+        with self.lock:
+            thread, failed = self._begin_start()
+        if thread is None:
+            if failed:
+                self._recover_from_start_failure()
             return
-        thread = threading.Thread(target=self._run, name="tianshu-memory-log-writer", daemon=True)
-        self.thread = thread
-        self.state = self.STARTING
         try:
             thread.start()
         except BaseException:
-            # The thread never ran, so it owns nothing and there is nothing to join. The sink stays
-            # with this class, which is also what a shutdown in this state expects to find.
-            self.state = self.STOPPED
-            raise
-        self.state = self.RUNNING
+            self._recover_from_start_failure()
+            return
+        with self.lock:
+            self._lock_held = False
+            self._start_outcome = self.START_OK
+            self.state = self.RUNNING
+
+    def _recover_from_start_failure(self):
+        """Fail closed after a writer that could not be started.
+
+        Called with the lock released, so that the settlement inside can take it. The order matters:
+        the sink is latched first, which is what makes every later producer refuse and readiness
+        report the log as unavailable; then the records that were admitted but never handed to a
+        writer are settled, which is what returns their slots and releases any caller already waiting
+        on them; then the file this class still owns is closed, because the writer that would
+        normally close it never ran.
+
+        `_seal` owns all of that, so this path and a shutdown that arrives at the same moment take it
+        exactly once between them — it is guarded by the `STARTING` → `STOPPED` transition. Nothing
+        here starts another writer, re-submits anything, or keeps the thread object: the process has
+        exactly as many writers as it managed to start.
+        """
+        with self.lock:
+            if self.state in (self.NEW, self.STARTING):
+                self._lock_held = False
+                self._start_outcome = self.START_FAILED
+                self.thread = None
+                # The state stays `STARTING`, which is literally true — a start was attempted and is
+                # over — and is also the branch `_seal` uses for a writer that never got to run.
+                self._seal()
 
     def start(self):
         """Start the single writer, at most once in this process, whatever calls in when."""
-        with self.lock:
-            self._start()
+        self._start()
+
+    def _lock_within(self, deadline):
+        """Take `self.lock`, or give up when the deadline passes. Never waits without a bound.
+
+        The only holder this can lose to for long is a `Thread.start` that the kernel has not
+        returned from, and giving up on it is the correct answer rather than a failure: the state
+        this method was going to read has not been reached, and a shutdown that reported a confirmed
+        end while a start was still in the kernel would be claiming something it cannot know.
+        """
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self.lock.acquire(timeout=min(remaining, 0.05)):
+                return True
+
+    def _seal(self):
+        """Finish a stopped writer: settle, latch if a start failed, release the file. Under the lock.
+
+        One guarded branch decides everything, and it is guarded by a state transition, so two
+        threads arriving here — two shutdown callers, or a shutdown racing a failed start — cannot
+        both settle the same records, close the same sink, or report different things about the
+        same file.
+
+        `Thread.start` is the only thing here that touches the kernel, and it cannot be holding the
+        lock: it releases it before it is called. A failed start is latched as `log_unavailable`,
+        which is what makes readiness and every new admission refuse rather than keep writing into a
+        process that has no writer.
+
+        Returns True when the writer's work is over and its slots are all returned, False when that
+        could not be established, or the thread that still has to be joined — reported through
+        `self._join_target` rather than by its type, because the type of a thread this class builds
+        is not a fact the caller should have to re-derive.
+        """
+        self._join_target = None
+        if self.state in (self.NEW, self.STARTING):
+            # Nothing was ever handed to a writer: the only records that can be queued here are those
+            # admitted while the start was being attempted, and this class still owns the file.
+            if self._start_outcome == self.START_FAILED:
+                self.sink.fail("log_unavailable")
+            self._abandon_queued()
+            self.thread = None
+            self.state = self.STOPPED
+            self._lock_held = False
+            self.sink.close()
+            return True
+        if self.state == self.STOPPED:
+            # Already sealed: the writer ended and settled everything, or the failed start did.
+            if self._start_outcome == self.START_FAILED:
+                return True
+            return self.thread is None or not self.thread.is_alive()
+        thread = self.thread
+        self.state = self.STOPPING
+        if thread is None:
+            # No thread object and not one of the states above: nothing to join and nothing left to
+            # write, so the same "already finished" answer, with the file released.
+            self._abandon_queued()
+            self.state = self.STOPPED
+            self.sink.close()
+            return True
+        self._join_target = thread
+        return False
+
+    def _settle_after_join(self, thread):
+        """Record the end of a joined thread, and answer for its work. Called with the lock held."""
+        if thread.is_alive():
+            return False
+        self.state = self.STOPPED
+        # A True here has to agree with the real state rather than with the absence of a live thread:
+        # the writer settles every record it was given before it exits, so a slot still spent means
+        # the work is not over and this is not a confirmed shutdown.
+        return self.admitted == 0
 
     def shutdown(self):
         """Stop accepting, drain what is queued, and wait a bounded time for the writer to end.
 
-        Returns True only when the one writer thread has really finished — which is also the moment
-        the file is released, because that thread owns the handle. A False means the writer did not
-        end inside the deadline: it may still be inside a `write` or an `fsync` the kernel has not
-        returned from. That is reported as unconfirmed rather than papered over: the caller must not
-        treat it as a closed file, nothing here closes the handle out from under a live writer, and
-        no second writer is ever built to replace it.
+        Returns True only when the writer's work really is over and its slots are all returned —
+        either the one thread has finished, which is also the moment it releases the file, or no
+        thread was ever started, in which case this class releases the file itself. A False means
+        that could not be established inside the deadline: the writer may still be inside a `write`
+        or an `fsync` the kernel has not returned from, or a start may still be inside the kernel.
+        Both are reported as unconfirmed rather than papered over — nothing here closes the handle
+        out from under a live writer, joins a thread that was never started, or builds a second
+        writer to replace the first.
 
-        A writer whose thread has not been started yet is never joined: the state is consulted under
-        the same lock the start uses, so this can only ever see `NEW` (nothing to join), `RUNNING`
-        (join it), or `STOPPED` (nothing left to join). The `STARTING` window is waited out, and that
-        wait is bounded, so a shutdown cannot be parked forever by a start that never returns.
+        The deadline covers *every* wait in this method, including the first acquisition of the lock.
+        That is why `Thread.start` is not called with the lock held, and why a start that is still
+        inside the kernel is answered with an unconfirmed `False` immediately rather than waited out:
+        otherwise this method would spend its whole budget queueing behind, or polling, a call it
+        cannot influence — which is exactly the defect the fourth review measured, where a 30 ms
+        budget took 260 ms. A caller that wants the writer to really end retries, and the retry is
+        cheap once the start has returned.
+
+        Every state change here is made under the lock, and a writer that has already been started is
+        never left with an unreported state: once the thread has ended, `STOPPED` is recorded so that
+        no later call believes a writer is still available.
         """
         deadline = time.monotonic() + WRITER_SHUTDOWN_SECONDS
-        with self.lock:
-            self.stopping.set()
-            while self.state == self.STARTING and time.monotonic() < deadline:
-                # `Thread.start` is on someone else's stack. Releasing the lock is what lets it
-                # finish; taking it again is what makes the state below a decision rather than a
-                # guess.
-                self.lock.release()
-                try:
-                    time.sleep(0.001)
-                finally:
-                    self.lock.acquire()
-            if self.state == self.NEW:
-                # No writer was ever started, so nothing else can be holding the file: the process
-                # that assembled this adapter is the only thing that could have, and it did not.
-                # Any record that is somehow queued here is settled rather than left taken.
-                self._abandon_queued()
-                self.state = self.STOPPED
-                self.sink.close()
-                return True
-            if self.state == self.STARTING:
-                # The start did not complete inside the deadline. This is the same "unconfirmed"
-                # verdict as a join that ran out of patience, and it is deliberately not a join:
-                # joining an unstarted thread is the error this whole state machine removes.
-                return False
-            if self.state == self.STOPPED:
-                return not (self.thread is not None and self.thread.is_alive())
-            thread = self.thread
+        self.stopping.set()
+        if not self._lock_within(deadline):
+            # A start has been inside the kernel for the whole budget. Nothing has been reported as
+            # running, so this is an unconfirmed outcome rather than a closed file — and it is
+            # reported now instead of being waited out, because waiting would mean spending the
+            # shutdown's budget on a call this process cannot influence and cannot outlast.
+            return False
+        if self._lock_held:
+            self.lock.release()
+            return False
+        # The lock is held from here, and released explicitly on every path: a `finally` would have
+        # to release a lock that the give-up paths above never took back.
+        settled = self._seal()
+        thread = self._join_target
+        self._join_target = None
+        if thread is None:
+            self.lock.release()
+            return settled
+        self.lock.release()
         thread.join(max(0.0, deadline - time.monotonic()))
-        ended = not thread.is_alive()
-        if ended:
-            with self.lock:
-                self.state = self.STOPPED
-        return ended
+        with self.lock:
+            return self._settle_after_join(thread)
 
     def _abandon_queued(self):
         """Settle every queued record for a writer that never ran. Called with the lock held."""
