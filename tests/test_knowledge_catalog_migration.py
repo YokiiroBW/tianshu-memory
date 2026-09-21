@@ -622,29 +622,125 @@ def test_a_database_without_project_knowledge_is_refused(tmp_path, contracts):
         assert inspect_catalog(db) == list(INDEXES)
 
 
-def test_an_index_of_the_wrong_shape_is_rebuilt_rather_than_hidden(tmp_path, contracts):
-    store = build(tmp_path, contracts)
-    # First upgrade, so the guard checkpoint describes a schema this release accepted and what
-    # follows is the drift the shape check exists for rather than a state the guard already keeps
-    # anyone out of. The catalog row goes with it, exactly as an interrupted earlier attempt would
-    # have left the file: the indexes are there, the record of them is not.
-    migrate_catalog(store, backup_path(tmp_path, "wrong-shape-first"))
+def prebuilt(tmp_path, contracts, statement, name="conflict"):
+    """A database whose catalog index already exists with some other definition.
+
+    The conflicting index is written through a plain SQLite connection, before this release opens
+    the database, exactly as another release or another tool would have left it. `build` then
+    derives the pre-catalog state around it: the catalog version row is gone and the other index is
+    missing, so the only thing standing between this database and the upgrade is the one name that
+    is taken by a definition this release does not recognize.
+    """
+    store = build(tmp_path, contracts, name=name)
+    with closing(sqlite3.connect(store.path)) as plain:
+        plain.execute(statement)
+        plain.commit()
+        plain.execute("VACUUM")
+    return store
+
+
+def pre_migration(store):
+    """Everything the refusal must leave exactly as it was, as one comparable value."""
+    with store.transaction() as db:
+        return SimpleNamespace(
+            indexes=dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='index'")),
+            metadata=dict(db.execute("SELECT key,value FROM metadata")),
+            revision=db.execute(
+                "SELECT value FROM metadata WHERE key='source_revision'"
+            ).fetchone()[0],
+            projects=db.execute("SELECT * FROM knowledge_projects ORDER BY 1,2").fetchall(),
+        )
+
+
+def index_sql(db, name):
+    return db.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()[0]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # The very columns of the keyset, in the order the other keyset uses them.
+        "CREATE INDEX knowledge_documents_project_id ON knowledge_documents(id,project_id)",
+        # The right prefix with a fourth column: the plan still narrows, the index still differs.
+        "CREATE INDEX knowledge_documents_project_id ON knowledge_documents(project_id,id,kind)",
+        # The right columns over another table's columns of the same names.
+        "CREATE INDEX knowledge_documents_project_id ON knowledge_documents(state)",
+        # The right columns with a flag: `PRAGMA index_info` names the same columns either way.
+        "CREATE UNIQUE INDEX knowledge_documents_project_id ON knowledge_documents(project_id,id)",
+        "CREATE INDEX knowledge_documents_project_id "
+        "ON knowledge_documents(project_id,id) WHERE state='ready'",
+        # A collation changes which rows the keyset order serves.
+        "CREATE INDEX knowledge_documents_project_id "
+        "ON knowledge_documents(project_id COLLATE NOCASE,id)",
+    ],
+)
+def test_an_index_of_another_definition_is_refused_rather_than_repaired(
+    tmp_path, contracts, statement
+):
+    store = prebuilt(tmp_path, contracts, statement)
+    before = pre_migration(store)
+    guard = Path(store.recovery_path).read_bytes()
+    backup = backup_path(tmp_path, "conflict-backup")
+    # The upgrade refuses, and the refusal is about the schema rather than about a missing file:
+    # the backup is still taken first, because a stopped writer's database is copied before any
+    # question is asked of it.
+    with pytest.raises(ValueError, match="different definition"):
+        migrate_catalog(store, backup)
+    assert backup.exists()
+    after = pre_migration(store)
+    # Nothing the migration could have written was written: the index still has the definition it
+    # had, the metadata and the source revision are untouched, no project moved, and the guard still
+    # describes the database as it really is. A repair would have shown up in the index SQL and in
+    # the source revision.
+    assert after.indexes == before.indexes
+    assert after.metadata == before.metadata
+    assert after.revision == before.revision
+    assert after.projects == before.projects
+    assert Path(store.recovery_path).read_bytes() == guard
+    assert "knowledge_catalog_schema" not in after.metadata
+    with store.transaction() as db:
+        # The catalogue stays unavailable, and the index it complains about is still the writer's.
+        assert index_sql(db, INDEXES[0]) == statement
+        assert inspect_catalog(db) == [INDEXES[0], INDEXES[1]]
+    # Removing the conflicting index by hand is what unblocks the same database: the upgrade then
+    # installs the reviewed definition rather than working around what it found.
     with closing(sqlite3.connect(store.path)) as plain:
         plain.execute("DROP INDEX knowledge_documents_project_id")
-        plain.execute("CREATE INDEX knowledge_documents_project_id ON knowledge_documents(id,kind)")
-        plain.execute("DELETE FROM metadata WHERE key='knowledge_catalog_schema'")
         plain.commit()
-    assert indexed_snapshot(store) == ["knowledge_documents_project_id"]
-    migrate_catalog(store, backup_path(tmp_path, "wrong-shape"))
+        plain.execute("VACUUM")
+    assert (
+        migrate_catalog(store, backup_path(tmp_path, "conflict-cleared"))[
+            "knowledge_catalog_schema"
+        ]
+        == 1
+    )
+    assert indexed_snapshot(store) == []
+
+
+def test_an_index_of_the_reviewed_definition_is_reused_rather_than_rebuilt(tmp_path, contracts):
+    # The same declaration, written out by hand with different formatting: same index, and it must
+    # not be refused for the spacing or the keyword case it was written with.
+    store = prebuilt(
+        tmp_path,
+        contracts,
+        "create index knowledge_documents_project_id\n  on knowledge_documents ( project_id , id )",
+        name="reused",
+    )
+    with store.transaction() as db:
+        page = db.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name=?", (INDEXES[0],)
+        ).fetchone()[0]
+    result = migrate_catalog(store, backup_path(tmp_path, "reused-backup"))
+    assert result["knowledge_catalog_schema"] == 1
     assert indexed_snapshot(store) == []
     with store.transaction() as db:
-        columns = tuple(
-            row[2]
-            for row in db.execute(
-                "SELECT * FROM pragma_index_info('knowledge_documents_project_id') ORDER BY seqno"
-            ).fetchall()
+        # The very same B-tree is still there: a re-created index would have a different root page.
+        assert (
+            db.execute("SELECT rootpage FROM sqlite_master WHERE name=?", (INDEXES[0],)).fetchone()[
+                0
+            ]
+            == page
         )
-    assert columns == ("project_id", "id")
 
 
 # -- the fresh-database path ----------------------------------------------------------------

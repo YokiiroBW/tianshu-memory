@@ -253,7 +253,6 @@ def test_the_directory_pages_over_real_http_within_the_byte_budget(catalogue, ru
     assert set(first) == {
         "project_id",
         "project_revision",
-        "limit",
         "items",
         "next_cursor",
         "omissions",
@@ -302,7 +301,6 @@ def test_reading_every_block_through_http_stays_within_the_budget(catalogue, run
     assert set(first) == {
         "project_id",
         "project_revision",
-        "limit",
         "document_id",
         "version",
         "hash",
@@ -332,18 +330,44 @@ def test_reading_every_block_through_http_stays_within_the_budget(catalogue, run
         texts.extend(block["text"] for block in step.json()["blocks"])
         cursor = step.json()["next_cursor"]
     assert len(texts) == BLOCKS and len(set(texts)) == BLOCKS
-    # The smallest budget the entry accepts cannot carry even one block of this document, and that
-    # is refused as its own code instead of silently dropping the head of the document.
-    tiny = operation(
+    # The budget is spent on the response that really goes over the wire. A page the entry served
+    # under a generous budget is measured in wire bytes here, and the request that asks for exactly
+    # those bytes must be served the same page — an entry that measured its own answer one cursor
+    # short would refuse it instead. The byte count is the body the client received, not a
+    # recomputation of it, so an encoding difference would show up as a refusal.
+    roomy = operation(
+        running, "document_read", reading(identifier, expected_hash=first["hash"], limit=2)
+    )
+    assert roomy.status_code == 200, roomy.text
+    exact = body_size(roomy)
+    assert 1024 <= exact <= 32768, "the card's own budget range has to be able to serve this page"
+    served = operation(
         running,
         "document_read",
-        reading(identifier, expected_hash=first["hash"], limit=32, budget=1024),
+        reading(identifier, expected_hash=first["hash"], limit=2, budget=exact),
     )
-    if tiny.status_code == 200:
-        assert tiny.json()["next_cursor"] is not None
-    else:
-        assert tiny.status_code == 422
-        assert tiny.json() == {"status": "failed", "code": "budget_too_small"}
+    assert served.status_code == 200, served.text
+    assert body_size(served) <= exact
+    # The same page, field for field. The cursor is not one of those fields: it seals the request's
+    # own budget, so a page asked for under a different budget continues into the next page under
+    # that budget — which is exactly what the next request below proves it can still do.
+    assert {key: value for key, value in served.json().items() if key != "next_cursor"} == {
+        key: value for key, value in roomy.json().items() if key != "next_cursor"
+    }
+    onward = operation(
+        running,
+        "document_read",
+        reading(
+            identifier,
+            cursor=served.json()["next_cursor"],
+            expected_hash=first["hash"],
+            limit=2,
+            budget=exact,
+        ),
+    )
+    assert onward.status_code == 200, onward.text
+    assert onward.json()["blocks"]
+    assert body_size(onward) <= exact
 
 
 def test_only_the_two_new_operations_were_added_to_what_the_entry_carries(catalogue, running):
@@ -437,8 +461,14 @@ def test_cursors_are_bound_to_this_entry_his_operation_and_his_page(catalogue, r
     cursor = first["next_cursor"]
     assert cursor is not None
     # The same token under the other operation, with different limits, and with a byte changed.
+    # The read presents the version and digest it is continuing, so the refusal is the cursor's own
+    # operation binding rather than the missing hash a continuation page would be refused for.
+    note = document_id(ALPHA, "note-000.md")
+    digest = operation(running, "document_read", reading(note)).json()["hash"]
     assert operation(
-        running, "document_read", reading(document_id(ALPHA, "note-000.md"), cursor=cursor)
+        running,
+        "document_read",
+        reading(note, cursor=cursor, expected_hash=digest),
     ).json() == {
         "status": "failed",
         "code": "invalid_cursor",
@@ -465,6 +495,42 @@ def test_cursors_are_bound_to_this_entry_his_operation_and_his_page(catalogue, r
         "status": "failed",
         "code": "cursor_stale",
     }
+
+
+def test_a_continuation_page_over_http_must_keep_the_premise_it_started_with(catalogue, running):
+    """The wire answer for a continuation that contradicts its own cursor carries no block text.
+
+    The three contradictions are refused with the codes the card fixes, and none of them returns a
+    body containing any of the document's text, so a refusal is never a partial page either. The
+    page with the premise the cursor was sealed for is still served, from the position the cursor
+    names, so the refusals are about the contradiction rather than about the page position.
+    """
+    identifier = document_id(ALPHA, "note-000.md")
+    first = operation(
+        running, "document_read", reading(identifier, expected_hash=None, limit=2)
+    ).json()
+    cursor, digest = first["next_cursor"], first["hash"]
+    assert cursor is not None
+    texts = [block["text"] for block in first["blocks"]]
+    assert texts
+    for arguments, code in (
+        (
+            reading(identifier, cursor=cursor, expected_version=2, expected_hash=digest, limit=2),
+            "stale_evidence",
+        ),
+        (reading(identifier, cursor=cursor, expected_hash="0" * 64, limit=2), "stale_evidence"),
+        (reading(identifier, cursor=cursor, expected_hash=None, limit=2), "invalid_input"),
+    ):
+        refused = operation(running, "document_read", arguments)
+        assert refused.status_code == 422, refused.text
+        assert refused.json() == {"status": "failed", "code": code}
+        assert not any(text.encode() in refused.content for text in texts)
+    served = operation(
+        running, "document_read", reading(identifier, cursor=cursor, expected_hash=digest, limit=2)
+    )
+    assert served.status_code == 200, served.text
+    assert served.json()["blocks"]
+    assert served.json()["document_id"] == identifier
 
 
 def test_a_source_that_changed_under_the_page_is_refused_with_no_old_text(catalogue, running):

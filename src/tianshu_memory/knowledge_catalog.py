@@ -205,6 +205,11 @@ def read_arguments(args):
 
     A caller may not name a source path, a locator or a URL: the document identity is the only
     handle, and everything about where its bytes came from stays in the domain.
+
+    The first page may leave `expected_hash` open — the caller does not know the digest until the
+    first page tells it. Every page after that must carry the digest it is continuing, which is a
+    condition on the request itself and is therefore decided here, with the other input checks,
+    before any cursor is opened or any source is read.
     """
     page = page_arguments(args, READ_FIELDS)
     string(args["document_id"], 128)
@@ -215,6 +220,8 @@ def read_arguments(args):
         "invalid_input",
         400,
     )
+    if args["cursor"] is not None:
+        require(args["expected_hash"] is not None, "invalid_input", 400)
     return page
 
 
@@ -265,17 +272,21 @@ def unit_of(row, evidence):
 
 
 def envelope(base, payload, next_cursor, omissions):
-    """The one response shape both operations return.
+    """The one response shape both operations return, with exactly the card's own keys.
 
-    Every document field comes from `base` — the page's own identity, revision, limit and, for a
-    read, the document id, version and hash — and `payload` carries only the delivered elements.
-    The two are kept apart on purpose: a page must never be able to overwrite the identity it is
-    reporting with something that came out of the paging loop.
+    Every document field comes from `base` — the page's identity and revision, plus, for a read,
+    the document id, version and hash — and `payload` carries only the delivered elements. The two
+    are kept apart on purpose: a page must never be able to overwrite the identity it is reporting
+    with something that came out of the paging loop.
+
+    The response names the frozen fields and nothing else. The page's element limit is part of the
+    request and of the signed cursor, but it is not part of the answer: a caller that wants to know
+    what it asked for already knows, and a wire field the card did not fix is a field a later
+    reader would have to treat as contractual.
     """
     return {
         "project_id": base["project_id"],
         "project_revision": base["revision"],
-        "limit": base["limit"],
         **base["extra"],
         **payload,
         "next_cursor": next_cursor,
@@ -289,40 +300,87 @@ def fits(body, budget_bytes):
 
 
 def page(base, payload_key, elements, cursor_for, budget_bytes, more_candidates):
-    """Assemble the largest prefix of `elements` whose whole response fits the byte budget.
-    `cursor_for(index)` seals the position *after* `elements[index]`, so a cursor only ever names
-    an element that was not delivered: no element can be skipped between two pages and no page
-    can deliver one twice. Three outcomes are distinguished, in the card's own words:
+    """Assemble the largest prefix of `elements` whose *actual* response fits the byte budget.
+
+    `cursor_for(index)` seals the position after `elements[index]`, so a cursor only ever names an
+    element that was not delivered: no element can be skipped between two pages and no page can
+    deliver one twice. The budget is measured on the response that would really be sent, never on a
+    hypothetical one. Three outcomes are distinguished, in the card's own words:
 
     - the first element of a non-empty candidate list does not fit while a response without it
-      does: `budget_too_small`, with no cursor at all, so the caller must raise the budget
-      instead of silently losing the head of the catalog;
-    - the budget stopped the page with elements left over: `next_cursor` plus the single
-      omission `budget`;
-    - the element limit stopped the page, or the candidate list ended exactly at the page:
-      `next_cursor` only when something really remains, and both `omissions` and the claimed
-      `budget` stay empty — a full page is not a budget omission and is never reported as one.
+      does: `budget_too_small`, with no cursor at all, so the caller must raise the budget instead
+      of silently losing the head of the catalogue;
+    - the budget stopped the page with an element left over: `next_cursor` plus the single omission
+      `budget`;
+    - the element limit stopped the page, or the candidate list ended inside it: `next_cursor` only
+      when something really remains, and `omissions` stays empty — a full page is not a budget
+      omission and is never reported as one.
+
+    What the last two lines distinguish is *what the page really is*, not what a pessimal version of
+    it would cost. The candidate list here is `limit + 1` rows at most, so "there is another page"
+    and "this is the last page" are both already known before a single byte is measured:
+
+    - when the caller's limit already covers every candidate, the page is the last one and carries
+      no cursor. Charging it the cost of a cursor or of a `budget` omission would refuse a response
+      that fits — a complete final page of one block is the case this exists for;
+    - when a candidate was held back, every prefix but the last needs a cursor for the page after
+      it, and the last one needs a cursor sealed exactly where the element limit would have sealed
+      it. Either way the cursor is real and is counted.
+
+    The work stays bounded by the page: at most `limit + 1` candidates are serialized, the loop
+    stops at the first size that fits, and no element is ever truncated or skipped.
     """
     if not elements:
         return envelope(base, {payload_key: []}, None, [])
-    last = min(base["limit"], len(elements)) - 1
-    for index in range(last + 1):
-        body = envelope(base, {payload_key: elements[: index + 1]}, cursor_for(index), [BUDGET])
+    limit = base["limit"]
+    last = min(limit, len(elements)) - 1
+    # The complete page, as it would really be sent. When no candidate was held back, this is the
+    # last page of the walk and the response that needs no cursor is the one to measure.
+    if not more_candidates:
+        body = envelope(base, {payload_key: elements[: last + 1]}, None, [])
         if fits(body, budget_bytes):
-            continue
-        if index == 0:
-            require(
-                fits(envelope(base, {payload_key: []}, None, []), budget_bytes),
-                "budget_too_small",
-                400,
-            )
+            return body
+    stopped = None
+    for candidate in range(last + 1):
+        # A cursor exists after this candidate unless it is the last element the walk can reach and
+        # nothing was held back — the one case where the next page does not exist. The omission
+        # follows the cursor: it says the budget is what stood between this page and the next one,
+        # which can only be true while a further element was in reach.
+        further = candidate < last
+        sealed = cursor_for(candidate) if further or more_candidates else None
+        body = envelope(
+            base, {payload_key: elements[: candidate + 1]}, sealed, [BUDGET] if further else []
+        )
+        if not fits(body, budget_bytes):
+            stopped = candidate
+            break
+    if stopped is None:
+        return envelope(
+            base,
+            {payload_key: elements[: last + 1]},
+            cursor_for(last) if more_candidates else None,
+            [],
+        )
+    if stopped == 0:
+        # Even the first element does not fit beside the cursor the rest of the walk needs. The page
+        # is still deliverable when those candidates are covered by the element limit, in which case
+        # its real response carries no cursor; otherwise the caller must raise the budget rather
+        # than lose the head of the catalogue.
+        if more_candidates or last > 0:
             raise Fault("budget_too_small", 400)
-        return envelope(base, {payload_key: elements[:index]}, cursor_for(index - 1), [BUDGET])
-    # Every element this page could deliver fits. One is still left over for the next page when
-    # the limit was reached with candidates remaining.
-    remain = more_candidates or len(elements) > last + 1
+        require(
+            fits(envelope(base, {payload_key: elements[:1]}, None, []), budget_bytes),
+            "budget_too_small",
+            400,
+        )
+        return envelope(base, {payload_key: elements[:1]}, None, [])
+    # The budget held an element back, so the cursor is real and the omission follows from what
+    # stopped the page: fewer elements than the element limit could have delivered.
     return envelope(
-        base, {payload_key: elements[: last + 1]}, cursor_for(last) if remain else None, []
+        base,
+        {payload_key: elements[:stopped]},
+        cursor_for(stopped - 1),
+        [BUDGET] if stopped < min(limit, len(elements)) else [],
     )
 
 
@@ -411,32 +469,57 @@ class Catalog:
             return self.list_documents(shape)
         return self.read_document(shape)
 
+    def _continues(self, bound, document_id, document, version):
+        """Whether this request really continues the page its cursor was sealed for.
+
+        The cursor proves what the caller was reading; the request says what the caller is asking
+        for now. Both have to name the same document, the same version and the same hash, and the
+        request may not name a version or a hash of its own that disagrees — that is not a page to
+        continue but a different request, refused as an invalid cursor. The request's own premise is
+        checked against the document first, so a caller pointing at a version or a digest the
+        document no longer has still gets `stale_evidence` rather than a cursor verdict.
+        """
+        require(
+            bound.get("document_id") == document_id
+            and bound.get("version") == document["version"]
+            and bound.get("version") == self.args["expected_version"]
+            and bound.get("hash") == version["hash"],
+            "invalid_cursor",
+            400,
+        )
+        # A first page may leave the hash open; a later one may not. Without it the caller would be
+        # continuing a walk it never bound to a digest, which is the one thing the cursor is for.
+        require(self.args["expected_hash"] is not None, "invalid_input", 400)
+
     def _announce_read(self):
         """Record the source this read must have re-read, so the external phase reads it.
 
         This is the catalogue's whole part in the phase between the two transactions. Only the
         current, structurally readable version of the named document is announced, and a document
-        no read could ever serve is refused here rather than after a pointless file read.
+        no read could ever serve is refused here rather than after a pointless file read. The page
+        position is settled first: a request that contradicts the cursor it presented fails before
+        anything is read, exactly as it would in the serving phase.
         """
         document = self._document(self.args["document_id"])
+        version = None
+        if document is not None:
+            version = self.db.execute(
+                "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
+                (document["id"], document["version"]),
+            ).fetchone()
         require(
-            document is not None and not unavailable(document, self.project), "stale_evidence", 409
-        )
-        version = self.db.execute(
-            "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
-            (document["id"], document["version"]),
-        ).fetchone()
-        require(version is not None, "stale_evidence", 409)
-        expected_version = (
-            self.bound["version"] if self.bound is not None else self.args["expected_version"]
-        )
-        expected_hash = self.bound["hash"] if self.bound is not None else self.args["expected_hash"]
-        require(
-            document["version"] == expected_version
-            and (expected_hash is None or expected_hash == version["hash"]),
+            document is not None
+            and version is not None
+            and not unavailable(document, self.project)
+            and document["version"] == self.args["expected_version"]
+            and (
+                self.args["expected_hash"] is None or self.args["expected_hash"] == version["hash"]
+            ),
             "stale_evidence",
             409,
         )
+        if self.bound is not None:
+            self._continues(self.bound, self.args["document_id"], document, version)
         if document["kind"] == "file":
             self.reader.capture(document, version["hash"])
 
@@ -487,6 +570,9 @@ class Catalog:
             "project_id": self.project_id,
             "revision": registered["revision"],
             "extra": {},
+            # The element limit is what the page assembler bounds itself by. It is a request
+            # parameter, not a response field: `envelope` never emits it.
+            "limit": shape["limit"],
         }
         self.bound = self._cursor(shape)
 
@@ -516,7 +602,7 @@ class Catalog:
         more = len(rows) > shape["limit"]
         elements = [item(row, row["state"]) for row in rows[: shape["limit"]]]
         return page(
-            {**self.base, "limit": shape["limit"]},
+            self.base,
             "items",
             elements,
             lambda index: self._seal(elements[index]["document_id"]),
@@ -525,7 +611,15 @@ class Catalog:
         )
 
     def read_document(self, shape):
-        """One keyset page of the current version's complete blocks of one document."""
+        """One keyset page of the current version's complete blocks of one document.
+
+        A continuation page carries the same premise the first page did — the caller names the
+        version and the hash it is reading. The cursor repeats that premise so a page cannot be
+        continued after the document moved; it does not replace it. A request whose own
+        `expected_version`/`expected_hash` disagree with the cursor is a request that no longer
+        describes the page it is asking for, and it is refused as an invalid cursor rather than
+        answered with text the caller did not ask for.
+        """
         document_id = self.args["document_id"]
         bound = self.bound
         document = self._document(document_id)
@@ -538,27 +632,27 @@ class Catalog:
                 "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
                 (document_id, document["version"]),
             ).fetchone()
-        expected_version = bound["version"] if bound is not None else self.args["expected_version"]
-        expected_hash = bound["hash"] if bound is not None else self.args["expected_hash"]
-        structural = (
+        require(
             document is not None
             and version is not None
-            and document["version"] == expected_version
-            and (expected_hash is None or expected_hash == version["hash"])
-            and not unavailable(document, self.project)
+            and document["version"] == self.args["expected_version"]
+            and (
+                self.args["expected_hash"] is None or self.args["expected_hash"] == version["hash"]
+            )
+            and not unavailable(document, self.project),
+            "stale_evidence",
+            409,
         )
+        if bound is not None:
+            self._continues(bound, document_id, document, version)
         # A file-backed version is current only once its bytes have really been read and found to
         # hash to the recorded digest. The external phase re-read the locator this dispatch
         # announced, so this comparison is what turns that read into evidence: a file edited,
         # replaced or removed between the two transactions fails here and never yields text.
-        if structural and document["kind"] == "file":
+        structural = True
+        if document["kind"] == "file":
             structural = fresh(self.read, document, version["hash"])
         require(structural, "stale_evidence", 409)
-        require(
-            bound is None or bound.get("document_id") == document_id,
-            "invalid_cursor",
-            400,
-        )
         last_id = (bound or {}).get("last_id")
         require(last_id is None or isinstance(last_id, str), "invalid_cursor", 400)
         # The same one-bound keyset as the directory, and the same named index for the same reason:

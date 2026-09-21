@@ -37,7 +37,6 @@
 {
   "project_id": "alpha",
   "project_revision": 0,
-  "limit": 8,
   "items": [
     {"document_id": "document:6f2a…", "kind": "file", "version": 1,
      "indexed_state": "ready", "source_validation": "not_checked"}
@@ -52,6 +51,9 @@
 `indexed_state` 是**导入时**记录的索引状态；`source_validation` 恒为 `not_checked`——目录是索引描述，
 **从不声称来源文件当前仍然有效**，这一点必须由调用方按需用 `document_read` 或 `check` 复核。
 
+响应字段就是卡里点名的那几个：`limit` 属于**请求**（也属于游标绑定），不属于响应。调用方自己知道这一页
+是按哪个元素上限要来的，多返回一个未冻结的字段只会让后来的读者把它当成合同。
+
 ### `document_read`
 
 ```json
@@ -64,7 +66,6 @@
 {
   "project_id": "alpha",
   "project_revision": 0,
-  "limit": 8,
   "document_id": "document:6f2a…",
   "version": 1,
   "hash": "9c1d…",
@@ -82,6 +83,12 @@
 每块只有 `{reference{block_id,document_id,version,hash},text,spans}`：**只返回完整块**，绝不返回半块或
 截断正文。`expected_version` 必填；`expected_hash` 可为 `null`，给定时必须与当前版本摘要一致，否则
 `stale_evidence`。返回的 `hash` 是调用方续页时要带回的值。
+
+**续页前提由调用方给出，游标只重复它、不替代它**：非首屏（`cursor` 非 `null`）时 `expected_hash` 必填，
+`expected_version`/`expected_hash` 必须与游标封存的 document_id/version/hash 完全一致。缺摘要为
+`invalid_input`（领域 400）；与游标矛盾为 `invalid_cursor`（领域 400）——游标**不会**自动纠正调用方
+写错的版本或摘要，也不会因为调用方指向另一版本就继续把旧版本正文发出去。文档本身的当前版本已经改变
+（调用方的前提与库内事实不符）仍是 `stale_evidence`。
 
 ### 两者都不返回
 
@@ -104,13 +111,17 @@
 按 `canonical`（确定 JSON，非 ASCII 转义）计算。因此中文块与转义字符都按**真实字节**计入，而不是按
 字符数估计。
 
-装配规则（`page()`，两个操作共用）：
+装配规则（`page()`，两个操作共用）：预算按**这一页真实要发的那个响应**计算——有下一页才有游标，
+末页既没有 `next_cursor` 也不会有 `budget` 省略。
 
-1. 逐个元素试算"整包是否放得下"，只交付**真正放得下**的前缀；
-2. 第一个元素就放不下、而空响应放得下 → `budget_too_small`（领域 400），**不给游标**。调用方必须提高
-   `budget_bytes` 重试；本操作不跳过放不下的元素，也不悄悄丢掉目录开头；
-3. 预算截断且仍有剩余元素 → 交付已放下的前缀 + `next_cursor` + `omissions == ["budget"]`；
-4. 元素个数达到 `limit`、或候选恰好到此结束 → 只有在**确实还有剩余**时给 `next_cursor`，且
+1. 逐个元素试算"整包（含这一页真会带的游标与省略）是否放得下"，只交付**真正放得下**的前缀；
+2. **候选恰好到此结束**（`limit` 已覆盖全部候选）时，整页的响应**不带游标**：先按这个形状试算，放得下就
+   整页交付，`next_cursor: null`、`omissions: []`。**不因为一个根本不会返回的游标而拒绝一个放得下的末页**
+   ——单块完整末页（约 818 字节）在最小预算 1024 下必须成功；
+3. 第一个元素连"带游标"都放不下 → `budget_too_small`（领域 400），**不给游标**。调用方必须提高
+   `budget_bytes` 重试；本操作不跳过放不下的元素，也不悄悄丢掉目录开头（游标真的放不下时不假装能续页）；
+4. 预算截断且仍有剩余元素 → 交付已放下的前缀 + `next_cursor` + `omissions == ["budget"]`；
+5. 元素个数达到 `limit`、或候选恰好到此结束 → 只有在**确实还有剩余**时给 `next_cursor`，且
    `omissions == []`——整页不是预算省略，绝不虚报。
 
 `omissions` 只有 `[]` 与 `["budget"]` 两种取值。空目录、零块文档返回**空列表 + `next_cursor: null`**，
@@ -129,6 +140,11 @@
 
 因此一个游标**只能**由同一个身份、同一个项目、同一个操作、同样的 `limit`/`budget_bytes` 继续使用；
 改 `limit`、改预算、跨操作、跨 client、跨项目或改一个字节都得到 `invalid_cursor`（领域 400）。
+
+绑定是**双向**的：游标封存的 `document_id`/`version`/`hash` 必须与调用方这一请求自己给的
+`expected_version`/`expected_hash` 一致，否则是 `invalid_cursor`。游标的职责是证明"上一页读的是哪一份"，
+不是替调用方决定"这一页该读哪一份"——用游标覆盖请求前提，就等于调用方指向另一版本时仍把旧版本正文
+发出去。
 
 已验签但**页间项目 revision 变了** → `cursor_stale`（领域 409）：目录已经动了，调用方要从第一页重新
 开始，而不是被交给一次过期遍历的剩余部分。同一次请求的三阶段之间变了 → 既有的 `project_conflict`。
@@ -175,13 +191,14 @@ CREATE INDEX knowledge_blocks_document_version_id ON knowledge_blocks(document_i
 ```
 
 - 两条语句**点名索引**（`INDEXED BY`），并由**同一次请求内的形状自检**兜底：`snapshot` 与 `Catalog`
-  都先运行 `inspect`，索引缺失或同名但列序不对 → `dependency_unavailable`（503），绝不退化为全表扫描。
+  都先运行 `inspect`，索引缺失或同名但形状不对 → `dependency_unavailable`（503），绝不退化为全表扫描。
   之所以点名：键集从表头附近开始时，放任 planner 可能选 `id` 主键再跨项目过滤，成本随**别的项目**增长。
 - `id` 下界**恒为字符串**（首屏为空串，任何文档 id 都不可能等于它）。写成 `(? IS NULL OR id>?)` 读起来
   一样，对 SQLite 却不一样：那样只用得上 `project_id`，随后逐行过滤。单值单比较才能让一页的成本与
   **这一页**成正比。
-- `inspect` 以 `PRAGMA index_info` 的实际形状判定，而不是相信 metadata 里的版本行；同名错列的索引会被
-  拒绝而不是被信任。
+- `inspect` 判定的是**完整形状**，不是名字：`sqlite_master` 里那条建索引语句（只忽略空白与大小写）、
+  表名、`PRAGMA index_info` 的列与列序、`PRAGMA index_list` 的 unique/partial 标志。同名错列的索引会被
+  拒绝而不是被信任——列序换了、多一列、加了 `UNIQUE`、加了 `WHERE`、加了 `COLLATE` 都算不同定义。
 
 ## 9. 迁移与回滚
 
@@ -202,9 +219,16 @@ uv run python -m tianshu_memory.knowledge_cli `
 `ValueError: Catalog migration already applied`（并保留它自己那份独占备份）。
 
 动作顺序：**先**以 `xb` 独占方式占住一个本地备份文件（拒绝覆盖既有回滚产物、拒绝 UNC 路径、拒绝与库或
-检查点同文件）→ 进入既有 `Store.transaction()` → 事务内把完整迁移前数据库备份到该文件 → `install`：
-删掉同名旧索引、按定义重建、`PRAGMA index_info` 自检、写 `metadata.knowledge_catalog_schema=1`、
-显式 `source_revision + 1`（这一步让既有 Store 事务推进 schema 3 的 `source-guard.json` 检查点）。
+检查点同文件）→ 进入既有 `Store.transaction()` → 事务内把完整迁移前数据库备份到该文件 → **形状前置检查**
+（下面"错误同名索引"）→ `install`：只创建**缺失**的索引、`PRAGMA index_info` 自检、写
+`metadata.knowledge_catalog_schema=1`、显式 `source_revision + 1`（这一步让既有 Store 事务推进 schema 3 的
+`source-guard.json` 检查点）。
+
+**错误同名索引 → 失败关闭，绝不 DROP 重修**：迁移前若同名索引已存在但不是本版本评审过的定义，整个升级
+在写任何东西之前拒绝（`ValueError: Catalog index already exists with a different definition: <名字>`），
+保留原索引、原 metadata、原 `source_revision` 与 guard 检查点不动。**形状正确**的既有索引被**复用**（不
+DROP、不重建，B-tree 根页不变）；**缺失**的索引在同一个迁移事务里按定义创建。本版本不认识的 schema 由
+人处理，不由迁移器"顺手修好"。
 
 不新建表、不新建触发器、不动任何文档/版本/块/项目 revision/客户端权限——索引不是权威行。
 
@@ -237,8 +261,9 @@ uv run pytest tests/test_knowledge_catalog_migration.py -q --basetemp .runtime/t
   启动 `knowledge_cli serve`、经真实 socket 走"列表 → 阅读列表指名的文档 → 下一页"，并与进程内入口
   在同一库上的答案逐字比对。
 - `test_knowledge_catalog_migration.py`：迁移验收（全新/已装库、重复迁移、缺 guard、错误 guard、已存在
-  备份、错误索引形状、缺 `knowledge_schema`、备份即迁移前完整库、迁移不动权威行/触发器/权限，以及
-  `EXPLAIN QUERY PLAN` 与 `progress_handler` 的规模对比）。其中两项**真实启动**操作者命令
+  备份、六种错误索引定义与一种只是排版不同的等价定义、缺 `knowledge_schema`、备份即迁移前完整库、迁移不
+  动权威行/触发器/权限，以及 `EXPLAIN QUERY PLAN` 与 `progress_handler` 的规模对比）。其中两项**真实启动**
+  操作者命令
   `python -m tianshu_memory.knowledge_cli --config <私有配置> migrate-catalog --backup <新文件>`：一项核对
   子进程留下的备份、两条索引、一条版本行，并随后经公共 `KnowledgeApplication.execute` 用两个操作读回
   升级前就导入的那份资料；另一项核对重复升级被拒（命令以 `{"status":"failed",
@@ -250,13 +275,11 @@ uv run pytest tests/test_knowledge_catalog_migration.py -q --basetemp .runtime/t
 
 ## 11. 与本轮任务卡的差异（如实列出）
 
-1. **返回体多一个 `limit` 字段**：除卡里点名的 `project_id`/`project_revision`/`items`（或 `blocks`/
-   `document_id`/`version`/`hash`）/`next_cursor`/`omissions`/`trust` 之外，两个操作都返回本页实际使用的
-   `limit`，让调用方不必回看请求就知道这一页是按哪个元素上限装配的。
-2. **游标同时绑定 `budget_bytes`**：卡只点名 `limit`；实现把预算一并封入游标，改预算续页即
-   `invalid_cursor`，因为一页按一个预算装配，不该被换个预算重放后还声称遵守了它。
-3. **两条 SQL 点名索引（`INDEXED BY`）**：卡要求计划前缀 `SEARCH`、无临时排序；实测放任 planner 在键集
+1. **游标同时绑定 `budget_bytes`**：卡只点名 `limit`；实现把预算一并封入游标，改预算续页即
+   `invalid_cursor`，因为一页按一个预算装配，不该被换个预算重放后还声称遵守了它。响应**不**包含 `limit`
+   字段——`limit` 只属于请求与游标绑定（首轮实现曾多返回 `limit`，已按验收意见移除）。
+2. **两条 SQL 点名索引（`INDEXED BY`）**：卡要求计划前缀 `SEARCH`、无临时排序；实测放任 planner 在键集
    靠近表头时可能改走 `id` 主键再过滤 `project_id`，故语句点名索引，并由同一次请求内的形状自检兜底
-   （缺失/错列 → `dependency_unavailable`）。
-4. **跨项目 `document_read` 是 `stale_evidence`**：与本项目域既有证据规则一致，且拒绝体不报告该文档是否
+   （缺失/错形状 → `dependency_unavailable`）。
+3. **跨项目 `document_read` 是 `stale_evidence`**：与本项目域既有证据规则一致，且拒绝体不报告该文档是否
    存在于别处。

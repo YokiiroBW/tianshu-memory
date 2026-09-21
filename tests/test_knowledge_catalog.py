@@ -681,9 +681,17 @@ def test_revocation_and_credential_rotation_take_effect_mid_walk(catalogue):
 def test_cursor_is_bound_to_operation_client_project_page_and_revision(catalogue):
     cursor = list_page(catalogue)["next_cursor"]
     assert cursor is not None
-    # Cross-operation: a list cursor presented to the reader.
+    # Cross-operation: a list cursor presented to the reader. The read states the version and hash
+    # it is continuing, so what it presents really is a continuation request and the refusal comes
+    # from the cursor's own operation binding rather than from the missing hash.
     with pytest.raises(Fault, match="invalid_cursor"):
-        read_page(catalogue, catalogue.alpha[0], cursor)
+        read_page(
+            catalogue,
+            catalogue.alpha[0],
+            cursor,
+            expected_version=1,
+            expected_hash=read_page(catalogue, catalogue.alpha[0])["hash"],
+        )
     # Tampered token.
     with pytest.raises(Fault, match="invalid_cursor"):
         list_page(catalogue, cursor[:-2] + ("AA" if not cursor.endswith("AA") else "BB"))
@@ -704,6 +712,70 @@ def test_cursor_is_bound_to_operation_client_project_page_and_revision(catalogue
         db.execute("UPDATE knowledge_projects SET revision=revision+1 WHERE id=?", (ALPHA,))
     with pytest.raises(Fault, match="cursor_stale"):
         list_page(catalogue, cursor)
+
+
+def test_a_continuation_page_may_not_contradict_the_cursor_it_presents(catalogue):
+    """The cursor repeats the premise of the walk; it does not replace the caller's own.
+
+    A caller that asks for a later page of version 1 while naming version 2, a digest that is not
+    the one it is continuing, or no digest at all, is not asking to continue this walk. Every one
+    of those is refused before the blocks are read, and the same request with the premise the cursor
+    was sealed for still pages, so the refusals are about the contradiction and not about the page
+    position being unusable.
+    """
+    units = [{"spans": [[index + 1, index + 1]], "text": f"Block {index}."} for index in range(3)]
+    identifier, value = seeded_blocks(
+        catalogue.store, ALPHA, catalogue.roots[ALPHA], "contradicted.md", units
+    )
+    first = read_page(catalogue, identifier, limit=2)
+    cursor = first["next_cursor"]
+    assert cursor is not None and first["hash"] == value
+    assert [block["text"] for block in first["blocks"]] == ["Block 0.", "Block 1."]
+    # A version the caller names that the cursor did not seal. The document's current version is
+    # still 1, so this is the caller contradicting the cursor rather than the document having moved.
+    with pytest.raises(Fault, match="stale_evidence"):
+        read_page(catalogue, identifier, cursor, expected_version=2, expected_hash=value, limit=2)
+    # A digest that is not the one this walk is continuing.
+    with pytest.raises(Fault, match="stale_evidence"):
+        read_page(catalogue, identifier, cursor, expected_hash="0" * 64, limit=2)
+    # The first page may leave the digest open; no later page may.
+    with pytest.raises(Fault, match="invalid_input"):
+        read_page(catalogue, identifier, cursor, expected_hash=None, limit=2)
+    # A first page still may, and still returns the digest the later pages continue from.
+    reopened = read_page(catalogue, identifier, expected_hash=None, limit=2)
+    assert reopened["hash"] == value and reopened["next_cursor"] == cursor
+    # The same continuation with the premise the cursor was really sealed for is served, and it
+    # serves the blocks after the delivered ones: nothing was skipped by the refusals above.
+    second = read_page(catalogue, identifier, cursor, expected_hash=value, limit=2)
+    assert [block["text"] for block in second["blocks"]] == ["Block 2."]
+    assert second["next_cursor"] is None and second["omissions"] == []
+    # And the contradiction is still refused after a page was served in between.
+    with pytest.raises(Fault, match="stale_evidence"):
+        read_page(catalogue, identifier, cursor, expected_version=2, expected_hash=value, limit=2)
+
+
+def test_a_contradicted_continuation_costs_no_page_of_the_document(catalogue):
+    """A refused continuation is refused whole: no partial page, and no text from any version.
+
+    The refusal happens before the page is assembled from blocks, so the response can never carry
+    the head of a page the caller did not ask for. Nothing of the document's text appears in the
+    failure either, which is what makes the refusal safe to log.
+    """
+    units = [{"spans": [[index + 1, index + 1]], "text": f"Secret {index}."} for index in range(3)]
+    identifier, value = seeded_blocks(
+        catalogue.store, ALPHA, catalogue.roots[ALPHA], "unread-continuation.md", units
+    )
+    first = read_page(catalogue, identifier, limit=1)
+    cursor = first["next_cursor"]
+    assert cursor is not None
+    for arguments, code in (
+        ({"expected_version": 2, "expected_hash": value}, "stale_evidence"),
+        ({"expected_hash": "0" * 64}, "stale_evidence"),
+        ({"expected_hash": None}, "invalid_input"),
+    ):
+        with pytest.raises(Fault, match=code) as refused:
+            read_page(catalogue, identifier, cursor, limit=1, **arguments)
+        assert not any(unit["text"] in str(refused.value) for unit in units)
 
 
 def test_read_cursor_binds_the_document_version_and_hash(catalogue):
@@ -787,6 +859,136 @@ def test_document_list_budget_reports_and_never_claims_a_false_omission(catalogu
     assert seen == catalogue.alpha
     full = list_page(catalogue, limit=4)
     assert full["omissions"] == [] and len(full["items"]) == 4
+
+
+def test_a_complete_page_is_measured_as_the_response_it_really_is(catalogue):
+    """The budget is spent on the answer, not on a cursor the answer does not carry.
+
+    A page whose elements all fit is the page the caller gets: an element limit that already covers
+    every candidate means no next page, so no cursor and no omission belong in the response, and a
+    budget that fits the answer must not be refused for them. What is deliberately *not* claimed is
+    that a budget can always carry one element: an element plus the cursor that a further page would
+    need can cost more than the element alone, and a page that must carry a cursor to be a page at
+    all is still refused when that whole response does not fit.
+    """
+    one = seeded_blocks(
+        catalogue.store,
+        ALPHA,
+        catalogue.roots[ALPHA],
+        "one-final-block.md",
+        [{"spans": [[1, 1]], "text": "a" * 200}],
+    )[0]
+    complete = read_page(catalogue, one, budget=32768)
+    size = len(canonical(complete).encode())
+    assert complete["next_cursor"] is None and complete["omissions"] == []
+    assert size <= 1024, "the probe's own case: a complete final page smaller than the least budget"
+    # The same answer, byte for byte, under the least budget the entry accepts.
+    assert canonical(read_page(catalogue, one, budget=1024)) == canonical(complete)
+    # Several elements on a last page are measured the same way: the page is delivered whole
+    # whenever it fits, not one element short for a cursor that would never be returned.
+    several = seeded_blocks(
+        catalogue.store,
+        ALPHA,
+        catalogue.roots[ALPHA],
+        "several-final-blocks.md",
+        [{"spans": [[index + 1, index + 1]], "text": f"b{index}" * 7} for index in range(2)],
+    )[0]
+    whole = read_page(catalogue, several, budget=32768)
+    assert len(canonical(whole).encode()) <= 1024
+    page = read_page(catalogue, several, budget=1024)
+    assert [block["text"] for block in page["blocks"]] == ["b0" * 7, "b1" * 7]
+    assert page["next_cursor"] is None and page["omissions"] == []
+    assert canonical(page) == canonical(whole)
+
+
+def test_the_page_boundary_is_where_the_response_really_stops(catalogue):
+    """Walking a document under a tight budget delivers every block once and stays in budget.
+
+    A page carries a cursor exactly while blocks remain, and says `budget` exactly when the byte
+    budget — not the element limit — is what stopped it. A lost block, a repeated block, a page over
+    its budget or a cursor on the last page all show up as a failure here.
+    """
+    identifier, value = seeded_blocks(
+        catalogue.store,
+        ALPHA,
+        catalogue.roots[ALPHA],
+        "tight-walk.md",
+        [
+            {"spans": [[index + 1, index + 1]], "text": f"Block {index:02d}. " + "x" * 40}
+            for index in range(12)
+        ],
+    )
+    budget, cursor, seen, pages = 2048, None, [], 0
+    while True:
+        step = read_page(catalogue, identifier, cursor, budget=budget, expected_hash=value)
+        assert len(canonical(step).encode()) <= budget
+        assert step["blocks"], "a page that is handed out carries at least one block"
+        seen.extend(block["text"] for block in step["blocks"])
+        cursor = step["next_cursor"]
+        pages += 1
+        assert pages < 32, "the walk must terminate"
+        if cursor is None:
+            assert step["omissions"] == [], "the last page has nothing left to omit"
+            break
+        assert step["omissions"] in ([], ["budget"])
+        assert len(step["blocks"]) <= 32
+    assert pages > 1, "the budget really did split this document"
+    assert seen == [f"Block {index:02d}. " + "x" * 40 for index in range(12)]
+    # The element limit ends a page without claiming a budget omission, and the same walk under a
+    # budget that carries the whole document is one page with no cursor at all.
+    limited = read_page(catalogue, identifier, limit=5, budget=32768)
+    assert len(limited["blocks"]) == 5 and limited["omissions"] == []
+    assert limited["next_cursor"] is not None
+    one_shot = read_page(catalogue, identifier, limit=32, budget=32768, expected_hash=value)
+    assert len(one_shot["blocks"]) == 12
+    assert one_shot["next_cursor"] is None and one_shot["omissions"] == []
+
+
+def test_an_element_that_cannot_fit_is_refused_rather_than_skipped(catalogue):
+    """The smallest budget that cannot carry the first block is its own code, with no cursor.
+
+    A page that started from the second block would be a silent loss of the head of the document, so
+    the refusal is total: no blocks and no cursor to continue from. The same first block under a
+    budget that really does cover it — together with the cursor the rest of the document needs — is
+    served, which is what separates this refusal from the one the cursor's own cost used to cause.
+    """
+    identifier, value = seeded_blocks(
+        catalogue.store,
+        ALPHA,
+        catalogue.roots[ALPHA],
+        "too-big-head.md",
+        [{"spans": [[1, 1]], "text": "y" * 4000}, {"spans": [[2, 2]], "text": "small."}],
+    )
+    with pytest.raises(Fault, match="budget_too_small") as refused:
+        read_page(catalogue, identifier, budget=1024)
+    assert refused.value.code == "budget_too_small"
+    enlarged = read_page(catalogue, identifier, budget=8192)
+    assert enlarged["blocks"][0]["text"] == "y" * 4000
+    assert len(canonical(enlarged).encode()) <= 8192
+    # The very same document, where the whole page fits but the element limit cuts it: the head is
+    # served first, under a cursor, and the caller's own element limit is what stopped the page
+    # rather than the budget — so no budget omission is claimed for it.
+    served = read_page(catalogue, identifier, limit=1, budget=8192)
+    assert [block["text"] for block in served["blocks"]] == ["y" * 4000]
+    assert len(canonical(served).encode()) <= 8192
+    assert served["next_cursor"] is not None and served["omissions"] == []
+    rest = read_page(
+        catalogue, identifier, served["next_cursor"], limit=1, budget=8192, expected_hash=value
+    )
+    assert [block["text"] for block in rest["blocks"]] == ["small."]
+    assert rest["next_cursor"] is None and rest["omissions"] == []
+    # A directory page is measured the same way: BETA has three documents, so a one-entry page
+    # always has a page after it, and the least accepted budget has to carry the whole response —
+    # entry, cursor and all — which is what the probe denied.
+    roomy = list_page(
+        catalogue, cursor=None, limit=1, budget=32768, client="beta-writer", project_id=BETA
+    )
+    assert len(roomy["items"]) == 1 and roomy["next_cursor"] is not None
+    assert len(canonical(roomy).encode()) <= 1024
+    served = list_page(catalogue, limit=1, budget=1024, client="beta-writer", project_id=BETA)
+    assert served["items"] == roomy["items"]
+    assert served["next_cursor"] is not None
+    assert served["omissions"] == [] and served["trust"] == roomy["trust"]
 
 
 def test_arguments_are_exact_and_bounded(catalogue):
