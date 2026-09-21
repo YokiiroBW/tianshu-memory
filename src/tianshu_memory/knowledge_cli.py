@@ -7,6 +7,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from .diagnostics import KNOWLEDGE_SERVICE
 from .domain import Fault, strict_json
 from .knowledge import KnowledgeApplication
 from .knowledge_catalog_migration import migrate as migrate_catalog
@@ -14,6 +15,7 @@ from .knowledge_directories_migration import migrate as migrate_directories
 from .knowledge_migration import migrate
 from .lessons_migration import migrate as migrate_lessons
 from .research_notes_migration import migrate as migrate_research_notes
+from .server_runtime import add_serve_arguments
 from .store import Store
 
 
@@ -39,13 +41,14 @@ def main():
         command.add_argument("--credential-env", required=True)
         if name == "action":
             command.add_argument("file")
-    # The restricted HTTP entry: one fixed client, one explicit port, no host option. The
-    # credential is whatever each request presents as `Authorization: Bearer`, exactly as `action`
-    # reads it from the environment and hands it to the same `execute`; a request body is never
-    # allowed to name an identity.
+    # The restricted HTTP entry: one fixed client, one explicit port, and the shared deployment
+    # options. The credential is whatever each request presents as `Authorization: Bearer`,
+    # exactly as `action` reads it from the environment and hands it to the same `execute`; a
+    # request body is never allowed to name an identity.
     serve = commands.add_parser("serve")
     serve.add_argument("--client", required=True)
     serve.add_argument("--port", type=int, required=True)
+    add_serve_arguments(serve)
     args = parser.parse_args()
     try:
         if args.command in {
@@ -73,18 +76,45 @@ def main():
             create_server(args.config, args.client, args.credential_env).run(transport="stdio")
             return
         elif args.command == "serve":
-            from .knowledge_http import create_app
+            from .knowledge_http import create_app, probe_handles
+            from .runtime_probes import ProbeConfig
+            from .server_runtime import resolve_binding, serve
 
             # No credential is configured here: every request presents its own `Authorization:
             # Bearer` value and the existing `knowledge.clients` decides whether it authorizes
             # anything. A process that cannot read its configuration or whose named client is not
             # registered refuses to start, so it can never look healthy and then refuse every
-            # request.
-            app = create_app(args.config, args.client, args.port)
-            import uvicorn
+            # request. The deployment options are the shared ones; the default binding stays
+            # loopback.
+            binding = resolve_binding(
+                host=args.host,
+                port=args.port,
+                certfile=args.tls_certfile,
+                keyfile=args.tls_keyfile,
+                allowed_hosts=args.allowed_host or [],
+            )
 
-            uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False)
-            return
+            def build():
+                return create_app(args.config, args.client, args.port)
+
+            def probe_settings(assembly):
+                return ProbeConfig(
+                    service=KNOWLEDGE_SERVICE,
+                    diagnostics=assembly.diagnostics,
+                    config_path=args.config,
+                    contract_path=assembly.diagnostics.contract_path,
+                    runtime=assembly,
+                    client=args.client,
+                    handles=lambda: probe_handles(assembly.app, args.port),
+                )
+
+            return serve(
+                KNOWLEDGE_SERVICE,
+                build,
+                args=args,
+                binding=binding,
+                probe_settings=probe_settings,
+            )
         else:
             with Path(args.file).open("rb") as stream:
                 raw = stream.read(262145)

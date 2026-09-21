@@ -4,14 +4,41 @@ import os
 import sqlite3
 from pathlib import Path
 
-import uvicorn
 from jsonschema.exceptions import ValidationError
 
-from .app import configured_app
+from .app import configured_app, runtime_app
+from .diagnostics import CHAT_SERVICE
 from .domain import Fault, strict_json
+from .server_runtime import add_serve_arguments, serve
 from .store import Store
 from .user_actions import LocalUserApplication
 from .workflow import LocalWorkflow
+
+
+def serve_deployment(args):
+    """Run the deployment `serve` command through the shared runtime assembly.
+
+    The deployment options are the shared ones: an IP-literal `--host`, an explicit port, and the
+    TLS and authority arguments a non-loopback bind requires. The application is the same
+    `runtime_app` composition the product already had, built here so the runtime can install the
+    diagnostic stack, the two probes and the authority check around it.
+    """
+    from .runtime_probes import ProbeConfig
+
+    def build():
+        return runtime_app(args.config, args.diagnostics_contract)
+
+    def probe_settings(assembly):
+        return ProbeConfig(
+            service=CHAT_SERVICE,
+            diagnostics=assembly.diagnostics,
+            config_path=args.config,
+            contract_path=assembly.diagnostics.contract_path,
+            runtime=assembly,
+            handles=lambda: assembly.app.state.memory is not None,
+        )
+
+    return serve(CHAT_SERVICE, build, args=args, probe_settings=probe_settings)
 
 
 def main():
@@ -20,8 +47,11 @@ def main():
     )
     parser.add_argument("--config", required=True, help="Explicit private runtime JSON config")
     sub = parser.add_subparsers(dest="operation", required=True)
-    serve = sub.add_parser("serve")
-    serve.add_argument("--port", type=int, default=8130)
+    serve_parser = sub.add_parser(
+        "serve", help="One HTTP process: identity, chat, profile and source-sync entry"
+    )
+    serve_parser.add_argument("--port", type=int, default=8130)
+    add_serve_arguments(serve_parser)
     action = sub.add_parser(
         "fixture-action", help="Local synthetic source/review input; never production confirmation"
     )
@@ -50,6 +80,13 @@ def main():
     )
     migrate_sources.add_argument("--backup", required=True)
     args = parser.parse_args()
+    if args.operation == "serve":
+        return serve_deployment(args)
+    return run_local_operation(args, parser)
+
+
+def run_local_operation(args, parser):
+    """Every non-deployment operation, exactly as the product already ran it."""
     if args.operation in {"migrate-profiles", "migrate-sources", "migrate-users"}:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
         store = Store(
@@ -70,9 +107,6 @@ def main():
         return
     os.environ["TIANSHU_MEMORY_CONFIG"] = args.config
     app = configured_app()
-    if args.operation == "serve":
-        uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False)
-        return
     if args.operation == "user-action":
         try:
             raw = Path(args.file).read_bytes()
@@ -111,3 +145,10 @@ def main():
     else:
         result = getattr(workflow, args.operation.replace("-", "_"))()
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    # The console script installed from `[project.scripts]` calls `main` directly; this guard is
+    # what makes `python -m tianshu_memory.cli` the same command, which is how the deployment
+    # documentation and the process tests start it.
+    main()

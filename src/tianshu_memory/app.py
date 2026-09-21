@@ -10,6 +10,12 @@ from starlette.concurrency import run_in_threadpool
 
 from .auth import Authenticator
 from .contracts import Contracts
+from .diagnostics import (
+    CHAT_SERVICE,
+    note_authenticated,
+    note_fault,
+    record_execution,
+)
 from .domain import Fault, fingerprint, now, strict_json
 from .service import MemoryService
 from .sources import LocalFixtureSources
@@ -23,6 +29,41 @@ OPERATIONS = {
     "/internal/v1/memory/revise": ("revise", "revise_request", "revise_response"),
     "/internal/v1/memory/turn-commits": ("consume", "committed_event", "consume_receipt"),
 }
+
+
+def module_of(operation, input_type):
+    """The contract module an operation's input and output belong to."""
+    if operation == "check_sources":
+        return "sync-shared"
+    if operation == "select_profiles":
+        return "profiles"
+    return "identity-memory"
+
+
+async def served(*, service, request, operation, payload, context, module, output_type):
+    """Run one operation through the service and validate the shape it produced.
+
+    The one seam this task adds to the request path: the synchronous call is wrapped so the
+    diagnostic adapter records when it really started and when it really ended. Nothing about the
+    call itself changes — same service object, same arguments, same threadpool.
+    """
+    execution = record_execution(operation)
+    try:
+        with execution:
+            result = await run_in_threadpool(getattr(service, operation), payload, context)
+    except BaseException:
+        # A response that ended before the worker could start performs no work at all, and the log
+        # says exactly that instead of leaving a start without an end.
+        execution.cancelled()
+        raise
+    service.contracts.validate(f"{module}#{output_type}", result)
+    return JSONResponse(
+        result,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Memory-Token-Accounting": "utf8-bytes-conservative-estimate",
+        },
+    )
 
 
 def create_app(*, service=None, auth=None):
@@ -56,12 +97,17 @@ def create_app(*, service=None, auth=None):
             request_id = "request-unavailable"
             try:
                 if service is None or auth is None:
+                    note_authenticated("dependency_unavailable")
                     raise Fault("dependency_unavailable", 503)
                 authenticated_service, caller = auth.authenticate(
                     request.headers.get("authorization")
                 )
                 if operation not in caller.get("operations", []):
+                    note_authenticated("forbidden")
                     raise Fault("forbidden", 403)
+                # The verdict is recorded here, straight after the same two checks that always
+                # decided it: nothing about who may call what has changed.
+                note_authenticated()
                 body = bytearray()
                 async for chunk in request.stream():
                     body.extend(chunk)
@@ -110,21 +156,14 @@ def create_app(*, service=None, auth=None):
                     and service.source_authority is None
                 ):
                     raise Fault("dependency_unavailable", 503)
-                result = await run_in_threadpool(getattr(service, operation), payload, context)
-                module = (
-                    "sync-shared"
-                    if operation == "check_sources"
-                    else "profiles"
-                    if operation == "select_profiles"
-                    else "identity-memory"
-                )
-                service.contracts.validate(f"{module}#{output_type}", result)
-                return JSONResponse(
-                    result,
-                    headers={
-                        "Cache-Control": "no-store",
-                        "X-Memory-Token-Accounting": "utf8-bytes-conservative-estimate",
-                    },
+                return await served(
+                    service=service,
+                    request=request,
+                    operation=operation,
+                    payload=payload,
+                    context=context,
+                    module=module_of(operation, input_type),
+                    output_type=output_type,
                 )
             except Fault as error:
                 if error.code == "idempotency_conflict":
@@ -134,14 +173,17 @@ def create_app(*, service=None, auth=None):
                             "INSERT INTO conflicts(operation,request_id,digest) VALUES (?,?,?)",
                             (operation, request_id, fingerprint(payload)),
                         )
+                note_fault(error.code)
                 return JSONResponse(
                     error.wire(request_id),
                     status_code=error.status,
                     headers={"Cache-Control": "no-store"},
                 )
             except (ValidationError, ValueError, KeyError, TypeError):
+                note_fault("invalid_input")
                 return JSONResponse(Fault("invalid_input").wire(request_id), status_code=400)
             except (sqlite3.Error, OSError):
+                note_fault("dependency_unavailable")
                 return JSONResponse(
                     Fault("dependency_unavailable", 503).wire(request_id), status_code=503
                 )
@@ -170,6 +212,34 @@ def create_app(*, service=None, auth=None):
     return app
 
 
+def runtime_app(config_path, contract_path):
+    """The composition root the deployment CLI hands to `server_runtime`.
+
+    It is the same `configured_app` factory the product already had, plus the one thing a probe
+    cannot read from a file: whether this process really holds its own service and authenticator.
+    No route, no authorization rule and no repair path is added here.
+    """
+    from .runtime_probes import ProbeConfig
+
+    app = configured_app()
+
+    def handles():
+        return app.state.memory is not None and getattr(app.state, "auth", None) is not None
+
+    def probe_settings(assembly):
+        return ProbeConfig(
+            service=CHAT_SERVICE,
+            diagnostics=assembly.diagnostics,
+            config_path=config_path,
+            contract_path=contract_path,
+            runtime=assembly,
+            handles=handles,
+        )
+
+    app.state.probe_settings = probe_settings
+    return app
+
+
 def configured_app():
     config_path = os.environ.get("TIANSHU_MEMORY_CONFIG")
     if not config_path:
@@ -194,4 +264,6 @@ def configured_app():
         sources = SourceAuthority(SourceTransport(config_path, contracts), contracts)
     service = MemoryService(store, contracts, source_authority=sources)
     auth = Authenticator(config_path, contracts, now)
-    return create_app(service=service, auth=auth)
+    app = create_app(service=service, auth=auth)
+    app.state.auth = auth
+    return app

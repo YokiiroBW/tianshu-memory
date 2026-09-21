@@ -67,6 +67,32 @@ from .knowledge import KnowledgeApplication
 
 ACTION_PATH = "/local/v1/project-knowledge/action"
 HEALTH_PATH = "/health"
+# The correlation header the frozen diagnostics contract fixes, the request-scope key the installed
+# middleware publishes its validated value under, and the fixed name the installed stack registers
+# itself as. A request may present that one header; this module accepts no other name, echoes only
+# a value that arrived validated, and never reads or writes the log itself.
+CORRELATION_HEADER = "x-tianshu-correlation-id"
+CORRELATION_SCOPE_KEY = "tianshu_correlation_id"
+HOOK_NAME = "tianshu_diagnostics"
+
+
+class _NoExecution:
+    """The stand-in used when no diagnostic stack is installed on this application."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        return False
+
+    def cancelled(self):
+        return None
+
+
+def null_execution():
+    return _NoExecution()
+
+
 # Exactly the operations this entry may carry: the project-knowledge reads plus the whole
 # research-note lifecycle. Every other operation the domain knows stays unreachable from here,
 # even for a client that holds its permission.
@@ -142,6 +168,19 @@ class Refusal(Fault):
 def transport(code, status):
     """This module's own verdict on a request, carrying the status it is reported with."""
     return Fault(code, status)
+
+
+def correlate(response, request):
+    """Carry the request's own verified correlation identifier back, if one was resolved.
+
+    The middleware validates the header and publishes the result on the request scope under the
+    documented name; this helper only copies that value into the response. Nothing else about the
+    request — its body, its authorization, its business fields — is ever reflected.
+    """
+    identifier = request.scope.get(CORRELATION_SCOPE_KEY)
+    if identifier is not None:
+        response.headers[CORRELATION_HEADER] = identifier
+    return response
 
 
 def failed(code, status) -> JSONResponse:
@@ -409,19 +448,31 @@ def create_app(config_path, client, port, *, body_timeout=None, execute_timeout=
         *here*, where it crosses out of the domain, and everything else this module raises later —
         a saturated entry, an expired phase, an unreadable body — is its own verdict and keeps its
         own status. No code name is ever consulted to decide which layer spoke.
+
+        The one addition this task makes is the diagnostic seam around that call: it records the
+        real start and the real end of the synchronous work. It changes nothing about the call —
+        same application, same arguments, same credential, same threadpool — and the observer seam
+        below is untouched.
+
+        The seam is resolved from what the installed stack published on this application, so this
+        module names nothing of it: with no stack installed there is simply nothing to record, which
+        is exactly how this entry behaved before.
         """
         observer = app.state.observer
+        hooks = app.state.__dict__.get(HOOK_NAME)
+        execution = hooks.execution("knowledge") if hooks is not None else null_execution()
         try:
-            if observer is None:
-                result = application().execute(body, client=client, credential=presented)
-                settle = app.state.settle
-                if settle is not None:
-                    settle()
-                return result
-            # The observer replaces the call, never a rule of it: it receives the same body and
-            # the same presented credential a production request would, and an observation that
-            # does not perform the call simply performs nothing.
-            return observer(body, presented, application)
+            with execution:
+                if observer is None:
+                    result = application().execute(body, client=client, credential=presented)
+                    settle = app.state.settle
+                    if settle is not None:
+                        settle()
+                    return result
+                # The observer replaces the call, never a rule of it: it receives the same body and
+                # the same presented credential a production request would, and an observation that
+                # does not perform the call simply performs nothing.
+                return observer(body, presented, application)
         except Fault as error:
             raise Refusal(error.code) from None
 
@@ -488,8 +539,11 @@ def create_app(config_path, client, port, *, body_timeout=None, execute_timeout=
             except Fault:
                 # The read failed, so no call of this request is running and the slot goes back.
                 raise
-            return JSONResponse(
-                await run_operation(body, presented, lease), status_code=200, headers=NO_STORE
+            return correlate(
+                JSONResponse(
+                    await run_operation(body, presented, lease), status_code=200, headers=NO_STORE
+                ),
+                request,
             )
         except Fault:
             raise
@@ -541,3 +595,13 @@ def create_app(config_path, client, port, *, body_timeout=None, execute_timeout=
         return failed("dependency_unavailable", STATUS_DEPENDENCY)
 
     return app
+
+
+def probe_handles(app, port):
+    """Whether this process still holds the objects it was told to serve with.
+
+    Read-only, and the only readiness fact about the knowledge entry that no file can express: the
+    fixed client identity it serves and the port it was told to serve. The deployment assembly
+    calls this; this module installs nothing else.
+    """
+    return bool(app.state.knowledge_client) and isinstance(port, int)

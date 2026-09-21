@@ -1,0 +1,77 @@
+# What the build context may contain. Passed explicitly:
+#
+#   docker build --file infra/container/Dockerfile --ignorefile infra/container/Dockerfile.dockerignore .
+#
+# It lives under `infra/container/` rather than at the repository root because the root is the
+# coordination checkout, which this card does not write; an ignore file placed there would be a
+# change to a shared file. Naming it explicitly also makes the exclusion visible in the build
+# command rather than depending on a file an operator might not notice.
+
+# Everything, then the few things the build actually needs. A default-allow list would have to
+# anticipate every file the checkout may grow, and one missed entry would ship it into an image.
+**
+
+# The two inputs of the locked resolution, plus the source that gets installed.
+!pyproject.toml
+!uv.lock
+!src/**
+
+# The source is narrowed too: only modules are installed, so a stray scratch file under `src/` is
+# not carried in. Nothing outside `src/tianshu_memory/` is needed.
+src/**
+!src/tianshu_memory/**
+src/tianshu_memory/**
+!src/tianshu_memory/*.py
+!src/tianshu_memory/**/*.py
+
+# The probe script is copied in its own layer, so it is the third and last thing kept.
+!scripts/container_healthcheck.py
+
+# Named for what they are, so a reader can see each exclusion was deliberate rather than an
+# oversight of a wildcard. The first group is already covered by `**` and stays because the reason
+# matters: this image must never contain a checkout, a runtime directory, a credential or a
+# database, and a build context that could carry one is one mistake away from doing so.
+.git/**
+.gitignore
+.github/**
+.runtime/**
+.venv/**
+venv/**
+tests/**
+docs/**
+infra/**
+projects/**
+node_modules/**
+__pycache__/**
+*.pyc
+.pytest_cache/**
+.ruff_cache/**
+
+# Local state and credentials, by extension and by name rather than by directory, because a private
+# configuration can sit anywhere an operator put it. `*.json` is deliberately not excluded: the
+# build inputs are a `.toml` and a `.lock`, and excluding every JSON file would silently drop any
+# packaged data file a future module needs. These patterns name the artifacts that hold secrets or
+# real content instead.
+*.jsonl
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+.env
+.env.*
+credentials*
+*credential*
+*secret*
+*password*
+*token*
+source-guard.json
+
+# Container files themselves: the build does not need its own recipe or the build script it runs.
+Dockerfile*
+*.dockerignore
+docker-compose*.yml
