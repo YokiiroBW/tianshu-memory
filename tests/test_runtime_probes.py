@@ -216,6 +216,77 @@ def test_a_healthy_knowledge_process_reports_ready(knowledge_service, diagnostic
     assert set(document["checks"]) == set(CHECKS_BY_SERVICE[KNOWLEDGE_SERVICE])
 
 
+def test_the_knowledge_service_depends_on_the_same_checkpoint_its_store_verifies(
+    knowledge_service, diagnostics
+):
+    """The reviewed defect: deleting the guard left readiness claiming `ready`.
+
+    The knowledge entry builds its Store with this exact recovery path and every write it performs
+    re-verifies that checkpoint first, so a process whose guard is gone cannot serve at all. A
+    readiness verdict has to say so, and it has to say so without touching the file: a probe that
+    rebuilt a guard would be repairing the very protection it is reporting on.
+    """
+    diagnostics = Diagnostics(KNOWLEDGE_SERVICE, {"log_directory": str(diagnostics.sink.directory)})
+    guard = Path(str(knowledge_service.store.path) + ".source-guard.json")
+    assert guard.is_file(), "a migrated knowledge database records a checkpoint"
+    before = guard.read_bytes()
+
+    def verdict():
+        return readiness(
+            settings_for(
+                KNOWLEDGE_SERVICE,
+                knowledge_service,
+                diagnostics,
+                contract_path=diagnostics_package(),
+                client=CLIENT,
+            )
+        )
+
+    assert verdict()["checks"]["database"] == "ok"
+    guard.unlink()
+    absent = verdict()
+    assert absent["status"] == "not_ready"
+    assert absent["checks"]["database"] == "not_configured"
+    # Nothing was re-created, and nothing was written in its place.
+    assert not guard.exists()
+    guard.write_bytes(before)
+    assert verdict()["status"] == "ready"
+    # A guard that no longer agrees with the database is not-ready either, and is left alone: the
+    # checkpoint is compared as the same canonical form the Store compares, not re-derived here.
+    damaged_value = json.loads(before)
+    damaged_value["revision"] = damaged_value["revision"] + 1
+    damaged = canonical(damaged_value).encode("utf-8")
+    guard.write_bytes(damaged)
+    disagreeing = verdict()
+    assert disagreeing["status"] == "not_ready"
+    assert disagreeing["checks"]["database"] == "failed"
+    assert guard.read_bytes() == damaged
+    guard.write_bytes(before)
+
+
+def test_the_knowledge_guard_is_the_one_the_configuration_names(knowledge_service, diagnostics):
+    """A configured recovery path is the guard that counts, exactly as the Store reads it."""
+    elsewhere = knowledge_service.tmp_path / "placed-elsewhere.json"
+    assert not elsewhere.exists()
+    knowledge_service.config["source_sync"] = {"recovery_path": str(elsewhere)}
+    knowledge_service.path.write_text(canonical(knowledge_service.config), encoding="utf-8")
+    diagnostics = Diagnostics(KNOWLEDGE_SERVICE, {"log_directory": str(diagnostics.sink.directory)})
+    document = readiness(
+        settings_for(
+            KNOWLEDGE_SERVICE,
+            knowledge_service,
+            diagnostics,
+            contract_path=diagnostics_package(),
+            client=CLIENT,
+        )
+    )
+    # The default guard beside the database is present but is not the one this configuration uses.
+    assert Path(str(knowledge_service.store.path) + ".source-guard.json").is_file()
+    assert document["status"] == "not_ready"
+    assert document["checks"]["database"] == "not_configured"
+    assert not elsewhere.exists()
+
+
 def test_the_document_has_exactly_the_three_contract_fields(chat_service, diagnostics):
     settings = settings_for(
         CHAT_SERVICE, chat_service, diagnostics, contract_path=diagnostics_package()

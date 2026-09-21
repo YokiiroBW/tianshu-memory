@@ -60,8 +60,13 @@
   值取自 `ok` / `failed` / `not_configured` / `not_verified` / `non_durable`。
   全部响应带 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`、
   `Referrer-Policy: no-referrer`。
-- readiness token 只从 `diagnostics.token_env` 命名的环境变量读取，**不落盘、不进日志**；它不授予
-  任何业务权限。token 在适配器构造时读取，进程运行期间不会获得新凭据。
+- readiness token 只从 `diagnostics.token_env` 命名的环境变量读取（配置未写该键时默认
+  `TIANSHU_DIAGNOSTICS_TOKEN`），**不落盘、不进日志**；它不授予任何业务权限。token 在适配器
+  构造时读取，进程运行期间不会获得新凭据。反向也成立：业务凭据不会被当成探针凭据，任何未被
+  配置命名的变量都不会让 `/health/ready` 通过。
+- `runtime.ready` **只由进程自身的生命周期记录**（套接字已开、本机前置条件成立之后），探针在
+  任何路径上都不写它。就绪判定为假的进程在此**什么都不记**：不成立的状态已经有自己的启动记录，
+  为它补一条生命周期行就是假成功。
 - `not_verified` 表示"本进程没有真的测过这条依赖"（远端来源、外部依赖），按合同如实上报，
   **不阻塞** ready。
 - `not_configured` 的含义按检查项区分，并逐项写在 `runtime_probes.BLOCKING_STATES` 里：
@@ -82,7 +87,10 @@
 - 数据库文件、`source-guard.json` 与所在目录在反复探测前后逐字节一致；
 - 不存在的数据库**保持不存在**（`mode=ro` 不会创建空库）；
 - 旧 schema 不会被隐式迁移；journal mode 不会被改变；
-- 缺失或与库内 revision 不一致的 guard **绝不重建**。
+- 缺失或与库内 revision 不一致的 guard **绝不重建**。知识服务的就绪判定依赖**它自己 Store 所核验
+  的同一份检查点**：检查点缺失或与库内 revision 不一致时 `not_ready`，判定过程只读该文件、
+  逐字节不改动它，也**不**走写恢复记录的路径（日志适配器自己的 guard 检查按同一套原始比较规则
+  执行，不另立一套）。
 
 ### 就绪判定与容量故障
 
@@ -102,11 +110,22 @@
   `request.authenticated`、`sync.execute.started`、`sync.execute.completed`、`request.completed`、
   `log.sink_failed`。未注册名字会被拒绝，不会静默丢弃。
 - 分片 64 MiB 滚动；目录默认上限 1 GiB，可显式配置 32 MiB–64 GiB。写入 flush + fsync，
-  单行在锁内原子落盘。
+  单行**由唯一写线程**原子落盘。
+- **只有一个写线程拥有文件**：阻塞的 `flush`/`fsync` 由该线程承担，事件循环只递交一行并等待结论，
+  所以慢盘不会拖住其它请求（包括 liveness 探针）。`sequence` 在写线程上、写入前于 sink 锁内
+  **预留**，因此文件里的字节顺序与编号顺序一致，且读取方看到的 `sequence` 永远是已落盘的值。
+- 边界都是**明确的拒绝**，不是"也许写入成功"：队列上限 64 行，递交最多等 0.25 秒；调用方最多等
+  2 秒确认；关停最多等 5 秒。超过确认期限的那次写入**不会被取消、也不会重发**（它仍是写线程自己的
+  工作量），但该行**不算已确认**，进程被锁存为 `log_unavailable` 并停止接纳新业务——"字节大概在"
+  不是本进程可以给出的持久化结论。
 - 容量故障**失败关闭**：不删除尚未被采集的文件，不再接受新业务，只打印一次固定告警到 stderr
   （`tianshu-memory: runtime event log unavailable; readiness fails closed`）。
-- `log_directory` 缺失或为 `false` 时进入**非持久模式**：此时什么都不写（没有 stdio 回退，
-  避免服务进程被写满的继承管道阻塞），生产环境下非持久模式**永不 ready**。
+- **未配置**日志目录与**显式关闭**是两种不同状态：配置里给出 `log_directory` 时以它为准；配置里
+  没有该键时才读 `TIANSHU_LOG_DIR`；写 `log_directory: false` 表示显式关闭持久化，环境变量
+  **不能**覆盖这个书面决定。显式非持久模式什么都不写（没有 stdio 回退，避免服务进程被写满的
+  继承管道阻塞），生产环境下非持久模式**永不 ready**。
+- 一个进程**从未**被配置持久日志时，业务请求不被拒绝（那是显式的开发模式，由 readiness 的
+  `non_durable` 拒绝）；一旦配置了持久日志而某一行确认不了，请求必须被拒绝（`503`）。
 
 ### 关联标识
 
@@ -185,11 +204,17 @@ docker run --read-only --tmpfs /tmp `
 
 | 变量 | 谁读 | 含义 |
 | --- | --- | --- |
-| `TIANSHU_DIAGNOSTICS_TOKEN` | 运行时（名字由配置的 `diagnostics.token_env` 指定） | `/health/ready` 的独立凭据；不授予业务权限 |
+| `TIANSHU_DIAGNOSTICS_TOKEN` | 运行时（配置未写 `diagnostics.token_env` 时的**默认名字**） | `/health/ready` 的独立凭据；不授予业务权限，不写入日志 |
 | `TIANSHU_HEALTHCHECK_HOST` | `scripts/container_healthcheck.py` | 被公告的权威名（含端口），同时决定 `Host` 头与连接端口 |
 | `TIANSHU_HEALTHCHECK_CA` | 同上 | 可选：额外的私有信任锚文件路径；**不是**关闭校验的开关 |
-| `TIANSHU_LOG_DIR` | 配置作者 | 镜像内约定：日志卷的挂载点，写进配置的 `log_directory` |
+| `TIANSHU_LOG_DIR` | 运行时（配置未写 `log_directory` 时） | JSONL 运行日志目录，必须是绝对路径；配置里的书面值优先 |
 | `TIANSHU_MEMORY_CONFIG` | 容器默认命令 | 镜像内约定：配置文件路径 |
+
+**显式配置优先于环境变量**，且方向只有一个：配置文件里写了的 `log_directory` /
+`diagnostics.token_env` 就是答案，环境变量只在配置**没有**给出该键时才被读取。所以继承来的
+环境变量既不能把已配置的进程重定向到别的目录，也不能在进程已按书面配置关掉持久化后把它打开。
+`diagnostics.token_env` 命名的凭据**只**用于 `/health/ready`：它不授予任何业务权限，业务凭据
+（如记忆/知识域的 bearer）**不会**被当作探针凭据读取，反向也是如此。
 
 绑定地址、端口、证书、权威名与身份**都只能来自启动参数**，没有任何环境变量回退。
 

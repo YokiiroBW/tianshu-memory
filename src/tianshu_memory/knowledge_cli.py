@@ -95,7 +95,18 @@ def main():
             )
 
             def build():
-                return create_app(args.config, args.client, args.port)
+                # The deployment's own validated authorities go to the business entry as well, so
+                # the inner Host check accepts exactly what this binding accepted. Without them a
+                # legal non-loopback deployment would pass the outer check and then be refused by
+                # the entry's own loopback rule — reachable as a probe and unusable as a service.
+                # This hands over the names that were already validated before the socket existed;
+                # it does not relax the check, derive anything from a request or accept a wildcard.
+                return create_app(
+                    args.config,
+                    args.client,
+                    args.port,
+                    authorities=binding.authority_names(),
+                )
 
             def probe_settings(assembly):
                 return ProbeConfig(

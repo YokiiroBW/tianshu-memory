@@ -27,11 +27,12 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 
 from . import source_recovery
 from .diagnostics import CHAT_SERVICE, CHECK_STATES, CHECKS_BY_SERVICE, KNOWLEDGE_SERVICE
-from .domain import canonical
+from .domain import canonical, strict_json
 
 # The frozen diagnostics package as published by the coordinator. This product consumes it and
 # keeps it at deployment time; it never copies the schema source into itself.
@@ -175,7 +176,7 @@ def _connect(database):
 def _select(database, statements):
     """Run the fixed read-only statements and return their rows, or a verdict for the failure."""
     try:
-        with _connect(database) as connection:
+        with closing(_connect(database)) as connection:
             return [connection.execute(statement).fetchone() for statement in statements], None
     except sqlite3.Error as error:
         return None, failed(retryable=error.sqlite_errorcode in RETRYABLE_SQLITE)
@@ -248,9 +249,18 @@ def probe_guard(database, guard_path):
     A checkpoint is required exactly when the database records one. A missing, unreadable or
     divergent file is not-ready and is never rewritten, deleted or re-initialized here; a database
     whose metadata does not yet record a revision legitimately has no checkpoint to compare.
+
+    This is the same verdict the Store itself reaches before it commits, reached without writing
+    anything: the guard is the business's own protection, and a readiness probe that skipped it
+    would call a process ready whose very next transaction must fail closed. The original
+    `source_recovery.verify` is deliberately *not* called here — it logs an error line through
+    `logging`, and a probe that appended a line to any log would stop being read-only. The
+    comparison below is therefore made with the same strict parser and the same canonical form the
+    original uses, so the two agree on what "the same checkpoint" means without either of them
+    writing.
     """
     try:
-        with _connect(database) as connection:
+        with closing(_connect(database)) as connection:
             expected = source_recovery.checkpoint(connection)
     except sqlite3.Error as error:
         return failed(retryable=error.sqlite_errorcode in RETRYABLE_SQLITE)
@@ -262,12 +272,32 @@ def probe_guard(database, guard_path):
     if not guard.is_file():
         return NOT_CONFIGURED
     try:
-        actual = json.loads(guard.read_text(encoding="utf-8"))
+        actual = strict_json(guard.read_bytes())
     except (OSError, ValueError):
         return failed()
     if canonical(actual) != canonical(expected):
         return failed()
     return OK
+
+
+def probe_knowledge_guard(database, raw):
+    """The checkpoint the knowledge entry's own Store will verify before it commits anything.
+
+    The knowledge entry builds its Store with the configured recovery path, defaulting to the
+    database's own `.source-guard.json`, and every write it performs re-verifies that checkpoint
+    first. A readiness verdict that reported this process ready with that guard missing would
+    describe a service whose very next operation must refuse — so the guard is part of what
+    readiness means here, read through the same rule the chat entry uses rather than a second one.
+    """
+    return probe_guard(database, _recovery_path(raw, database))
+
+
+def _recovery_path(raw, database):
+    """The guard path this configuration's Store will use, resolved the way `Store` resolves it."""
+    configured = (raw.get("source_sync") or {}).get("recovery_path")
+    if isinstance(configured, str) and configured.strip():
+        return configured
+    return str(database) + ".source-guard.json"
 
 
 def probe_mode(raw):
@@ -412,6 +442,25 @@ def probe_ownership(runtime, handles):
         return failed()
 
 
+def combine(first, second):
+    """The worse of two parts of one check, so a combined verdict never hides a failure.
+
+    Readiness reports a fixed, closed set of check keys — that set is frozen by the contract, and a
+    probe may not add a key just to display something. When one key genuinely covers two conditions
+    that must both hold, the verdict has to be the worse of them: reporting the better one would be
+    a readiness claim about a prerequisite that just failed.
+    """
+    if first.state == "failed" or second.state == "failed":
+        return failed(retryable=first.retryable or second.retryable)
+    if first.state == "not_configured" or second.state == "not_configured":
+        return NOT_CONFIGURED
+    if first.state == "non_durable" or second.state == "non_durable":
+        return NON_DURABLE
+    if first.state == "not_verified" or second.state == "not_verified":
+        return NOT_VERIFIED
+    return OK
+
+
 def assess(settings, diagnostics, runtime=None):
     """Every check for one service, keyed by the closed set readiness reports."""
     checks = {
@@ -430,12 +479,18 @@ def assess(settings, diagnostics, runtime=None):
             checks.setdefault(key, failed())
         return checks
     database = raw.get("database_path") or ""
-    checks["database"] = probe_database(database)
     if settings.service == CHAT_SERVICE:
         guard = (raw.get("source_sync") or {}).get("recovery_path")
+        checks["database"] = probe_database(database)
         checks["guard"] = probe_guard(database, guard or str(database) + ".source-guard.json")
         checks["mode"] = probe_mode(raw)
     else:
+        # The knowledge entry's own service protection is the same checkpoint the chat entry uses,
+        # reached through the same read-only rule: every write it performs re-verifies that guard
+        # before committing, so a process whose guard is missing cannot serve at all. Its check set
+        # is frozen without a separate guard key, so the two conditions it really depends on are
+        # reported together under `database`, as the worse of the two.
+        checks["database"] = combine(probe_database(database), probe_knowledge_guard(database, raw))
         checks["client"] = probe_knowledge_client(settings, raw)
         checks["extensions"] = probe_knowledge_extensions(database)
     return checks

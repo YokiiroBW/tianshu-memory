@@ -225,18 +225,35 @@ def serve_port(port):
     return port
 
 
-def check_host(host, port):
-    """Only the loopback authority of this exact port is accepted.
+def check_host(host, port, authorities=None):
+    """Only the authority of this exact port that this process was told to answer on.
 
-    A request with any other Host — a public name, a DNS name resolving here, or the same host
-    on a different port — is refused before the body is read. Forwarded headers are never
-    consulted, because this process must not be reachable through a proxy.
+    A request with any other Host — a public name nobody configured, a DNS name resolving here, or
+    the same name on a different port — is refused before the body is read. Forwarded headers are
+    never consulted, because this process must not be reachable through a proxy.
+
+    `authorities` is the deployment's own already-validated authority set, and it is the *only*
+    thing that can widen this check. A deployment that binds off loopback must present its legal
+    names to the shared binding before the socket exists; those same validated names are handed
+    here, so this entry accepts exactly what that binding accepts and nothing more. Nothing is ever
+    derived from a request, a wildcard is never accepted, and the loopback rule below stays the
+    default for every application that was not assembled for a deployment.
     """
-    authority = (host or "").strip().lower()
-    name, separator, declared = authority.rpartition(":")
-    if not separator:
-        name, declared = authority, ""
-    require(name in LOOPBACK_HOSTS and declared == str(port), "invalid_host", STATUS_AUTHORITY)
+    require(authority(host, port, authorities), "invalid_host", STATUS_AUTHORITY)
+
+
+def authority(host, port, authorities=None):
+    """Whether a presented `Host` names an authority this process may answer on."""
+    text = (host or "").strip().lower()
+    name, separator, declared = text.rpartition(":")
+    if not separator or ":" in name:
+        # No port at all, or a bare IPv6 literal that was never bracketed.
+        name, declared = text, ""
+    if declared != str(port):
+        return False
+    if authorities is None:
+        return name in LOOPBACK_HOSTS
+    return name in authorities
 
 
 def check_origin(request):
@@ -336,14 +353,22 @@ def parse_body(raw):
     return payload
 
 
-def create_app(config_path, client, port, *, body_timeout=None, execute_timeout=None):
-    """Build the entry for one fixed knowledge client on one explicit loopback port.
+def create_app(
+    config_path, client, port, *, body_timeout=None, execute_timeout=None, authorities=None
+):
+    """Build the entry for one fixed knowledge client on one explicit port.
 
     The factory refuses to build an application whose private configuration is missing or
     unparseable, whose named client is not registered, or whose port is not a real port: a
     process that cannot serve its client must not start and then look alive. It holds no
     credential: every request presents its own, and the domain decides whether it authorizes
     anything.
+
+    `authorities` is the deployment's validated authority set, and it is optional so that a bare
+    application keeps the loopback-only rule it has always had. A deployment passes exactly the
+    names its binding already accepted, so a legal non-loopback authority reaches the business
+    route instead of being refused a second time by a check that never saw the deployment's own
+    configuration. It is never derived from a request and never a wildcard.
 
     The two phase limits exist so a test can exercise a deadline without waiting ten seconds. The
     wire contract is the defaults; production never passes them.
@@ -355,6 +380,7 @@ def create_app(config_path, client, port, *, body_timeout=None, execute_timeout=
         STATUS_BODY,
     )
     port = serve_port(port)
+    authorities = None if authorities is None else frozenset(authorities)
     read_deadline = READ_TIMEOUT_SECONDS if body_timeout is None else float(body_timeout)
     execute_deadline = (
         EXECUTE_TIMEOUT_SECONDS if execute_timeout is None else float(execute_timeout)
@@ -513,7 +539,7 @@ def create_app(config_path, client, port, *, body_timeout=None, execute_timeout=
         fails closed with the storage error the domain raises. This route neither reads a body nor
         takes one of the four slots: it does no work that a slot bounds.
         """
-        check_host(request.headers.get("host"), port)
+        check_host(request.headers.get("host"), port, authorities)
         check_origin(request)
         return JSONResponse(
             {"state": "listening", "entrypoint": "project_knowledge_http", "projects": None},
@@ -524,7 +550,7 @@ def create_app(config_path, client, port, *, body_timeout=None, execute_timeout=
     @app.post(ACTION_PATH, status_code=200)
     async def action(request: Request):
         """One complete project-knowledge or research-note operation."""
-        check_host(request.headers.get("host"), port)
+        check_host(request.headers.get("host"), port, authorities)
         check_origin(request)
         presented = bearer(request)
         check_media_type(request)

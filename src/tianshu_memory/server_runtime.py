@@ -78,15 +78,31 @@ class Binding:
         IPv6 address is the same interface, and a value this runtime cannot parse is refused instead
         of being compared as text.
         """
+        return self.authority_of(header) is not None
+
+    def authority_of(self, header):
+        """The normalized authority a legal `Host` header names, or None when it names none.
+
+        This is the same verdict `accepts` gives, in the form an inner entry point needs: the entry
+        that re-checks the authority downstream must accept exactly what this binding accepted and
+        refuse exactly what it refused. Returning the resolved name rather than a boolean keeps that
+        exact — the inner check compares against names this binding already validated, so it can
+        neither widen the rule nor invent a second one.
+        """
         if not isinstance(header, str):
-            return False
+            return None
         name, port = split_authority(header.strip().lower())
         if port != str(self.port):
-            return False
+            return None
         try:
-            return normalize_authority(name, self.port) in self.allowed
+            resolved = normalize_authority(name, self.port)
         except Fault:
-            return False
+            return None
+        return resolved if resolved in self.allowed else None
+
+    def authority_names(self):
+        """Every authority this binding accepts, in the one comparable form it compares."""
+        return frozenset(self.allowed)
 
 
 def ip_literal(value):
@@ -346,11 +362,18 @@ class Assembly:
         self.state = "active"
 
     def announce_ready(self, document):
-        """Record the first successful readiness verdict, once, and only while active."""
+        """Record the first successful readiness verdict, once, and only while active.
+
+        This is the *lifecycle* seam, never a probe: it is called from the startup path after the
+        socket is open, so the line is written once when this process really reached readiness. A
+        readiness request must not be able to append anything at all — including this event — which
+        is why the route that answers those requests never calls this.
+        """
         if document["status"] != "ready" or self.ready_announced or not self.active:
-            return
+            return False
         self.ready_announced = True
         self.diagnostics.emit("runtime.ready", level="INFO", outcome="succeeded")
+        return True
 
     def stopping(self):
         if self.state == "stopped":
@@ -363,7 +386,7 @@ class Assembly:
             return
         self.state = "stopped"
         self.diagnostics.emit("runtime.stopped", level="INFO", outcome="succeeded")
-        self.diagnostics.sink.close()
+        self.diagnostics.shutdown()
 
     def probe_settings(self):
         """The read-only probe settings for this exact assembly, built by the entry point.
@@ -400,11 +423,11 @@ def build_assembly(service, build_app, *, config_path, contract_path, binding, p
         install_probe_routes(assembly.app, assembly)
     except Fault:
         diagnostics.emit("runtime.start_failed", level="ERROR", outcome="failed")
-        diagnostics.sink.close()
+        diagnostics.shutdown()
         raise
     except BaseException:
         diagnostics.emit("runtime.start_failed", level="ERROR", outcome="failed")
-        diagnostics.sink.close()
+        diagnostics.shutdown()
         raise Fault("invalid_configuration", 503) from None
     return assembly
 
@@ -467,7 +490,11 @@ def install_probe_routes(app, assembly):
             # own local prerequisites in time, so it is not ready. Liveness is unaffected, because
             # it does no work that could block.
             document = closed_document(assembly.diagnostics.service)
-        assembly.announce_ready(document)
+        # Nothing is recorded here, on any path out of this route: not the request, not the
+        # authentication verdict, not the probe's result and not a readiness transition. Both
+        # probes are strictly read-only, so asking this process a question cannot change its log,
+        # its sequence, its database or its business facts — no matter how often it is asked, or
+        # whether the caller was authorized.
         return JSONResponse(
             document,
             status_code=200 if document["status"] == "ready" else 503,
@@ -610,9 +637,32 @@ async def _serve(server, assembly):
         assembly.diagnostics.emit("runtime.start_failed", level="ERROR", outcome="failed")
         return
     assembly.started()
+    await announce_startup_readiness(assembly)
     try:
         await server.main_loop()
     finally:
         assembly.stopping()
         await server.shutdown(sockets=getattr(server, "servers", None))
         assembly.stopped()
+
+
+async def announce_startup_readiness(assembly):
+    """Record this process's own readiness once, from the lifecycle, after the socket is open.
+
+    This is where `runtime.ready` belongs: the process has just established that it is serving and
+    that its local prerequisites hold, and an operator watching the collected stream sees that
+    transition without having to poll anything. Neither probe ever triggers it — a health request
+    that appended a line would make the probe a writer, which is exactly what it must not be.
+
+    The verdict is read on a worker, never on the event loop, and a process that is not ready says
+    nothing here: a not-ready verdict already has its own record at startup, and inventing a
+    lifecycle line for a state this process never reached would be a false success.
+    """
+    try:
+        document = await asyncio.wait_for(
+            asyncio.to_thread(readiness, assembly.probe_settings()),
+            timeout=CHECK_DEADLINE_SECONDS,
+        )
+    except (TimeoutError, asyncio.TimeoutError, Fault):
+        return
+    assembly.announce_ready(document)

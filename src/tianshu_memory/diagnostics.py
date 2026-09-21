@@ -30,8 +30,10 @@ What it guarantees, and how:
 `runtime_probes` reads the latch; the probe itself never writes here.
 """
 
+import asyncio
 import json
 import os
+import queue
 import re
 import sys
 import threading
@@ -60,6 +62,26 @@ DEFAULT_SEGMENT_BYTES = 64 * 1024 * 1024
 MIN_DIRECTORY_BYTES = 32 * 1024 * 1024
 DEFAULT_DIRECTORY_BYTES = 1024 * 1024 * 1024
 MAX_DIRECTORY_BYTES = 64 * 1024 * 1024 * 1024
+
+# The two environment variables the deployment convention fixes. Both are read here, by the
+# adapter that owns them, so a container that sets them really is wired up rather than merely
+# configured to look that way. An explicit configuration key always wins over its environment
+# variable: the file is the deployment's own statement, and an environment variable inherited from
+# a unit must never silently redirect a process that was configured in writing.
+LOG_DIRECTORY_ENV = "TIANSHU_LOG_DIR"
+DEFAULT_TOKEN_ENV = "TIANSHU_DIAGNOSTICS_TOKEN"
+# How much persistence work may be outstanding at once. The queue is the only buffer between a
+# request and the one writer, so its size is the bound on how many requests can be waiting on the
+# log: a burst beyond it is refused rather than parked, exactly as an overloaded service refuses.
+WRITE_QUEUE_LIMIT = 64
+# The longest a caller waits for the writer it is not allowed to run itself: how long a single
+# enqueue may block, and how long a caller waits for its own line to be on disk. Both are
+# deadlines on a refusal, never a claim that the line was written.
+WRITER_QUEUE_TIMEOUT_SECONDS = 0.25
+WRITER_DEADLINE_SECONDS = 2.0
+# The longest shutdown waits for already-queued lines. Past it the process stops anyway and every
+# line it could not persist is latched as a failure by the writer that owns it.
+WRITER_SHUTDOWN_SECONDS = 5.0
 
 CORRELATION_HEADER = "x-tianshu-correlation-id"
 CORRELATION_PATTERN = re.compile(r"[a-f0-9]{32}\Z")
@@ -282,26 +304,42 @@ def map_fault(code):
     return FAULT_CODES.get(code, "internal_error")
 
 
+def _directory_setting(value):
+    """One explicitly configured absolute log directory, or None when the key is absent."""
+    if value is None or value is False:
+        return None
+    require(isinstance(value, str) and bool(value.strip()), "invalid_configuration", 503)
+    resolved = Path(value).expanduser()
+    require(resolved.is_absolute(), "invalid_configuration", 503)
+    return resolved
+
+
 def read_config(raw):
-    """The two diagnostics keys, validated strictly; every other key is left to its owner.
+    """The two diagnostics settings, validated strictly; every other key is left to its owner.
 
     `log_directory` is the explicit local log directory (deployment mounts it at
-    `/var/log/tianshu`). `diagnostics.token_env` names the environment variable that holds the
-    independent readiness token; the token itself is never stored or logged here. A non-durable
-    adapter is only ever chosen explicitly: either the key is absent, or it is the literal false.
-    Any other value fails closed rather than silently falling back to a stdio stream.
+    `/var/log/tianshu`). `diagnostics.token_env` names the environment variable holding the
+    independent readiness token; the token itself is never stored or logged here.
+
+    Both deployment variables are read *here*, so setting them really assembles a durable sink
+    rather than only appearing to. The precedence is fixed and one-directional:
+
+    - `log_directory` in the configuration wins; with no key, `TIANSHU_LOG_DIR` is used; with
+      neither, the sink is explicitly non-durable. The variable is only ever a directory: an
+      absolute path, read exactly once while the process is being assembled.
+    - `diagnostics.token_env` in the configuration wins; with no key, the contract's own
+      `TIANSHU_DIAGNOSTICS_TOKEN` is consumed. The variable names which environment variable holds
+      the token — it never *is* the token, so a business credential cannot be picked up by
+      accident here, and the value is only ever read when a readiness request presents one.
+
+    A non-durable adapter is only ever chosen explicitly: either the key is absent and no variable
+    is set, or the key is the literal false. Any other value fails closed rather than silently
+    falling back to a stdio stream.
     """
     require(isinstance(raw, dict), "invalid_configuration", 503)
-    directory = raw.get("log_directory")
-    if directory is None or directory is False:
-        directory = None
-    else:
-        require(
-            isinstance(directory, str) and bool(directory.strip()), "invalid_configuration", 503
-        )
-        resolved = Path(directory).expanduser()
-        require(resolved.is_absolute(), "invalid_configuration", 503)
-        directory = resolved
+    directory = _directory_setting(raw.get("log_directory"))
+    if directory is None and raw.get("log_directory") is not False:
+        directory = _directory_setting(os.environ.get(LOG_DIRECTORY_ENV))
     section = raw.get("diagnostics", {})
     require(isinstance(section, dict), "invalid_configuration", 503)
     token_env = section.get("token_env")
@@ -309,6 +347,8 @@ def read_config(raw):
         require(
             isinstance(token_env, str) and bool(token_env.strip()), "invalid_configuration", 503
         )
+    else:
+        token_env = DEFAULT_TOKEN_ENV
     return {"log_directory": directory, "token_env": token_env}
 
 
@@ -335,6 +375,7 @@ class Sink:
         self.directory_bytes = int(directory_bytes)
         self.lock = threading.Lock()
         self.sequence = 0
+        self._last_reserved = 0
         self.failure = None
         self.warned = False
         self._handle = None
@@ -343,6 +384,60 @@ class Sink:
     @property
     def durable(self):
         return self.directory is not None
+
+    def reserve(self):
+        """Claim the next sequence number for the one thread that is about to write it.
+
+        The read and the increment happen together under the sink's lock, which is what makes the
+        claim exclusive: without that, two writers would read the same value and two lines would
+        carry the same number. The lock is released before the write, so the `fsync` happens with
+        nothing held — that separation is the whole reason the writer thread exists.
+
+        Only the single writer thread calls this. Callers read `sequence`, which is advanced only
+        after a line is really on disk, so no reader ever sees a number that was not written.
+        """
+        with self.lock:
+            self._last_reserved = self.sequence + 1
+            return self._last_reserved
+
+    def last_reserved(self):
+        """The highest number handed out by `reserve`, whether or not it is on disk yet."""
+        return self._last_reserved
+
+    def last_persisted_sequence(self):
+        """The highest sequence already on disk for this instance, or 0.
+
+        Read once while the process is being assembled and before anything is written, so a restart
+        that reuses an instance id continues the sequence instead of repeating numbers inside the
+        same file. A segment that cannot be read is treated as if it were absent: the number this
+        returns is added to, never trusted as the only guard against a repeat.
+        """
+        if self.directory is None:
+            return 0
+        highest = 0
+        try:
+            entries = list(os.scandir(self.directory))
+        except OSError:
+            return 0
+        for entry in entries:
+            name = entry.name
+            if not name.startswith(self.instance_id + ".") or not name.endswith(".jsonl"):
+                continue
+            try:
+                with open(entry.path, encoding="utf-8") as stream:
+                    for line in stream:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            number = json.loads(line).get("sequence")
+                        except (ValueError, AttributeError):
+                            continue
+                        if isinstance(number, int) and number > highest:
+                            highest = number
+            except OSError:
+                continue
+        return highest
 
     def _warn_once(self):
         if not self.warned:
@@ -354,10 +449,14 @@ class Sink:
                 pass
 
     def fail(self, code):
-        """Latch a persistence failure and emit the one fixed warning. Never recovers by itself."""
+        """Latch a persistence failure and emit the one fixed warning. Never recovers by itself.
+
+        The open handle is deliberately left alone: it is owned by the single writer thread, which
+        is the only caller of `write` and therefore the only place that may close it. Latching is
+        safe from any thread.
+        """
         if self.failure is None:
             self.failure = code
-        self._close()
         self._warn_once()
 
     def _close(self):
@@ -423,8 +522,8 @@ class Sink:
         except OSError as error:
             raise SinkUnavailable(f"log segment cannot be opened: {error.errno}") from None
 
-    def write(self, line):
-        """Persist one already-validated line. Raises only to the caller's own failure latch.
+    def write(self, line, sequence):
+        """Persist one already-validated line, and publish the number it was written under.
 
         With no configured log directory there is no second, quieter sink to fall back to: a
         standard stream is not a durable record and must never be mistaken for one, so the line is
@@ -432,6 +531,10 @@ class Sink:
         development process only — a deployment that claims to be ready on it cannot exist — and
         dropping is also the only behavior that cannot block a serving process on a full pipe it
         does not own.
+
+        Only the single writer thread calls this, with a number it claimed from `reserve`. The
+        shared counter is moved at the very end: a reader must never see a number whose bytes are
+        not on disk yet, so its value is always a sequence the file really contains.
         """
         encoded = line.encode("utf-8") + b"\n"
         if len(encoded) > MAX_LINE_BYTES:
@@ -448,9 +551,168 @@ class Sink:
         self._segment_size += len(encoded)
         handle.flush()
         os.fsync(handle.fileno())
+        self.sequence = sequence
 
     def close(self):
+        """Release the open segment. Only the thread that owns the handle may call this."""
         self._close()
+
+
+class _Pending:
+    """One record handed to the writer, and the verdict the caller is waiting for."""
+
+    __slots__ = ("done", "failed", "persisted", "record")
+
+    def __init__(self, record):
+        self.record = record
+        self.done = threading.Event()
+        self.persisted = False
+        self.failed = False
+
+
+class Writer:
+    """The one thread allowed to touch the log file, and the bounded queue in front of it.
+
+    `flush` and `fsync` are blocking calls on a real disk, and running them on the event loop would
+    make the log the slowest thing in the process: a 250 ms `fsync` would stall every other
+    request, including the liveness probe that exists to answer while everything else is busy. So
+    the blocking work belongs to a thread this process owns, and the event loop only ever (*) hands
+    over a line and waits for the verdict of the one writer that owns the file.
+
+    What is bounded, exactly:
+
+    - **The queue.** `WRITE_QUEUE_LIMIT` lines may be outstanding. A submission beyond it is
+      refused immediately and latches the sink, because parking an unbounded number of requests on
+      the log is the failure mode this bound exists to prevent — and it is never a silent drop.
+    - **Every wait.** A submission may wait `WRITER_QUEUE_TIMEOUT_SECONDS` to reach the queue; a
+      caller waits at most `WRITER_DEADLINE_SECONDS` for its own line; shutdown waits
+      `WRITER_SHUTDOWN_SECONDS` for what is already queued. Each of those is a deadline on a
+      refusal, never an assertion that the line was written.
+    - **The writers.** Exactly one thread owns the file, so there is never an old writer and a new
+      one racing over the same segment, and a line that timed out is *not* cancelled: the writer
+      this process owns either persists it or latches it. Nothing is submitted twice.
+
+    A deadline that expires therefore means "not established", and the caller refuses the business
+    work it was about to admit. It never means "probably fine": a line whose persistence could not
+    be confirmed is latched, not assumed.
+    """
+
+    def __init__(self, diagnostics):
+        self.diagnostics = diagnostics
+        self.sink = diagnostics.sink
+        self.queue = queue.Queue(maxsize=WRITE_QUEUE_LIMIT)
+        self.attempted = 0
+        self.stopping = threading.Event()
+        self.thread = None
+
+    def start(self):
+        """Start the single writer, once, from the thread that assembles the process."""
+        if self.thread is not None or not self.sink.durable:
+            return
+        self.thread = threading.Thread(
+            target=self._run, name="tianshu-memory-log-writer", daemon=True
+        )
+        self.thread.start()
+
+    def submit(self, pending):
+        """Queue one pending record, or return None because the bounded buffer is already full."""
+        try:
+            self.queue.put(pending, timeout=WRITER_QUEUE_TIMEOUT_SECONDS)
+        except queue.Full:
+            # The one refusal this class makes on its own: the bounded buffer is full, which is a
+            # capacity verdict about the log rather than an unavailable disk. A request refused
+            # here is never admitted, and the record it could not write is never queued twice.
+            self.sink.fail("log_capacity")
+            return None
+        return pending
+
+    def wait(self, pending):
+        """Whether this exact line reached durable storage. A timeout is a refusal, not a maybe."""
+        if not pending.done.wait(WRITER_DEADLINE_SECONDS):
+            # The writer is still working on it — or stuck in the kernel. Either way this process
+            # cannot claim the line was persisted, so it refuses; the writer still owns the item and
+            # decides that item's verdict itself, and it is never cancelled or re-sent.
+            #
+            # A write that did not confirm inside the deadline also latches the sink. Latency this
+            # far past the deadline is a log whose durability is unknown, and refusing only this one
+            # request would keep admitting the next, so the process stops admitting business work
+            # until an operator looks at it. The record may still land — an unconfirmed write is not
+            # a lost one — but readiness stays false, because "the bytes are probably there" is not
+            # a durability claim this process is allowed to make.
+            self.sink.fail("log_unavailable")
+            pending.failed = True
+            return False
+        return pending.persisted and not pending.failed
+
+    def _run(self):
+        """Own the file until told to stop: persist, or latch, every record in arrival order.
+
+        The sequence number is allocated *here*, on the one thread that writes, so the order of the
+        numbers is the order of the bytes by construction. Allocating it in the calling thread would
+        need the allocation and the write to happen under one lock, and holding that lock across an
+        `fsync` is exactly the design this class exists to remove.
+        """
+        try:
+            while True:
+                try:
+                    pending = self.queue.get(timeout=WRITER_QUEUE_TIMEOUT_SECONDS)
+                except queue.Empty:
+                    if self.stopping.is_set():
+                        return
+                    continue
+                self.attempted += 1
+                try:
+                    record = pending.record
+                    sequence = self.sink.reserve()
+                    record["sequence"] = sequence
+                    line = json.dumps(
+                        record, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+                    )
+                    if len(line.encode("utf-8")) + 1 > MAX_LINE_BYTES:
+                        # A record that cannot fit the contract's byte limit is refused rather than
+                        # truncated into something that parses as a different event.
+                        self.sink.fail("log_unavailable")
+                    else:
+                        self.sink.write(line, sequence)
+                except SinkUnavailable as error:
+                    self.sink.fail(
+                        "log_capacity" if isinstance(error, SinkFull) else "log_unavailable"
+                    )
+                except Exception:
+                    # Anything else raised while making this record durable leaves it unwritten, so
+                    # it is the same refusal as a full disk. Latching here keeps the rule true even
+                    # for a failure this code did not anticipate: an unaccountable side effect is
+                    # never admitted, and the caller's `wait` sees an unlatched-but-unwritten
+                    # record as a refusal either way.
+                    self.sink.fail("log_unavailable")
+                    pending.failed = True
+                else:
+                    if self.sink.failure is None and not pending.failed:
+                        pending.persisted = True
+                        # The number becomes visible to the rest of the process only now, after the
+                        # bytes really are on disk.
+                        self.sink.sequence = sequence
+                finally:
+                    pending.done.set()
+        finally:
+            # Every line still queued when this thread ends is latched rather than retried: the
+            # process is stopping, and pretending these were written is exactly what the latch is
+            # for. Nothing here is re-submitted or re-executed.
+            while True:
+                try:
+                    pending = self.queue.get_nowait()
+                except queue.Empty:
+                    return
+                pending.done.set()
+
+    def shutdown(self):
+        """Stop accepting, drain what is already queued, and release the file within a deadline."""
+        if self.thread is None:
+            self.sink.close()
+            return
+        self.stopping.set()
+        self.thread.join(WRITER_SHUTDOWN_SECONDS)
+        self.sink.close()
 
 
 class Diagnostics:
@@ -461,10 +723,13 @@ class Diagnostics:
         "config_path",
         "contract_path",
         "instance_id",
+        "log_configured",
         "refused",
         "service",
         "sink",
+        "stopping",
         "token_env",
+        "writer",
     )
 
     def __init__(
@@ -474,9 +739,19 @@ class Diagnostics:
         settings = read_config(config)
         self.service = service
         self.token_env = settings["token_env"]
+        # Whether this process was configured with a durable log at all, as distinct from whether
+        # that log is currently working. The two are different answers to different questions.
+        self.log_configured = settings["log_directory"] is not None
         self.instance_id = str(uuid.uuid4())
         self.clock = clock or _timestamp
         self.sink = sink if sink is not None else Sink(settings["log_directory"], self.instance_id)
+        self.stopping = threading.Event()
+        self.writer = Writer(self)
+        if self.sink.durable and self.sink.sequence == 0:
+            # A process that restarts with the same instance id must not repeat numbers inside the
+            # file it is appending to. This is read once, before anything is written, and only ever
+            # raises the starting point.
+            self.sink.sequence = self.sink.last_persisted_sequence()
         # Kept so the read-only probes can find the same configuration and contract package this
         # process was started with. They are paths, never values.
         self.config_path = config_path
@@ -486,6 +761,24 @@ class Diagnostics:
     @property
     def durable(self):
         return self.sink.durable
+
+    def start(self):
+        """Start the single log writer, if it is not already running.
+
+        The writer starts itself on the process's first event, so this exists for the deployment
+        path to state the intent explicitly rather than for correctness.
+        """
+        self.writer.start()
+
+    def shutdown(self):
+        """Drain the already-queued lines within a deadline and release the file.
+
+        After this the process is stopping: the writer has stopped accepting, so every later event
+        is refused rather than queued for a thread that will never read it. A refused event is a
+        refusal of the work it would have described, which is the same rule as everywhere else.
+        """
+        self.stopping.set()
+        self.writer.shutdown()
 
     def log_state(self):
         """The readiness verdict for the log itself, without touching the filesystem."""
@@ -500,8 +793,41 @@ class Diagnostics:
     def available(self):
         return self.sink.failure is None
 
+    def _build(self, name, *, level, outcome, error_code, duration_ms):
+        """Build one contract-shaped record, with every field except its number.
+
+        The record is handed to the writer unnumbered on purpose: the number is allocated on the
+        thread that writes, so the file's order and the numbers' order cannot disagree however many
+        threads call this at once.
+        """
+        scope = _scope.get()
+        if self.sink.durable:
+            # One writer, started once: the process's first event creates it. Nothing else ever
+            # creates it, so there is never a second writer over the same file.
+            self.writer.start()
+        return _Pending(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "timestamp": self.clock(),
+                "service": self.service,
+                "instance_id": self.instance_id,
+                "sequence": None,
+                "event_id": str(uuid.uuid4()),
+                "level": level,
+                "event": name,
+                "outcome": outcome,
+                "correlation_id": scope.correlation_id if scope is not None else None,
+                "duration_ms": _duration(duration_ms),
+                "error_code": error_code,
+            }
+        )
+
     def emit(self, name, *, level="INFO", outcome="succeeded", error_code=None, duration_ms=None):
-        """Record one registered event. Returns whether it was persisted.
+        """Queue one registered event, and report whether it reached the log.
+
+        In an explicitly non-durable process there is nothing to persist, so this reports True and
+        readiness reports `non_durable` — that is where the mode is refused, not here. Every other
+        True means the line is on durable storage before this returns.
 
         A persistence failure never propagates: the caller's business result has already been
         decided and keeps its own receipt. The failure is latched instead, which is what makes
@@ -521,31 +847,76 @@ class Diagnostics:
             # that could not be written.
             self.sink._warn_once()
             return False
-        scope = _scope.get()
-        with self.sink.lock:
-            sequence = self.sink.sequence + 1
-            record = {
-                "schema_version": SCHEMA_VERSION,
-                "timestamp": self.clock(),
-                "service": self.service,
-                "instance_id": self.instance_id,
-                "sequence": sequence,
-                "event_id": str(uuid.uuid4()),
-                "level": level,
-                "event": name,
-                "outcome": outcome,
-                "correlation_id": scope.correlation_id if scope is not None else None,
-                "duration_ms": _duration(duration_ms),
-                "error_code": error_code,
-            }
-            line = json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-            try:
-                self.sink.write(line)
-            except SinkUnavailable as error:
-                self.sink.fail("log_capacity" if isinstance(error, SinkFull) else "log_unavailable")
-                return False
-            self.sink.sequence = sequence
-        return True
+        if not self.sink.durable:
+            # Nothing is written and nothing can fail. Readiness reports `non_durable`, which is
+            # where an undeployable mode is refused rather than here.
+            return True
+        if self.stopping.is_set():
+            # This process is stopping: the writer has stopped accepting, so a record handed over
+            # now would sit in a queue nothing will read. It is refused instead of being accepted
+            # and quietly forgotten.
+            return False
+        pending = self.writer.submit(
+            self._build(
+                name, level=level, outcome=outcome, error_code=error_code, duration_ms=duration_ms
+            )
+        )
+        if pending is None:
+            return False
+        return self.writer.wait(pending)
+
+    async def aemit(
+        self, name, *, level="INFO", outcome="succeeded", error_code=None, duration_ms=None
+    ):
+        """`emit` for the event loop: the waiting happens on a worker, never on the loop itself.
+
+        A blocking `fsync` is allowed to take as long as the disk takes; what it is not allowed to
+        do is stop this loop from answering a liveness probe while it does.
+        """
+        if not self.sink.durable:
+            return self.emit(
+                name, level=level, outcome=outcome, error_code=error_code, duration_ms=duration_ms
+            )
+        return await asyncio.to_thread(
+            self.emit,
+            name,
+            level=level,
+            outcome=outcome,
+            error_code=error_code,
+            duration_ms=duration_ms,
+        )
+
+    def _refuse_unaccountable(self):
+        """Whether business work must be refused because its record could not be made durable.
+
+        Two cases refuse, and they are the same case seen twice: this process **was configured** to
+        keep a durable log and the record for this work cannot be persisted — because the sink is
+        already latched, because the bounded buffer is full, or because the write did not confirm
+        within its deadline. In every one of them a side effect would exist that this process cannot
+        account for, so the work it would have described must not happen.
+
+        A process with no log directory was never configured with a durable log at all. That mode is
+        an explicit development choice, it is reported as `non_durable` and a deployment can never
+        be ready on it, and the product's own existing suites run in exactly that mode. Refusing
+        every request there would be a new rule about the domain rather than a rule about the log,
+        and this task adds no rule of its own to the domain.
+        """
+        if not self.log_configured:
+            return False
+        return not self.available()
+
+    async def accept(self, name):
+        """The durable acceptance record, confirmed before any business work is admitted.
+
+        Returns True only when this exact line reached durable storage. Every other answer — a full
+        buffer, an unusable disk, a writer that did not confirm within the deadline, an explicitly
+        non-durable process with nothing to confirm — is a refusal, and the caller must not run the
+        business work it was about to run. That is the whole point: a side effect this process
+        cannot account for must not happen.
+        """
+        if self._refuse_unaccountable():
+            return False
+        return await self.aemit(name, level="INFO", outcome="started")
 
     def install(self, app: FastAPI):
         """Attach the request middleware and the published hooks to one application.
@@ -587,46 +958,58 @@ class Diagnostics:
                 # not try to write about it — that write is exactly what cannot succeed.
                 self.refused += 1
                 return _refuse()
-            self.emit("request.started", level="INFO", outcome="started")
+            if not await self.accept("request.started"):
+                # The acceptance record could not be confirmed as durable, so the work it would
+                # have described must not happen at all. This is the one place the decision is
+                # still free: nothing has run yet, so refusing here leaves no side effect to
+                # reconcile, and there is nothing to retry, re-execute or roll back.
+                self.refused += 1
+                return _refuse()
             try:
                 response = await call_next(request)
             except ClientDisconnect:
-                self._complete(scope, "unknown", "client_disconnected", level="WARNING")
+                await self._complete(scope, "unknown", "client_disconnected", level="WARNING")
                 raise
             except Fault as error:
                 if scope.fault is None:
                     scope.fault = error.code
-                self._complete(scope, "failed", map_fault(error.code), level="ERROR")
+                await self._complete(scope, "failed", map_fault(error.code), level="ERROR")
                 raise
-            self._complete_response(scope, response)
+            await self._complete_response(scope, response)
             return response
         finally:
             _scope.reset(token)
 
-    def _complete_response(self, scope, response):
+    async def _complete_response(self, scope, response):
         status = response.status_code
         if status < 400:
-            self._complete(scope, "succeeded", None, level="INFO")
+            await self._complete(scope, "succeeded", None, level="INFO")
         elif status == 408:
             # The response deadline expired. The work it started is *not* a cancellation, so the
             # request's own record says the outcome is unknown rather than claiming one.
-            self._complete(scope, "unknown", "request_timeout", level="WARNING")
+            await self._complete(scope, "unknown", "request_timeout", level="WARNING")
         elif status == 429:
-            self._complete(scope, "rejected", "overloaded", level="WARNING")
+            await self._complete(scope, "rejected", "overloaded", level="WARNING")
         elif status == 503:
-            self._complete(scope, "rejected", "dependency_unavailable", level="ERROR")
+            await self._complete(scope, "rejected", "dependency_unavailable", level="ERROR")
         else:
-            self._complete(
+            await self._complete(
                 scope,
                 "rejected",
                 map_fault(scope.fault) if scope.fault else "invalid_input",
                 level="WARNING",
             )
 
-    def _complete(self, scope, outcome, error_code, *, level):
+    async def _complete(self, scope, outcome, error_code, *, level):
+        """The request's own closing record, written off the event loop like every other line.
+
+        This one lands after the response exists, which is exactly the case where a process must
+        not stop answering: the work is already done and its receipt already decided, so the
+        record of it is worth waiting for but never worth blocking the loop over.
+        """
         if not self.available():
             return
-        self.emit(
+        await self.aemit(
             "request.completed",
             level=level,
             outcome=outcome,
@@ -665,6 +1048,12 @@ class Execution:
     The HTTP response may end before this does — a deadline, a disconnect — and the record here
     still describes what actually happened to the work. That distinction is the whole point: a 408
     is a statement about the response, never a claim that the operation was cancelled.
+
+    Entering this context is the last moment at which the call can still be refused for free, so it
+    is where the durable start record is confirmed. A start record that cannot be persisted means
+    the call is refused with the same 503 the middleware uses, and the body never runs: a side
+    effect this process cannot account for is not allowed to happen. Already-committed work is
+    untouched — nothing here is re-executed, and no completed result is rolled back.
     """
 
     def __init__(self, diagnostics, name):
@@ -674,7 +1063,8 @@ class Execution:
         self.finished = False
 
     def __enter__(self):
-        self.diagnostics.emit("sync.execute.started", level="INFO", outcome="started")
+        if not self.diagnostics.emit("sync.execute.started", level="INFO", outcome="started"):
+            raise Fault("log_unavailable", 503)
         return self
 
     def __exit__(self, kind, value, traceback):

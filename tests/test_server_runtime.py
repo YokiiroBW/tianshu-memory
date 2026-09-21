@@ -7,6 +7,7 @@ terminal transition is recorded rather than assumed.
 """
 
 import argparse
+import asyncio
 import json
 import os
 import signal
@@ -22,11 +23,12 @@ from fastapi.testclient import TestClient
 
 from tianshu_memory.diagnostics import CHAT_SERVICE, CHECKS_BY_SERVICE, Diagnostics
 from tianshu_memory.domain import Fault, canonical
-from tianshu_memory.runtime_probes import ProbeConfig
+from tianshu_memory.runtime_probes import ProbeConfig, readiness
 from tianshu_memory.server_runtime import (
     DEFAULT_HOST,
     Assembly,
     add_serve_arguments,
+    announce_startup_readiness,
     build_assembly,
     closed_document,
     config_path_from_environment,
@@ -87,6 +89,23 @@ def contracts():
     root = Path(__file__).resolve().parents[1]
     context = json.loads((root / ".runtime/workspace-context.json").read_text(encoding="utf-8"))
     return Contracts(Path(context["workspace"]) / "contracts/text-dialogue/v1")
+
+
+def log_bytes(directory):
+    """The complete persisted log as bytes, across every segment this process wrote."""
+    return {path.name: path.read_bytes() for path in sorted(Path(directory).glob("*.jsonl"))}
+
+
+def event_names(directory):
+    """Every event name in the log, in file order across segments."""
+    names = []
+    for path in sorted(Path(directory).glob("*.jsonl")):
+        names.extend(
+            json.loads(line)["event"]
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    return names
 
 
 def test_the_default_binding_is_loopback_and_serves_only_its_own_names():
@@ -579,6 +598,7 @@ def test_a_ready_process_answers_200_with_the_closed_document(tmp_path, ready_pr
     assembly = Assembly(app, adapter, None, probe_factory=ready_probe_settings)
     assembly.started()
     install_probe_routes(app, assembly)
+    before = log_bytes(tmp_path)
     with TestClient(app) as client:
         response = client.get("/health/ready", headers={"Authorization": f"Bearer {TOKEN}"})
         live = client.get("/health/live")
@@ -588,10 +608,116 @@ def test_a_ready_process_answers_200_with_the_closed_document(tmp_path, ready_pr
     assert response.json()["service"] == CHAT_SERVICE
     assert set(response.json()["checks"]) == set(CHECKS_BY_SERVICE[CHAT_SERVICE])
     assert live.status_code == 200
-    # The probe asked a live process to describe itself and nothing wrote a line: the readiness
-    # announcement is the only record, and the probe itself never advances the sequence.
-    assert [path.name for path in Path(tmp_path).glob("*.jsonl")] != []
-    assert assembly.ready_announced is True
+    # The probe asked a live process to describe itself and the log is byte-for-byte what it was:
+    # no request line, no authentication line, no result line and no readiness transition. A ready
+    # answer that *did* write would make the probe a writer, whatever the answer said.
+    assert log_bytes(tmp_path) == before
+    assert assembly.ready_announced is False
+    assert event_names(tmp_path) == ["runtime.started"]
+
+
+def test_the_lifecycle_records_readiness_once_and_the_probe_never_does(
+    tmp_path, ready_process, monkeypatch
+):
+    """`runtime.ready` belongs to the startup path, which is the only thing that may append it."""
+    monkeypatch.setenv("TS102_READINESS", TOKEN)
+    app = FastAPI()
+    adapter = Diagnostics(
+        CHAT_SERVICE,
+        {"log_directory": str(tmp_path), "diagnostics": {"token_env": "TS102_READINESS"}},
+    )
+    adapter.install(app)
+    assembly = Assembly(app, adapter, None, probe_factory=ready_probe_settings)
+    assembly.started()
+    install_probe_routes(app, assembly)
+    with TestClient(app) as client:
+        for _ in range(3):
+            client.get("/health/ready", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert event_names(tmp_path) == ["runtime.started"]
+    document = readiness(assembly.probe_settings())
+    assert assembly.announce_ready(document) is True
+    assert event_names(tmp_path) == ["runtime.started", "runtime.ready"]
+    # Recording it twice is not recording it twice, and a probe asked again still writes nothing.
+    assert assembly.announce_ready(document) is False
+    settled = log_bytes(tmp_path)
+    with TestClient(app) as client:
+        client.get("/health/ready", headers={"Authorization": f"Bearer {TOKEN}"})
+        client.get("/health/live")
+    assert log_bytes(tmp_path) == settled
+    assert event_names(tmp_path) == ["runtime.started", "runtime.ready"]
+
+
+def test_the_startup_lifecycle_is_what_announces_readiness_and_an_unready_process_is_silent(
+    tmp_path, ready_process, monkeypatch
+):
+    """The real startup seam, not a stand-in: `_serve` records readiness, and only when it holds.
+
+    A ready process appends `runtime.ready` once, from the lifecycle; a process whose prerequisites
+    do not hold appends nothing, because a not-ready verdict already has its own startup record and
+    a lifecycle line for a state this process never reached would be a false success. Each process
+    writes to its own directory, as two real processes would.
+    """
+    monkeypatch.setenv("TS102_READINESS", TOKEN)
+
+    def assemble(directory, settings):
+        app = FastAPI()
+        adapter = Diagnostics(
+            CHAT_SERVICE,
+            {"log_directory": str(directory), "diagnostics": {"token_env": "TS102_READINESS"}},
+        )
+        adapter.install(app)
+        assembly = Assembly(app, adapter, None, probe_factory=settings)
+        assembly.started()
+        install_probe_routes(app, assembly)
+        return assembly
+
+    ready_directory = tmp_path / "ready"
+    ready_directory.mkdir()
+    ready = assemble(ready_directory, ready_probe_settings)
+    asyncio.run(announce_startup_readiness(ready))
+    assert event_names(ready_directory) == ["runtime.started", "runtime.ready"]
+    # Asking again is not a second record, and neither probe writes on its own.
+    before = log_bytes(ready_directory)
+    asyncio.run(announce_startup_readiness(ready))
+    with TestClient(ready.app) as client:
+        client.get("/health/ready", headers={"Authorization": f"Bearer {TOKEN}"})
+        client.get("/health/live")
+    assert log_bytes(ready_directory) == before
+
+    other_directory = tmp_path / "not-ready"
+    other_directory.mkdir()
+    not_ready = assemble(other_directory, probe_settings)
+    asyncio.run(announce_startup_readiness(not_ready))
+    # The verdict really was not ready, so the lifecycle said nothing at all: this process's log
+    # holds the startup line and no readiness transition, and no probe grew it either.
+    document = readiness(not_ready.probe_settings())
+    assert document["status"] == "not_ready"
+    assert not_ready.ready_announced is False
+    with TestClient(not_ready.app) as client:
+        client.get("/health/ready", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert event_names(other_directory) == ["runtime.started"]
+
+
+def test_an_unauthorized_probe_writes_nothing_either(tmp_path, ready_process, monkeypatch):
+    monkeypatch.setenv("TS102_READINESS", TOKEN)
+    app = FastAPI()
+    adapter = Diagnostics(
+        CHAT_SERVICE,
+        {"log_directory": str(tmp_path), "diagnostics": {"token_env": "TS102_READINESS"}},
+    )
+    adapter.install(app)
+    assembly = Assembly(app, adapter, None, probe_factory=ready_probe_settings)
+    assembly.started()
+    install_probe_routes(app, assembly)
+    before = log_bytes(tmp_path)
+    with TestClient(app) as client:
+        missing = client.get("/health/ready")
+        wrong = client.get("/health/ready", headers={"Authorization": "Bearer not-the-token"})
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    # A refused probe is still a probe: an operator hammering a protected route unauthenticated
+    # must not be able to grow the log, advance the sequence or fill the disk.
+    assert log_bytes(tmp_path) == before
 
 
 def test_both_probe_documents_are_no_store(tmp_path, monkeypatch):
@@ -623,6 +749,111 @@ def test_the_closed_not_ready_document_names_every_check_a_service_reports():
         assert document["service"] == service
         assert set(document["checks"]) == set(keys)
         assert set(document["checks"].values()) == {"failed"}
+
+
+def test_the_deployment_binding_is_the_authority_the_knowledge_entry_also_uses(
+    tmp_path, certificates
+):
+    """The reviewed defect, end to end: a legal off-loopback Host must reach the business route.
+
+    Before this, the shared binding accepted `memory.example.test:8443` and the knowledge entry's
+    own check refused the very same request with `invalid_host`: a deployment that was reachable as
+    a probe and unusable as a service. The entry now consumes the binding's already-validated
+    authority names, so the two checks are one decision made once.
+    """
+    from tianshu_memory.knowledge_http import ACTION_PATH, create_app
+
+    config = {
+        "database_path": str(tmp_path / "knowledge.sqlite"),
+        "knowledge": {
+            "clients": {"connector": {"permissions": ["query"], "projects": {"alpha": {}}}},
+            "projects": {"alpha": {}},
+        },
+    }
+    path = tmp_path / "knowledge.json"
+    path.write_text(canonical(config), encoding="utf-8")
+    binding = resolve_binding(
+        **binding_arguments(
+            host=PUBLIC_HOST,
+            port=8443,
+            certfile=str(certificates / "server.pem"),
+            keyfile=str(certificates / "server.key"),
+            allowed_hosts=["memory.example.test:8443", f"{PUBLIC_HOST}:8443"],
+        )
+    )
+    assert binding.accepts("memory.example.test:8443")
+    app = FastAPI()
+    entry = create_app(str(path), "connector", 8443, authorities=binding.authority_names())
+    install_networking(entry, binding)
+    app.mount("/deployed", entry)
+
+    def deployed(headers, method="post"):
+        client = TestClient(app)
+        if method == "post":
+            return client.post(
+                f"/deployed{ACTION_PATH}",
+                json={"operation": "query", "project_id": "alpha", "arguments": {"text": "x"}},
+                headers=dict(headers),
+            )
+        return client.get("/deployed/health", headers=dict(headers))
+
+    authorized = [
+        (b"host", b"memory.example.test:8443"),
+        (b"authorization", b"Bearer synthetic-credential"),
+    ]
+    # The business route is reached: whatever the domain then decides, it is not this transport
+    # refusing the authority. A 400 invalid_host here is exactly the reviewed defect.
+    answered = deployed(authorized)
+    assert answered.status_code != 400 or answered.json().get("code") != "invalid_host", (
+        answered.status_code,
+        answered.text[:200],
+    )
+    assert deployed(authorized, method="get").json() == {
+        "state": "listening",
+        "entrypoint": "project_knowledge_http",
+        "projects": None,
+    }
+    # Everything the binding refused is still refused inside, because there is one rule, not two.
+    for refused_host in (
+        b"evil.example.test:8443",
+        b"memory.example.test:8442",
+        b"memory.example.test",
+    ):
+        refused = deployed([(b"host", refused_host), *authorized[1:]])
+        assert refused.status_code == 400, refused_host
+        assert refused.json() == {"status": "failed", "code": "invalid_host"}, refused_host
+    # A browser origin is still refused, and a forwarded header still cannot name a legal host.
+    for extra in (
+        (b"origin", b"https://app.example.test"),
+        (b"x-forwarded-host", b"memory.example.test"),
+    ):
+        refused = deployed([(b"host", b"evil.example.test:8443"), *authorized[1:], extra])
+        assert refused.status_code == 400
+
+
+def test_a_bare_knowledge_application_still_serves_only_loopback(tmp_path):
+    """The loopback rule is the default, not a casualty of the deployment wiring above."""
+    from tianshu_memory.knowledge_http import ACTION_PATH, create_app
+
+    config = {
+        "database_path": str(tmp_path / "knowledge.sqlite"),
+        "knowledge": {
+            "clients": {"connector": {"permissions": ["query"], "projects": {"alpha": {}}}},
+            "projects": {"alpha": {}},
+        },
+    }
+    path = tmp_path / "knowledge.json"
+    path.write_text(canonical(config), encoding="utf-8")
+    entry = create_app(str(path), "connector", 8130)
+    client = TestClient(entry)
+    for host in (b"memory.example.test:8130", b"evil.example.test:8130", b"192.0.2.10:8130"):
+        refused = client.post(
+            ACTION_PATH,
+            json={"operation": "query", "project_id": "alpha", "arguments": {"text": "x"}},
+            headers={"Host": host.decode(), "Authorization": "Bearer synthetic-credential"},
+        )
+        assert refused.status_code == 400, host
+        assert refused.json() == {"status": "failed", "code": "invalid_host"}
 
 
 def test_the_lifecycle_records_what_really_happened(tmp_path):

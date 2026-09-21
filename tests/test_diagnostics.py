@@ -6,11 +6,15 @@ constants: the JSON Schema and the published examples are loaded from disk, so a
 stopped matching the contract would fail rather than quietly redefine it.
 """
 
+import asyncio
+import contextlib
 import json
 import re
 import threading
+import time
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -19,19 +23,27 @@ from fastapi.testclient import TestClient
 from tianshu_memory.diagnostics import (
     CHAT_SERVICE,
     CORRELATION_HEADER,
+    DEFAULT_TOKEN_ENV,
     ERROR_CODES,
     EVENTS,
     HOOK_NAME,
     KNOWLEDGE_SERVICE,
+    LOG_DIRECTORY_ENV,
     MAX_LINE_BYTES,
     NO_STORE,
     PROBE_PATHS,
     SINK_WARNING,
+    WRITE_QUEUE_LIMIT,
     Diagnostics,
+    Sink,
     SinkFull,
+    SinkUnavailable,
+    Writer,
     read_config,
     read_correlation,
 )
+from tianshu_memory.domain import Fault
+from tianshu_memory.runtime_probes import present_token
 from tianshu_memory.server_runtime import install_networking, install_probe_routes, resolve_binding
 
 FIELDS = (
@@ -84,6 +96,12 @@ def bound(app):
         app,
         resolve_binding(host="127.0.0.1", port=8080, certfile=None, keyfile=None, allowed_hosts=[]),
     )
+
+
+def _request(authorization):
+    """A minimal ASGI scope wrapped as a request, for the token verdict alone."""
+    headers = [] if authorization is None else [(b"authorization", authorization.encode("ascii"))]
+    return Request({"type": "http", "method": "GET", "path": "/health/ready", "headers": headers})
 
 
 def segment_lines(adapter):
@@ -336,6 +354,98 @@ def test_only_an_absolute_configured_directory_is_ever_called_durable(tmp_path):
     temporary = Diagnostics(CHAT_SERVICE, {})
     assert temporary.durable is False
     assert temporary.log_state() == "non_durable"
+
+
+def test_the_deployment_log_directory_variable_really_assembles_a_durable_sink(
+    tmp_path, monkeypatch
+):
+    """The reviewed defect: setting `TIANSHU_LOG_DIR` configured nothing at all.
+
+    A container that exports the documented variable must end up with a durable sink, or the
+    deployment convention is decoration. The variable is read exactly once, while the process is
+    assembled, and it is a directory — never a mode, a stream or a token.
+    """
+    directory = tmp_path / "deployed-logs"
+    directory.mkdir()
+    monkeypatch.setenv(LOG_DIRECTORY_ENV, str(directory))
+    adapter = Diagnostics(CHAT_SERVICE, {})
+    assert adapter.durable is True
+    assert adapter.log_configured is True
+    assert adapter.sink.directory == directory
+    assert adapter.emit("runtime.starting", level="INFO", outcome="started") is True
+    assert [path.name for path in directory.glob("*.jsonl")] != []
+    # A path the adapter cannot honour is refused at assembly, not silently downgraded.
+    monkeypatch.setenv(LOG_DIRECTORY_ENV, "relative/logs")
+    with pytest.raises(Exception):
+        Diagnostics(CHAT_SERVICE, {})
+
+
+def test_the_configuration_wins_over_the_environment(tmp_path, monkeypatch):
+    """One fixed precedence, in one direction: what the deployment wrote down wins.
+
+    A variable inherited from a unit must never redirect a process that was configured in writing,
+    and it must never be read once the written configuration has answered.
+    """
+    from_configuration = tmp_path / "from-configuration"
+    from_environment = tmp_path / "from-environment"
+    from_configuration.mkdir()
+    from_environment.mkdir()
+    monkeypatch.setenv(LOG_DIRECTORY_ENV, str(from_environment))
+    written = Diagnostics(CHAT_SERVICE, {"log_directory": str(from_configuration)})
+    assert written.sink.directory == from_configuration
+    written.emit("runtime.starting", level="INFO", outcome="started")
+    assert [path.name for path in from_configuration.glob("*.jsonl")] != []
+    assert list(from_environment.iterdir()) == []
+    # An explicit `false` is a written decision too: it disables durability on purpose, and the
+    # environment does not get to overrule it.
+    monkeypatch.setenv(LOG_DIRECTORY_ENV, str(from_environment))
+    disabled = Diagnostics(CHAT_SERVICE, {"log_directory": False})
+    assert disabled.durable is False
+    assert disabled.log_configured is False
+    assert list(from_environment.iterdir()) == []
+
+
+def test_the_contract_token_variable_is_consumed_when_no_name_is_configured(monkeypatch, tmp_path):
+    """The default is the contract's own independent variable, and never a business credential."""
+    monkeypatch.delenv(DEFAULT_TOKEN_ENV, raising=False)
+    default = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    assert default.token_env == DEFAULT_TOKEN_ENV
+    assert present_token(_request(None), default) == "unconfigured"
+    monkeypatch.setenv(DEFAULT_TOKEN_ENV, "synthetic-readiness-token")
+    assert present_token(_request("Bearer synthetic-readiness-token"), default) == "ok"
+    assert present_token(_request("Bearer something-else"), default) == "unauthorized"
+    # A configured name still wins, so a deployment that renamed the variable keeps working.
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setenv("TS102_RENAMED", "synthetic-readiness-token")
+    renamed = Diagnostics(
+        CHAT_SERVICE,
+        {"log_directory": str(other), "diagnostics": {"token_env": "TS102_RENAMED"}},
+    )
+    assert renamed.token_env == "TS102_RENAMED"
+    assert present_token(_request("Bearer synthetic-readiness-token"), renamed) == "ok"
+
+
+def test_a_business_credential_variable_is_never_picked_up_as_the_probe_token(
+    monkeypatch, tmp_path
+):
+    """The adapter reads one named variable; nothing else in the environment can authorize ready."""
+    monkeypatch.delenv(DEFAULT_TOKEN_ENV, raising=False)
+    monkeypatch.setenv("TIANSHU_MEMORY_TOKEN", "synthetic-business-credential")
+    monkeypatch.setenv("TIANSHU_KNOWLEDGE_CREDENTIAL", "synthetic-business-credential")
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(directory)})
+    assert adapter.token_env == DEFAULT_TOKEN_ENV
+    assert (
+        present_token(_request("Bearer synthetic-business-credential"), adapter) == "unconfigured"
+    )
+    # And the token value never reaches the log, whichever variable held it.
+    monkeypatch.setenv(DEFAULT_TOKEN_ENV, "synthetic-readiness-token")
+    adapter.emit("runtime.starting", level="INFO", outcome="started")
+    text = "".join(path.read_text(encoding="utf-8") for path in directory.glob("*.jsonl"))
+    assert "synthetic-readiness-token" not in text
+    assert "synthetic-business-credential" not in text
 
 
 def test_the_non_durable_mode_writes_no_file_and_no_stream(tmp_path, capsys):
@@ -620,3 +730,404 @@ def test_every_registered_event_is_reachable_through_the_adapter(tmp_path):
     for name in sorted(emittable):
         adapter.emit(name, level="INFO", outcome="succeeded")
     assert {line["event"] for line in segment_lines(adapter)} == set(emittable)
+
+
+@contextlib.contextmanager
+def injected_writes(*, fail_from=None, delay=0.0, calls=None):
+    """Make every durable write of this test slow, or failing, without changing any object.
+
+    The injection goes through the module's own `Sink.write` rather than through a stand-in sink, so
+    object identity is untouched: there is one sink, one writer and one latch, exactly as in a real
+    process, and the latch the middleware reads is the latch the failed write set. A wrapper that
+    merely forwarded attributes would accumulate the writer's state on itself and leave the real
+    sink's counter and latch behind.
+
+    `fail_from` is the 1-based write that starts failing, which is how a test puts the failure at a
+    chosen seam of the request path: `1` is the very first line, `2` is the line after the acceptance
+    record has really been confirmed. `None` means nothing fails, which is how the timing tests below
+    exercise a disk that is slow rather than broken.
+    """
+    real = Sink.write
+    state = {"attempts": 0, "failed": 0, "fail_from": fail_from}
+
+    def write(self, line, sequence):
+        state["attempts"] += 1
+        if calls is not None:
+            calls.append(line)
+        if delay:
+            time.sleep(delay)
+        if fail_from is not None and state["attempts"] >= fail_from:
+            state["failed"] += 1
+            raise SinkUnavailable("synthetic write failure")
+        return real(self, line, sequence)
+
+    Sink.write = write
+    try:
+        yield state
+    finally:
+        Sink.write = real
+
+
+def business_app(adapter, effects):
+    """One real app with a real business route that records what actually ran."""
+    app = FastAPI()
+
+    @app.post("/work")
+    async def work():
+        effects.append("committed")
+        return JSONResponse({"status": "ok"})
+
+    adapter.install(app)
+    bound(app)
+    return app
+
+
+def fault_boundary(app):
+    """The boundary the real entry point has: a refusal raised at the seam becomes its own answer.
+
+    `runtime_app` already turns a `Fault` into `error.wire(...)` at `error.status`. A test route that
+    called `record_execution` directly would instead let that refusal escape, so this installs the
+    same translation — the production behaviour, not a substitute for it.
+    """
+
+    @app.exception_handler(Fault)
+    async def refused(request, error):
+        return JSONResponse(
+            error.wire(request.headers.get("x-tianshu-request-id", "")),
+            status_code=error.status,
+            headers={"Cache-Control": "no-store"},
+        )
+
+
+@pytest.mark.parametrize("skip", [0, 1, 2])
+def test_a_write_failure_refuses_the_request_and_never_runs_the_business(tmp_path, skip):
+    """The reviewed defect, at every stage it can happen in: nothing may run without its record.
+
+    `skip` is how many writes succeed first. Each of them is a real seam of this request path — the
+    acceptance record, the authentication verdict, the execution start — so breaking at 0, 1 and 2
+    covers a failure at the entry, at authorization and immediately before the business call.
+    """
+    effects = []
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    app = business_app(adapter, effects)
+    with injected_writes(fail_from=skip + 1 if skip else 1) as state:
+        for _ in range(skip):
+            # Real prior writes, so the failure really lands at the stage this case names.
+            assert adapter.emit("runtime.starting", level="INFO", outcome="started") is True
+        with TestClient(app) as client:
+            response = client.post("/work")
+    assert response.status_code == 503, response.text
+    assert response.json() == {"status": "failed", "code": "log_unavailable"}
+    assert effects == [], "a request whose record could not be persisted must not run"
+    assert adapter.sink.failure == "log_unavailable"
+    assert adapter.available() is False
+    assert adapter.log_state() == "log_unavailable"
+    assert state["failed"] == 1, "exactly one write failed, and it was the one this case names"
+
+
+def test_an_execution_whose_start_record_fails_refuses_before_the_call_runs(tmp_path):
+    """The second seam, on its own: `Execution.__enter__` must not ignore its own failure.
+
+    The request is admitted normally, then persistence breaks exactly at the execution start — the
+    last moment at which the call can still be refused for free. The refusal arrives as the domain
+    fault the real entry point already translates, carrying 503 rather than a 200 with the work done.
+    """
+    from tianshu_memory.diagnostics import record_execution
+
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    app = FastAPI()
+    effects = []
+
+    @app.post("/work")
+    async def work():
+        with record_execution("read"):
+            effects.append("committed")
+        return JSONResponse({"status": "ok"})
+
+    adapter.install(app)
+    bound(app)
+    fault_boundary(app)
+    with injected_writes(fail_from=2):
+        # The acceptance record succeeds; the execution record is the one that fails, and it is the
+        # one that decides whether the call may run at all.
+        with TestClient(app) as client:
+            response = client.post("/work")
+    assert response.status_code == 503, response.text
+    assert response.json()["code"] == "log_unavailable"
+    assert response.json()["execution_state"] == "not_started"
+    assert response.json()["retryable"] is True
+    assert effects == []
+    assert adapter.sink.failure == "log_unavailable"
+
+
+def test_a_synchronous_business_call_is_refused_the_same_way(tmp_path):
+    """The same refusal from a worker thread, which is where real `execute` calls run."""
+    from starlette.concurrency import run_in_threadpool
+
+    from tianshu_memory.diagnostics import record_execution
+
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    app = FastAPI()
+    effects = []
+
+    def business():
+        with record_execution("read"):
+            effects.append("committed")
+        return "done"
+
+    @app.post("/work")
+    async def work():
+        return JSONResponse({"result": await run_in_threadpool(business)})
+
+    adapter.install(app)
+    bound(app)
+    fault_boundary(app)
+    with injected_writes(fail_from=2):
+        with TestClient(app) as client:
+            response = client.post("/work")
+    assert response.status_code == 503
+    assert response.json()["code"] == "log_unavailable"
+    assert effects == []
+    assert adapter.sink.failure == "log_unavailable"
+
+
+def test_a_slow_write_never_blocks_the_event_loop(tmp_path):
+    """The reviewed defect: a 250 ms `fsync` used to stall a 20 ms heartbeat to 252 ms.
+
+    The blocking work belongs to the one writer thread, so the loop keeps answering — including the
+    real liveness probe, which exists precisely to answer while the process is busy. The probe route
+    installed here is the runtime's own, so this asserts the claim the review made about the actual
+    route rather than about a stand-in.
+    """
+    from tianshu_memory.runtime_probes import ProbeConfig
+    from tianshu_memory.server_runtime import Assembly, install_probe_routes
+
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    effects = []
+    app = business_app(adapter, effects)
+
+    def settings(runtime):
+        return ProbeConfig(
+            service=CHAT_SERVICE,
+            diagnostics=runtime.diagnostics,
+            config_path=Path("absent.json"),
+            contract_path=None,
+            runtime=runtime,
+        )
+
+    install_probe_routes(app, Assembly(app, adapter, None, probe_factory=settings))
+
+    async def drive():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8080"
+        ) as client:
+
+            async def heartbeat():
+                started = time.monotonic()
+                await asyncio.sleep(0.02)
+                return time.monotonic() - started
+
+            async def liveness():
+                started = time.monotonic()
+                response = await client.get("/health/live")
+                return response, time.monotonic() - started
+
+            elapsed, live, response = await asyncio.gather(
+                heartbeat(), liveness(), client.post("/work")
+            )
+            return elapsed, live, response
+
+    # The 250 ms of blocking work happens on every record of the business request, which is the
+    # exact case the review reproduced.
+    with injected_writes(delay=0.25) as state:
+        elapsed, (live, live_elapsed), response = asyncio.run(drive())
+    assert state["attempts"] >= 1
+    assert live.status_code == 200
+    assert live.json() == {"status": "alive"}
+    assert response.status_code == 200, response.text
+    assert effects == ["committed"]
+    # The heartbeat and the probe are allowed to overshoot a little; neither may wait for the disk.
+    assert elapsed < 0.15, f"the event loop waited {elapsed:.3f}s for a 0.25s write"
+    assert live_elapsed < 0.15, f"the liveness probe waited {live_elapsed:.3f}s for a 0.25s write"
+
+
+def test_a_write_that_cannot_be_confirmed_in_time_refuses_rather_than_guessing(tmp_path):
+    """A deadline is a refusal, not an assertion: the work it would describe does not run."""
+    from tianshu_memory.diagnostics import WRITER_DEADLINE_SECONDS
+
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    effects = []
+    app = business_app(adapter, effects)
+    with injected_writes(delay=WRITER_DEADLINE_SECONDS + 0.75) as state:
+        started = time.monotonic()
+        with TestClient(app) as client:
+            response = client.post("/work")
+        elapsed = time.monotonic() - started
+        assert response.status_code == 503, response.text
+        assert effects == []
+        assert elapsed < WRITER_DEADLINE_SECONDS + 0.5, (
+            "the refusal must not wait for the whole write"
+        )
+        # A timed-out write is not a cancelled one: it is the writer's own work, and it is written
+        # exactly once. A later request is refused by the latch, not by running the business again.
+        assert state["attempts"] == 1
+        with TestClient(app) as client:
+            again = client.post("/work")
+        assert again.status_code == 503
+        assert effects == []
+    # The latch really was set by the write that did not confirm in time, so every later request is
+    # refused on the acceptance record alone, without reaching the business call at all.
+    assert adapter.sink.failure == "log_unavailable"
+    assert adapter.available() is False
+    # Draining joins the writer. The record whose confirmation timed out is not a lost line: it is
+    # the writer's own work and it did land. What matters is that no *business* side effect was
+    # produced for either request, and that no record was ever written about twice.
+    adapter.shutdown()
+    events = [line["event"] for line in segment_lines(adapter)]
+    assert events.count("request.completed") == 0
+    assert state["attempts"] == 1, "the timed-out record is attempted once and never re-sent"
+    assert effects == []
+
+
+def test_a_burst_past_the_bounded_buffer_is_refused_and_never_queued_without_limit(tmp_path):
+    """The buffer is bounded, and exceeding it is a refusal about the log, not a lost line.
+
+    The bound only binds when calls arrive faster than the one writer can persist them, so this is
+    many concurrent callers against a deliberately slow disk — the shape of the failure the bound
+    exists for: parking an unbounded number of requests on the log.
+    """
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    with injected_writes(delay=0.1):
+        admitted = []
+        lock = threading.Lock()
+
+        def caller():
+            landed = adapter.emit("request.started", level="INFO", outcome="started")
+            with lock:
+                admitted.append(landed)
+
+        callers = [threading.Thread(target=caller) for _ in range(120)]
+        for thread in callers:
+            thread.start()
+        for thread in callers:
+            thread.join()
+        assert adapter.writer.queue.qsize() <= WRITE_QUEUE_LIMIT
+        assert False in admitted, (
+            "a burst past the bound must refuse rather than queue without limit"
+        )
+        assert adapter.sink.failure == "log_capacity"
+        assert adapter.available() is False
+        assert adapter.log_state() == "log_capacity"
+    adapter.shutdown()
+    # Every record that reached the writer is in the file exactly once, numbered contiguously from
+    # one: the bound refuses work, it never drops a line it already accepted. One segment holds at
+    # most the queue's worth of lines, which is the bound stated as a fact about the file.
+    numbers = sorted(line["sequence"] for line in segment_lines(adapter))
+    assert numbers == list(range(1, len(numbers) + 1))
+    assert 0 < len(numbers) <= WRITE_QUEUE_LIMIT * 2
+
+
+def test_shutdown_is_bounded_and_never_accepts_a_record_it_cannot_write(tmp_path):
+    """Closing drains what is already queued, then refuses new work within its own deadline."""
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    for _ in range(5):
+        adapter.emit("runtime.starting", level="INFO", outcome="started")
+    adapter.shutdown()
+    lines = segment_lines(adapter)
+    assert len(lines) == 5
+    assert [line["sequence"] for line in lines] == [1, 2, 3, 4, 5]
+    # Closing twice is closing once, and a stopping adapter refuses new work instead of parking it
+    # in a queue whose reader has gone: a record that cannot be written is a refusal, never a
+    # silent accept.
+    adapter.shutdown()
+    assert adapter.emit("runtime.started", level="INFO", outcome="succeeded") is False
+    assert len(segment_lines(adapter)) == 5
+
+
+def test_a_restarted_instance_never_repeats_a_sequence_inside_the_same_file(tmp_path):
+    """A process that comes back with the same instance id continues the numbers it wrote."""
+    first = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    for _ in range(3):
+        first.emit("runtime.starting", level="INFO", outcome="started")
+    first.shutdown()
+    # The same instance id, as a process that reused a persisted identity would have.
+    resumed = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    resumed.instance_id = first.instance_id
+    resumed.sink = Sink(tmp_path, resumed.instance_id)
+    resumed.sink.sequence = resumed.sink.last_persisted_sequence()
+    resumed.writer = Writer(resumed)
+    resumed.emit("runtime.started", level="INFO", outcome="succeeded")
+    resumed.shutdown()
+    lines = segment_lines(resumed)
+    numbers = [line["sequence"] for line in lines]
+    assert numbers == [1, 2, 3, 4]
+    assert len(numbers) == len(set(numbers))
+
+
+def test_a_write_that_fails_after_the_business_already_ran_keeps_the_result_and_never_repeats_it(
+    tmp_path,
+):
+    """The other half of R1: a failure that arrives *after* the work is a latch, not a rewrite.
+
+    The request is admitted and the side effect really happens, then persistence breaks while the
+    completion record is being written. The caller keeps the result it was promised — a receipt is
+    not withdrawn because a log line failed — the business call runs exactly once, and the failed
+    write is never re-sent. What changes is only the future: readiness goes false and the next
+    request is refused before it can produce a side effect nobody could account for.
+    """
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path)})
+    calls = []
+    app = FastAPI()
+
+    @app.post("/work")
+    async def work():
+        calls.append("committed")
+        return JSONResponse({"status": "succeeded"})
+
+    adapter.install(app)
+    bound(app)
+    with injected_writes(fail_from=2) as state:
+        # The acceptance record succeeds, so this request really is admitted; the completion record
+        # is the write that then fails. The business call runs, and the refusal only changes what
+        # happens to later requests.
+        with TestClient(app) as client:
+            response = client.post("/work")
+            # The result is the one the business produced, unchanged and un-retried.
+            assert response.status_code == 200, response.text
+            assert response.json() == {"status": "succeeded"}
+            assert calls == ["committed"]
+            # A later request is a different question, and the answer is now a refusal.
+            refused = client.post("/work")
+    assert refused.status_code == 503
+    assert refused.json() == {"status": "failed", "code": "log_unavailable"}
+    assert calls == ["committed"], "the refused request never reached the business call"
+    # The completion record was attempted once and never re-sent; the refused request never reached
+    # the writer at all, so the acceptance record it would have needed was never even built.
+    assert state["attempts"] == 2
+    assert state["failed"] == 1
+    assert adapter.sink.failure == "log_unavailable"
+    adapter.shutdown()
+    events = [line["event"] for line in segment_lines(adapter)]
+    assert events == ["request.started"]
+
+
+def test_a_pre_latched_sink_refuses_without_writing_and_recovers_by_nothing_implicit(tmp_path):
+    """The latch is the only failure state, and nothing in this adapter clears it on its own."""
+    adapter = Diagnostics(CHAT_SERVICE, {"log_directory": str(tmp_path / "absent")})
+    app = FastAPI()
+    effects = []
+
+    @app.post("/work")
+    async def work():
+        effects.append("committed")
+        return JSONResponse({"status": "ok"})
+
+    adapter.install(app)
+    bound(app)
+    assert adapter.emit("runtime.starting", level="INFO", outcome="started") is False
+    with TestClient(app) as client:
+        response = client.post("/work")
+    assert response.status_code == 503
+    assert effects == []
+    assert adapter.available() is False
+    assert adapter.log_state() == "log_unavailable"
