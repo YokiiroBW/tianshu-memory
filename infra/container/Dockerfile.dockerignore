@@ -1,11 +1,9 @@
-# What the build context may contain. Passed explicitly:
+# Dockerfile-specific context exclusions, automatically selected by BuildKit:
 #
-#   docker build --file infra/container/Dockerfile --ignorefile infra/container/Dockerfile.dockerignore .
+#   docker build --platform linux/amd64 --file infra/container/Dockerfile .
 #
-# It lives under `infra/container/` rather than at the repository root because the root is the
-# coordination checkout, which this card does not write; an ignore file placed there would be a
-# change to a shared file. Naming it explicitly also makes the exclusion visible in the build
-# command rather than depending on a file an operator might not notice.
+# The name is <Dockerfile>.dockerignore and it lives beside that Dockerfile. This takes precedence
+# over a root .dockerignore; there is no docker build --ignorefile option.
 
 # Everything, then the few things the build actually needs. A default-allow list would have to
 # anticipate every file the checkout may grow, and one missed entry would ship it into an image.
@@ -24,7 +22,7 @@ src/tianshu_memory/**
 !src/tianshu_memory/*.py
 !src/tianshu_memory/**/*.py
 
-# The probe script is copied in its own layer, so it is the third and last thing kept.
+# The probe script is copied in its own layer.
 !scripts/container_healthcheck.py
 
 # Named for what they are, so a reader can see each exclusion was deliberate rather than an
@@ -40,6 +38,8 @@ venv/**
 tests/**
 docs/**
 infra/**
+!infra/container/build-requirements.txt
+!infra/container/build_install.py
 projects/**
 node_modules/**
 __pycache__/**

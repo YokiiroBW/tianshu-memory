@@ -16,7 +16,7 @@
 | 服务 | `service` 字段 | 入口 | 身份来源 |
 | --- | --- | --- | --- |
 | 聊天 | `memory` | `tianshu-memory --config <文件> serve` | 配置文件内的既有身份与来源装配 |
-| 项目知识 | `memory-knowledge` | `python -m tianshu_memory.knowledge_cli --config <文件> --client <身份> serve` | 每次请求的 `Authorization: Bearer` |
+| 项目知识 | `memory-knowledge` | `python -m tianshu_memory.knowledge_cli --config <文件> serve --client <身份>` | 每次请求的 `Authorization: Bearer` |
 
 两个服务是**两个进程**，各自持有自己的日志 sink、自己的 `instance_id`、自己的 `sequence`
 计数和自己的 ready 判定。知识服务不依赖聊天服务的 SourceAuthority 或 issuer 配置就绪；它只在
@@ -171,9 +171,27 @@
 
 ## 5. 容器镜像
 
-`infra/container/Dockerfile` 是**一个镜像、两个入口**：构建阶段把仓库自己的 `uv.lock` 导出成
-带哈希的依赖清单并校验安装，运行阶段只带上解释器、已安装环境与探针脚本，不含构建工具、不含
-源码检出、不含测试。
+`infra/container/Dockerfile` 是**一个镜像、两个入口**。TS-107 将正式安装收敛到
+`infra/container/build_install.py`：Docker 与本地 Python 3.12 验证执行同一路径。
+脚本要求显式源目录和全新输出目录，不复用既有 venv；所有构建中间文件写入输出目录，
+不往业务 `src` 写入 egg-info。运行阶段只复制应用 venv 与探针，不复制构建环境、源码检出和测试。
+上游 Python 基础镜像可能自带全局 pip；**应用 venv** 不含 pip、setuptools、wheel、uv、pytest、ruff
+或未启用的 MCP extra。
+
+安装步骤：
+
+1. 独立工具 venv 安装 `build-requirements.txt` 的固定 wheel/hash：pip 25.2、setuptools 80.9.0、
+   uv 0.8.22；构建后端在 `pyproject.toml` 同样固定为 setuptools 80.9.0。
+2. `uv export --locked --no-dev --no-emit-project --no-editable --no-header` 校验并导出当前锁。
+   `--locked` 在需要更新锁时拒绝，`--frozen` 则跳过新旧检查；两者不能互换。
+   当前 `uv.lock` 与运行依赖版本保持原样，本任务未全库升级或重新生成锁。
+3. 工具环境用 `pip wheel --no-deps --no-build-isolation --no-index` 构建应用 wheel。
+   构建后端已显式安装，因此不会依赖 Python 3.12 新 venv 隐式带 setuptools。
+4. 新建无 pip 的运行 venv，通过工具 pip 的 `--python` 安装导出的依赖：
+   `--require-hashes --only-binary=:all:`；应用 wheel 用 `--no-deps --no-index` 安装。
+   缺平台 wheel 即失败，不隐式编译或重新解析运行依赖。
+5. 核对已装依赖与导出锁的当前平台 marker 完全一致、`pip check`、两个 CLI 各两条帮助入口、
+   安装位置和工具隔离；写出 `installation-evidence.json`，包含输入/清单/wheel/源码 hash。
 
 - 非 root（`10001:10001`，无 home、无 shell），可写路径只有 `/var/log/tianshu` 与 `/srv/tianshu`，
   两者在镜像内创建并归属该账号；容器层用 `--read-only` 落地不可变的其余文件系统。
@@ -185,21 +203,35 @@
   退出码：`0` alive、`1` 进程回了但不是 liveness 文档（唯一应触发重启的情形）、
   `2` 探针无法得出结论（不可解析的权威名、读不到的信任锚、无法验证的证书、无人应答、
   应答超限）。**liveness 不等于 readiness**：readiness 需要独立凭据，不应作为重启依据。
-- `.dockerignore` 位于 `infra/container/Dockerfile.dockerignore`，必须在构建命令里显式点名
-  （该文件名只有被显式指定时才生效）；它以 `**` 默认排除，只放行 `pyproject.toml`、`uv.lock`、
-  `src/tianshu_memory/*.py` 与探针脚本，并按名字排除 `.git`、`.runtime`、`.venv`、测试、文档、
+- `.dockerignore` 位于 Dockerfile 旁的 `infra/container/Dockerfile.dockerignore`。
+  BuildKit 按 `<Dockerfile>.dockerignore` 命名自动选取，优先于根 `.dockerignore`；不使用
+  `--ignorefile`（Docker build 无此选项）。它以 `**` 默认排除，只放行 `pyproject.toml`、`uv.lock`、
+  `src/tianshu_memory/*.py`、探针与两个构建辅助文件，并按名字排除 `.git`、`.runtime`、`.venv`、测试、文档、
   数据库、备份、证书与凭据。
 
-构建与运行（**本环境没有容器运行时，以下命令在本卡中未执行、未验证**）。
-本卡不新增 compose 文件：集中编排属于下一批。基础镜像按 Python 依赖的精确补丁版本固定，
-**镜像 digest 尚未在打包验收中固定，因此当前 tag 仍不代表可复现**，只代表"同一份 Dockerfile
-与同一份 `uv.lock`"。镜像内不含 `.env`、数据库、凭据，也不含任何可用于真实环境的 token 或
-占位配置；配置由操作者在运行期以只读挂载提供。
+正式目标为 **Linux amd64**。两阶段固定同一个官方 `python:3.12.11-slim-bookworm` amd64 manifest
+`sha256:c00fc7b44d844b6da22861ec24af43968a5200eac4ec607b4725d585165d6b49`。
+2026-09-22 从 Docker Hub 官方 registry 核对所属 OCI index 为
+`sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7`；
+此处证明基础输入已固定，不证明镜像已构建，也不承诺产物逐字节可复现或后续安全更新已完成。
+工具 wheel 的 hash 仅覆盖 Linux amd64 和 Windows x86_64 本地验证；其他架构未支持。
+
+本地正式安装验证（需已有 Python 3.12；输出目录必须不存在）：
+
+```powershell
+python3.12 infra/container/build_install.py --source . --output .runtime/install-verification
+```
+
+Windows 可将 `python3.12` 替换为已有 3.12 解释器绝对路径。此验证会连接官方 PyPI 下载固定依赖，
+只检查安装与 CLI 帮助，不启动业务进程、不访问账号或模型。具体实测证据见 `docs/handoffs/TS-107.md`。
+
+容器构建与运行（**本环境无 Docker，以下容器命令未执行、未验证**）。集中编排由部署协调任务负责。
+镜像不含 `.env`、数据库、凭据或占位配置；配置由操作者在运行期以只读挂载提供。
 
 ```powershell
 docker build `
+  --platform linux/amd64 `
   --file infra/container/Dockerfile `
-  --ignorefile infra/container/Dockerfile.dockerignore `
   --tag tianshu-memory:local .
 ```
 
@@ -214,9 +246,10 @@ docker run --read-only --tmpfs /tmp `
   -e TIANSHU_HEALTHCHECK_CA=/etc/tianshu/ca.pem `
   -p 8130:8130 `
   tianshu-memory:local `
+  tianshu-memory --config /etc/tianshu/memory.json serve `
   --host 0.0.0.0 --port 8130 `
   --tls-certfile /etc/tianshu/server.pem --tls-keyfile /etc/tianshu/server.key `
-  --allowed-host memory.example.test:8130 serve
+  --allowed-host memory.example.test:8130
 ```
 
 ```powershell
@@ -226,11 +259,21 @@ docker run --read-only --tmpfs /tmp `
   --mount type=bind,src=/srv/tianshu,dst=/srv/tianshu `
   --mount type=volume,src=tianshu-logs,dst=/var/log/tianshu `
   --env TIANSHU_DIAGNOSTICS_TOKEN `
+  -e TIANSHU_HEALTHCHECK_HOST=memory-knowledge.example.test:18135 `
+  -e TIANSHU_HEALTHCHECK_CA=/etc/tianshu/ca.pem `
   -p 18135:18135 `
   tianshu-memory:local `
-  python -m tianshu_memory.knowledge_cli --config /etc/tianshu/knowledge.json `
-  --host 0.0.0.0 --port 18135 --client project-web-reader serve
+  python -m tianshu_memory.knowledge_cli --config /etc/tianshu/knowledge.json serve `
+  --host 0.0.0.0 --port 18135 --client project-web-reader `
+  --tls-certfile /etc/tianshu/server.pem --tls-keyfile /etc/tianshu/server.key `
+  --allowed-host memory-knowledge.example.test:18135
 ```
+
+实现依据：[uv 锁与同步](https://docs.astral.sh/uv/concepts/projects/sync/)、
+[Python 3.12 venv](https://docs.python.org/3.12/library/venv.html)、
+[pip 指定目标解释器](https://pip.pypa.io/en/stable/topics/python-option/)、
+[Docker 上下文排除规则](https://docs.docker.com/build/concepts/context/)、
+[官方 Python 基础配方版本](https://github.com/docker-library/python/tree/093598a0190ba9074b899d6a0a21a00c859aac56/3.12/slim-bookworm)。
 
 容器里**没有** `.runtime/workspace-context.json`，所以诊断合同包的位置不会被推导出来：容器部署
 必须在配置文件里显式给出 `contract_directory`，并把 `contracts/diagnostics/v1` 一起挂载进去，
@@ -259,6 +302,8 @@ docker run --read-only --tmpfs /tmp `
 - **容器构建与运行未验证**：本环境没有 Docker/Podman 守护进程，镜像**没有构建过、没有运行过**。
   `tests/test_container_runtime.py` 只能证明（a）Dockerfile 文本里写明的性质，以及（b）探针脚本
   对真实 TLS socket 的行为；`Dockerfile` 能通过静态检查**不等于**构建通过。
+  TS-107 的新 Python 3.12 安装验证另见交接；安装通过也不能替代 Linux 权限、只读文件系统、
+  BuildKit 实际上下文、镜像启动和 NAS 实机验收。
 - **真实远端来源、真实账号、付费调用未测试**。`remote` 检查永远是 `not_verified`。
 - **NAS 操作未执行**。日志目录指向本地路径；容量上限、卷与保留策略只在本机隔离测试中验证。
 - **两个服务同时对外部署、网关与网络边界未验证**：本卡只验证每个进程自己的绑定与权威名规则。

@@ -290,18 +290,21 @@ def test_both_base_images_are_pinned_to_a_patch_release():
             tag = reference.split(":", 1)[1]
             assert tag.count(".") >= 2, reference
             assert tag != "latest", reference
+            assert "@sha256:" in reference
+            assert len(reference.rsplit("sha256:", 1)[1]) == 64
 
 
 def test_the_dependency_install_is_locked_and_hash_checked():
-    body = " ".join(instructions())
-    assert "uv export --frozen" in body
-    assert "--no-emit-project" in body
-    assert "--require-hashes" in body
-    # The project itself is installed without re-resolving, so no dependency can drift at that step.
-    assert "--no-deps" in body
-    assert "--no-build-isolation" in body
-    # And the lock file is the only resolution input copied before the install.
+    # The actual installation lives in the same script exercised by local fresh-venv verification.
+    assert (
+        "RUN python infra/container/build_install.py --source /build --output /opt/tianshu"
+        in instructions()
+    )
     assert "COPY pyproject.toml uv.lock ./" in instructions()
+    assert (
+        "COPY infra/container/build-requirements.txt infra/container/build_install.py "
+        "./infra/container/" in instructions()
+    )
 
 
 def test_the_runtime_image_installs_nothing_and_builds_nothing():
@@ -403,6 +406,8 @@ def test_the_ignore_file_keeps_the_build_inputs_and_excludes_state():
     assert lines[0] == "**"
     for kept in ("!pyproject.toml", "!uv.lock", "!src/**"):
         assert kept in lines, kept
+    for name in ("build_install.py", "build-requirements.txt"):
+        assert lines.index(f"!infra/container/{name}") > lines.index("infra/**")
     for excluded in (
         ".git/**",
         ".runtime/**",
@@ -423,8 +428,9 @@ def test_the_ignore_file_keeps_the_build_inputs_and_excludes_state():
     assert "never contain a checkout, a runtime directory, a credential or a" in body
 
 
-def test_the_build_command_names_the_ignore_file_explicitly():
-    """`Dockerfile.dockerignore` is only honoured when it is named, so the recipe says how."""
+def test_the_build_command_uses_dockerfile_specific_ignore_discovery():
+    """BuildKit discovers the adjacent <Dockerfile>.dockerignore automatically."""
     body = recipe()
-    assert "--ignorefile infra/container/Dockerfile.dockerignore" in body
+    assert "--ignorefile" not in body
     assert "--file infra/container/Dockerfile" in body
+    assert IGNORE_FILE == DOCKERFILE.with_name(DOCKERFILE.name + ".dockerignore")

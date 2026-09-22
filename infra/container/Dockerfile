@@ -6,12 +6,11 @@
 # arguments or environment variables of the container, because a value in an image is a value
 # nobody can change without rebuilding it.
 #
-# Build (the ignore file is passed explicitly because this checkout keeps it under `infra/` rather
-# than beside the build context, and a stray `.dockerignore` would silently change what is sent):
+# Build with BuildKit. Docker automatically selects the adjacent Dockerfile.dockerignore:
 #
 #   docker build \
+#     --platform linux/amd64 \
 #     --file infra/container/Dockerfile \
-#     --ignorefile infra/container/Dockerfile.dockerignore \
 #     --tag tianshu-memory:local .
 #
 # Run the chat service (TLS is mandatory off loopback, so both files and the announced authority are
@@ -27,35 +26,28 @@
 # The build stage exists only to turn the locked dependency set into a wheel directory plus an
 # installed tree. It is discarded, so no compiler, no package index credential and no lock tooling
 # reaches the runtime image.
-FROM python:3.12.11-slim-bookworm AS builder
+FROM python:3.12.11-slim-bookworm@sha256:c00fc7b44d844b6da22861ec24af43968a5200eac4ec607b4725d585165d6b49 AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# One pinned build tool. `uv` reads the repository's own `uv.lock`; nothing here re-resolves it.
-RUN python -m pip install --no-cache-dir "uv==0.8.22"
-
 WORKDIR /build
 
-# Only the files the resolution needs, so a source edit does not invalidate the dependency layer.
 COPY pyproject.toml uv.lock ./
-
-# `--frozen` fails the build if `uv.lock` and `pyproject.toml` disagree, rather than resolving
-# something new, and `--require-hashes` makes the wheel step verify every artifact against the
-# hashes recorded in the lock file.
-RUN uv export --frozen --no-dev --no-emit-project --output-file requirements.txt \
-    && python -m venv /opt/tianshu/venv \
-    && /opt/tianshu/venv/bin/python -m pip install --require-hashes -r requirements.txt
-
+COPY infra/container/build-requirements.txt infra/container/build_install.py ./infra/container/
 COPY src ./src
 
-# The application itself, with no dependencies re-resolved: the interpreter above already has them.
-RUN /opt/tianshu/venv/bin/python -m pip install --no-deps --no-build-isolation .
+# The same path runs in a fresh local Python 3.12 environment for installation verification.
+# It hash-pins build tools separately, checks lock freshness with `uv export --locked`, builds an
+# application wheel, then installs locked binary dependencies and that wheel in a pip-free venv.
+# `--frozen` would skip freshness checking and must not replace `--locked` here.
+RUN python infra/container/build_install.py --source /build --output /opt/tianshu
 
 # The runtime image: the interpreter, the installed environment and the probe script. No shell
-# tool for the probe to depend on, no build tooling, no source checkout and no test suite.
-FROM python:3.12.11-slim-bookworm AS runtime
+# tool for the probe to depend on, no added build tooling, no source checkout and no test suite.
+# The upstream Python base may include pip globally; the application venv contains no pip/tools.
+FROM python:3.12.11-slim-bookworm@sha256:c00fc7b44d844b6da22861ec24af43968a5200eac4ec607b4725d585165d6b49 AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -96,10 +88,10 @@ HEALTHCHECK --interval=15s --timeout=10s --start-period=20s --retries=3 CMD ["py
 # an explicit certificate and an explicit authority list.
 #
 #   chat:      tianshu-memory --config <file>
-#                [--host <ip>] [--port <port>] serve
+#                serve [--host <ip>] [--port <port>]
 #                [--tls-certfile <pem> --tls-keyfile <pem> --allowed-host <authority>]...
 #   knowledge: python -m tianshu_memory.knowledge_cli --config <file>
-#                [--host <ip>] --port <port> --client <identity> serve
+#                serve [--host <ip>] --port <port> --client <identity>
 #                [--tls-certfile <pem> --tls-keyfile <pem> --allowed-host <authority>]...
 #
 # `--config` belongs to the command rather than to its `serve` subcommand, so it comes before the
