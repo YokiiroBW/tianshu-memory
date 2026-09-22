@@ -1,6 +1,7 @@
 import hmac
 import json
 import ssl
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -57,20 +58,41 @@ class Authenticator:
                 with httpx.Client(
                     verify=verify, timeout=5, follow_redirects=False, trust_env=False
                 ) as client:
-                    response = client.post(
+                    deadline = time.monotonic() + 5
+                    with client.stream(
+                        "POST",
                         url,
-                        headers={"Authorization": f"Bearer {credential}"},
+                        headers={
+                            "Authorization": f"Bearer {credential}",
+                            "Accept-Encoding": "identity",
+                        },
                         json={
                             "schema_version": 1,
                             "request_id": request_id,
                             "assertion_ref": assertion_ref,
                         },
-                    )
-                if response.status_code in {401, 403, 404}:
-                    raise Fault("forbidden", 403)
-                if response.status_code != 200:
-                    raise Fault("dependency_unavailable", 503)
-                resolved = response.json()
+                    ) as response:
+                        if response.status_code in {401, 403, 404}:
+                            raise Fault("forbidden", 403)
+                        require(response.status_code == 200, "dependency_unavailable", 503)
+                        require(
+                            response.headers.get("content-encoding", "identity").lower()
+                            == "identity",
+                            "dependency_unavailable",
+                            503,
+                        )
+                        body = bytearray()
+                        # Observe every transport chunk: coalescing to a fixed size
+                        # could hide a peer dripping bytes beneath the read timeout.
+                        for chunk in response.iter_bytes():
+                            require(
+                                time.monotonic() < deadline and len(body) + len(chunk) <= 262144,
+                                "dependency_unavailable",
+                                503,
+                            )
+                            body.extend(chunk)
+                        require(time.monotonic() < deadline, "dependency_unavailable", 503)
+                resolved = json.loads(body)
                 self.contracts.validate("common#origin_resolve_response", resolved)
                 require(resolved["request_id"] == request_id)
                 context = resolved["context"]

@@ -576,7 +576,7 @@ class TrustedWorkflow(_WorkflowBase):
             return proof
 
     def _approval(self, adapter, operation, payload):
-        from .user_actions import LocalUserApproval
+        from .user_approval import LocalUserApproval
 
         require(type(adapter) is LocalUserApproval, "dependency_unavailable", 503)
         adapter.verify(operation, payload)

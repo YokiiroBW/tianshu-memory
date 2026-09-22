@@ -1,4 +1,6 @@
+import asyncio
 import json
+import math
 import os
 import sqlite3
 from pathlib import Path
@@ -6,9 +8,10 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from jsonschema.exceptions import ValidationError
-from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
 
 from .auth import Authenticator
+from .chat_requests import Requests
 from .contracts import Contracts
 from .diagnostics import (
     CHAT_SERVICE,
@@ -40,22 +43,14 @@ def module_of(operation, input_type):
     return "identity-memory"
 
 
-async def served(*, service, request, operation, payload, context, module, output_type):
-    """Run one operation through the service and validate the shape it produced.
+async def served(*, service, request, operation, payload, context, module, output_type, lease):
+    """Validate the result and record actual worker execution, including late completion."""
 
-    The one seam this task adds to the request path: the synchronous call is wrapped so the
-    diagnostic adapter records when it really started and when it really ended. Nothing about the
-    call itself changes — same service object, same arguments, same threadpool.
-    """
-    execution = record_execution(operation)
-    try:
-        with execution:
-            result = await run_in_threadpool(getattr(service, operation), payload, context)
-    except BaseException:
-        # A response that ended before the worker could start performs no work at all, and the log
-        # says exactly that instead of leaving a start without an end.
-        execution.cancelled()
-        raise
+    def execute():
+        with record_execution(operation):
+            return getattr(service, operation)(payload, context)
+
+    result = await lease.run(execute, business=True)
     service.contracts.validate(f"{module}#{output_type}", result)
     return JSONResponse(
         result,
@@ -66,8 +61,19 @@ async def served(*, service, request, operation, payload, context, module, outpu
     )
 
 
-def create_app(*, service=None, auth=None):
+def create_app(*, service=None, auth=None, body_timeout=5.0, execute_timeout=15.0, max_active=8):
     app = FastAPI(title="Tianshu Memory", version="0.1.0", docs_url=None, redoc_url=None)
+    if (
+        not all(
+            type(v) in (int, float) and math.isfinite(v) and v > 0
+            for v in (body_timeout, execute_timeout)
+        )
+        or type(max_active) is not int
+        or not 1 <= max_active <= 64
+    ):
+        raise ValueError("Invalid chat request limits")
+    admission = Requests(max_active)
+    app.state.chat_requests = admission
     app.state.memory = service
 
     @app.get("/health")
@@ -95,13 +101,16 @@ def create_app(*, service=None, auth=None):
     def endpoint_for(operation, input_type, output_type):
         async def endpoint(request: Request):
             request_id = "request-unavailable"
+            lease = None
             try:
                 if service is None or auth is None:
                     await anote_authenticated("dependency_unavailable")
                     raise Fault("dependency_unavailable", 503)
-                authenticated_service, caller = auth.authenticate(
-                    request.headers.get("authorization")
-                )
+                lease = admission.claim()
+                async with asyncio.timeout(execute_timeout):
+                    authenticated_service, caller = await lease.run(
+                        auth.authenticate, request.headers.get("authorization")
+                    )
                 if operation not in caller.get("operations", []):
                     await anote_authenticated("forbidden")
                     raise Fault("forbidden", 403)
@@ -113,10 +122,11 @@ def create_app(*, service=None, auth=None):
                 if not await anote_authenticated():
                     raise Fault("log_unavailable", 503)
                 body = bytearray()
-                async for chunk in request.stream():
-                    body.extend(chunk)
-                    if len(body) > 262144:
-                        raise Fault("invalid_input", 400)
+                async with asyncio.timeout(body_timeout):
+                    async for chunk in request.stream():
+                        if len(body) + len(chunk) > 262144:
+                            raise Fault("invalid_input", 400)
+                        body.extend(chunk)
                 payload = strict_json(body)
                 if not isinstance(payload, dict):
                     raise Fault("invalid_input", 400)
@@ -142,47 +152,69 @@ def create_app(*, service=None, auth=None):
                 )
                 service.contracts.validate(schema, payload)
                 request_id = payload["event_id"] if operation == "consume" else header["request_id"]
-                if operation in {"consume", "check_sources"}:
-                    context = {
-                        "authenticated_service": authenticated_service,
-                        "allowed_scopes": caller.get("event_scopes", []),
-                    }
-                else:
-                    context = await run_in_threadpool(
-                        auth.resolve,
-                        authenticated_service,
-                        caller,
-                        header["origin"]["assertion_ref"],
-                        request_id,
+                lease.request = request
+                async with asyncio.timeout(execute_timeout):
+                    if operation in {"consume", "check_sources"}:
+                        context = {
+                            "authenticated_service": authenticated_service,
+                            "allowed_scopes": caller.get("event_scopes", []),
+                        }
+                    else:
+                        context = await lease.run(
+                            auth.resolve,
+                            authenticated_service,
+                            caller,
+                            header["origin"]["assertion_ref"],
+                            request_id,
+                        )
+                    if (
+                        operation in {"select", "select_profiles", "consume", "revise"}
+                        and service.source_authority is None
+                    ):
+                        raise Fault("dependency_unavailable", 503)
+                    return await served(
+                        service=service,
+                        request=request,
+                        operation=operation,
+                        payload=payload,
+                        context=context,
+                        module=module_of(operation, input_type),
+                        output_type=output_type,
+                        lease=lease,
                     )
-                if (
-                    operation in {"select", "select_profiles", "consume", "revise"}
-                    and service.source_authority is None
-                ):
-                    raise Fault("dependency_unavailable", 503)
-                return await served(
-                    service=service,
-                    request=request,
-                    operation=operation,
-                    payload=payload,
-                    context=context,
-                    module=module_of(operation, input_type),
-                    output_type=output_type,
-                )
             except Fault as error:
                 if error.code == "idempotency_conflict":
                     # Separate transaction after the rejected operation rolled back; no raw payload.
-                    with service.store.transaction() as db:
-                        db.execute(
-                            "INSERT INTO conflicts(operation,request_id,digest) VALUES (?,?,?)",
-                            (operation, request_id, fingerprint(payload)),
-                        )
+                    def conflict():
+                        with service.store.transaction() as db:
+                            db.execute(
+                                "INSERT INTO conflicts(operation,request_id,digest) VALUES (?,?,?)",
+                                (operation, request_id, fingerprint(payload)),
+                            )
+
+                    try:
+                        async with asyncio.timeout(execute_timeout):
+                            await lease.run(conflict)
+                    except TimeoutError:
+                        pass
                 note_fault(error.code)
                 return JSONResponse(
                     error.wire(request_id),
                     status_code=error.status,
                     headers={"Cache-Control": "no-store"},
                 )
+            except TimeoutError:
+                note_fault("timeout")
+                result = Fault("timeout", 408).wire(request_id)
+                if lease is not None and lease.business_started:
+                    result.update(execution_state="unknown", retryable=False)
+                return JSONResponse(result, status_code=408, headers={"Cache-Control": "no-store"})
+            except ClientDisconnect:
+                note_fault("invalid_input")
+                result = Fault("invalid_input", 400).wire(request_id)
+                if lease is not None and lease.business_started:
+                    result.update(execution_state="unknown", retryable=False)
+                return JSONResponse(result, status_code=400, headers={"Cache-Control": "no-store"})
             except (ValidationError, ValueError, KeyError, TypeError):
                 note_fault("invalid_input")
                 return JSONResponse(Fault("invalid_input").wire(request_id), status_code=400)
@@ -191,6 +223,9 @@ def create_app(*, service=None, auth=None):
                 return JSONResponse(
                     Fault("dependency_unavailable", 503).wire(request_id), status_code=503
                 )
+            finally:
+                if lease is not None:
+                    lease.finish()
 
         return endpoint
 

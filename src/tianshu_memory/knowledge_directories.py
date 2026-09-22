@@ -540,7 +540,7 @@ def _prepare(project, entry, item):
         decoded = decode(raw, media)
     except Fault as error:
         return {"reason": reason_of(error)}
-    from .knowledge import blocks
+    from .knowledge_evidence import blocks
 
     units = blocks(decoded, None)
     return {
@@ -601,8 +601,8 @@ def import_item(db, application, project_id, project, item, observed):
             return {**outcome("conflict"), "reason": "version_conflict"}
         if row["state"] == "ready" and stored == item["digest"]:
             return outcome("unchanged", version, stored)
-    application._ensure_project(db, project_id, project)
-    application._store_version(
+    application.ensure_project(db, project_id, project)
+    application.store_version(
         db,
         project_id,
         item["document_id"],
@@ -641,7 +641,7 @@ def remove_source(db, application, project_id, candidate, observed):
         "(SELECT id FROM knowledge_blocks WHERE document_id=?)",
         (row["id"],),
     )
-    application._bump(db, project_id)
+    application.bump(db, project_id)
     return {**candidate, "outcome": "deleted", "version": row["version"] + 1}
 
 

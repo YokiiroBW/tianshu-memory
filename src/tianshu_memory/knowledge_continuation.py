@@ -229,7 +229,7 @@ def declared_state(application, db, project_id, project, read):
     stale, evidence = [], []
     for item in references(payload):
         try:
-            evidence.append(application._reference(db, project_id, project, item, read))
+            evidence.append(application.reference(db, project_id, project, item, read))
         except Fault:
             stale.append(item)
     return {"version": row["version"], **payload}, stale, evidence
@@ -251,7 +251,7 @@ def recover(
     entry = workdir.require_registration(worktrees, args["worktree"])
     indexed = indexed_documents(db, project_id)
     state, stale, evidence = declared_state(application, db, project_id, project, read)
-    found = application._query(db, project_id, project, args, read)
+    found = application.query(db, project_id, project, args, read)
     if preview:
         return {"worktree": entry["id"], "indexed": indexed}
     return assemble(
@@ -348,7 +348,7 @@ def assemble(
         used = measured
     result["budget"]["used_bytes"] = used
     result["budget"]["over_budget"] = result["budget"]["over_budget"] or used > budget
-    result["seal"] = application._seal(
+    result["seal"] = application.seal(
         {key: value for key, value in result.items() if key != "seal"}, seal_key
     )
     return result
@@ -468,7 +468,7 @@ def unavailable(project_id, worktree, code):
 def internal_differences(application, db, project_id, project, package, seal_key, entry, read):
     """Identity, registration, revision and evidence of one package, in that order."""
     body = {key: value for key, value in package.items() if key != "seal"}
-    if not hmac.compare_digest(package["seal"], application._seal(body, seal_key)):
+    if not hmac.compare_digest(package["seal"], application.seal(body, seal_key)):
         return ["stale_or_tampered"]
     if package["project_id"] != project_id or package["registration"] != fingerprint(project):
         return ["stale_or_tampered"]
@@ -480,7 +480,7 @@ def internal_differences(application, db, project_id, project, package, seal_key
     if package["state"] is not None:
         for item in package["state"]["evidence"]:
             try:
-                application._reference(db, project_id, project, item, read)
+                application.reference(db, project_id, project, item, read)
             except Fault:
                 differences.append("stale_evidence")
                 break

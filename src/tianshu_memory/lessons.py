@@ -243,13 +243,13 @@ class SourceContext:
     holds the callable rather than looking it up per call.
     """
 
-    def __init__(self, application, db, project_id, *, reader, phase):
-        from .knowledge import Evidence
+    def __init__(self, project, lookup, db, project_id, *, reader, phase):
+        from .knowledge_evidence import Evidence
 
-        self.application = application
+        self.lookup = lookup
         self.db = db
         self.project_id = project_id
-        self.project = application.projects.get(project_id)
+        self.project = project
         require(isinstance(self.project, dict), "project_unregistered", 403)
         require(
             set(self.project) == {"root", "host", "default_branch", "urls"},
@@ -258,7 +258,7 @@ class SourceContext:
         )
         self.reader = reader
         self.read = getattr(reader, phase)
-        self.evidence = Evidence(application, db, project_id, self.project, self.read)
+        self.evidence = Evidence(lookup, db, project_id, self.project, self.read)
         self.revision = self._revision()
 
     def _revision(self):
@@ -304,7 +304,7 @@ class SourceContext:
         never handed to the file reader and no network request is made here, so composing or
         reading an experience never becomes an unrequested fetch.
         """
-        document = self.application._document(self.db, self.project_id, document_id)
+        document = self.lookup.document(self.db, self.project_id, document_id)
         require(document["version"] == version, "stale_evidence", 409)
         stored = self.db.execute(
             "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
