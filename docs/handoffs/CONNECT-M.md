@@ -4,6 +4,8 @@
 
 基于 Memory `9a3b2bed6aebff9f0677f2c62e979859769e0c9c`，提供给 Platform 服务端使用的真实人物/群共享画像与本人记忆分页入口。仅修改本 Memory 任务检出，不写根合同、其他产品、NAS、真实数据或凭据。本批用户授权已有能力整体贯通，接口先行稿为 [CONNECT-M-API.md](CONNECT-M-API.md)。
 
+固定实现提交：浏览端点 `0dd542a76cb7db36013513b3de28b81c2c81ac05`；知识四项只读扩展 `bd0123bc7e242dc5a767347602f23957af9b2c33`。本交接收尾不改变这两个固定实现提交。
+
 ## 变更
 
 - 新增三个只读 POST `/internal/v1/memory/browser/{overview,subjects,records}`。服务端固定 `browser_readers.<caller>` 账号、actor、精确 scopes；专用 `callers.<caller>` 只授 `browse`，按现有 `Authenticator` 逐请求读取 Bearer 与 Platform HTTPS origin。请求中的人、actor、scope 不能扩大固定权限。
@@ -30,4 +32,4 @@ Platform 必须通过正式 Origins.issue 为已登录账号/actor/scope 发放 
 
 `continuation_recover/check` 实际只读已登记 checkout 的 Git/文件和现有项目数据库，生成/验证客户端绑定 seal；不会向 `knowledge_operations` 持久化封装包、不会修改 checkout。包是当次观测快照，不是持续最新状态；必须在网页明示“读取交接”动作时触发，不能后台轮询。受信 Platform 后端只投影安全字段，不把完整包、seal 或本机路径显示给浏览器。`lesson_query`/`experience_query` 为文本检索，不是全量目录；真实没有匹配时按空态展示。
 
-验证：`uv run pytest tests/test_knowledge_http_extra.py tests/test_knowledge_http.py tests/test_knowledge_http_process.py tests/test_knowledge_catalog_http.py tests/test_lessons.py tests/test_knowledge_continuation.py -q --basetemp .runtime/tests-connect-m-knowledge-suite` 为 179 通过、1 跳过；最后把执行中撤销 HTTP 授权的拒绝状态固定为传输层 415 后，`test_knowledge_http_extra.py` 4 项复核通过。用真实独立 HTTP 子进程读到非空 lesson/experience/continuation，lesson 与既有 CLI 实际输出相同；小预算、跨项目 review、未登记 checkout、旧客户端默认拒绝和授权中途撤销均验。`ruff check`/`ruff format --check` 与完整 diff 检查通过。第二提交 SHA 待填写。部署、真实发放、完整浏览器链与用户写动作未在本任务执行。
+验证：`uv run pytest tests/test_knowledge_http_extra.py tests/test_knowledge_http.py tests/test_knowledge_http_process.py tests/test_knowledge_catalog_http.py tests/test_lessons.py tests/test_knowledge_continuation.py -q --basetemp .runtime/tests-connect-m-knowledge-suite` 为 179 通过、1 跳过；最后把执行中撤销 HTTP 授权的拒绝状态固定为传输层 415 后，`test_knowledge_http_extra.py` 4 项复核通过。用真实独立 HTTP 子进程读到非空 lesson/experience/continuation，lesson 与既有 CLI 实际输出相同；小预算、跨项目 review、未登记 checkout、旧客户端默认拒绝和授权中途撤销均验。`ruff check`/`ruff format --check` 与完整 diff 检查通过。部署、真实发放、完整浏览器链与用户写动作未在本任务执行。
