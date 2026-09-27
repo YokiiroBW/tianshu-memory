@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from jsonschema.exceptions import ValidationError
 from starlette.requests import ClientDisconnect
 
+from . import browser
 from .auth import Authenticator
 from .chat_requests import Requests
 from .contracts import Contracts
@@ -229,9 +230,107 @@ def create_app(*, service=None, auth=None, body_timeout=5.0, execute_timeout=15.
 
         return endpoint
 
+    def browser_endpoint_for(operation):
+        async def endpoint(request: Request):
+            request_id = "request-unavailable"
+            lease = None
+
+            def failed(code, status):
+                return JSONResponse(
+                    {"status": "failed", "code": code, "request_id": request_id},
+                    status_code=status,
+                    headers={"Cache-Control": "no-store"},
+                )
+
+            try:
+                if service is None or auth is None or service.source_authority is None:
+                    raise Fault("dependency_unavailable", 503)
+                lease = admission.claim()
+                async with asyncio.timeout(execute_timeout):
+                    caller_name, caller = await lease.run(
+                        auth.authenticate, request.headers.get("authorization")
+                    )
+                if "browse" not in caller.get("operations", []):
+                    await anote_authenticated("forbidden")
+                    raise Fault("forbidden", 403)
+                if not await anote_authenticated():
+                    raise Fault("log_unavailable", 503)
+                if (
+                    request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    != "application/json"
+                ):
+                    raise Fault("invalid_input", 415)
+                body = bytearray()
+                async with asyncio.timeout(body_timeout):
+                    async for chunk in request.stream():
+                        if len(body) + len(chunk) > 16384:
+                            raise Fault("invalid_input", 413)
+                        body.extend(chunk)
+                payload = strict_json(body)
+                browser.validate_request(operation, payload)
+                request_id = payload["request_id"]
+                lease.request = request
+                async with asyncio.timeout(execute_timeout):
+                    context = await lease.run(
+                        auth.resolve,
+                        caller_name,
+                        caller,
+                        payload["origin"]["assertion_ref"],
+                        request_id,
+                    )
+
+                    def execute():
+                        with record_execution("browse"):
+                            current_name, current_caller = auth.authenticate(
+                                request.headers.get("authorization")
+                            )
+                            if current_name != caller_name or "browse" not in current_caller.get(
+                                "operations", []
+                            ):
+                                raise Fault("forbidden", 403)
+                            return browser.read(
+                                service,
+                                auth,
+                                caller_name,
+                                current_caller,
+                                payload,
+                                context,
+                                operation,
+                            )
+
+                    result = await lease.run(execute, business=True)
+                    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+            except Fault as error:
+                note_fault(error.code)
+                return failed(error.code, error.status)
+            except TimeoutError:
+                note_fault("timeout")
+                return failed("timeout", 408)
+            except ClientDisconnect:
+                note_fault("invalid_input")
+                return failed("invalid_input", 400)
+            except (ValidationError, ValueError, KeyError, TypeError):
+                note_fault("invalid_input")
+                return failed("invalid_input", 400)
+            except (sqlite3.Error, OSError, RuntimeError):
+                note_fault("dependency_unavailable")
+                return failed("dependency_unavailable", 503)
+            finally:
+                if lease is not None:
+                    lease.finish()
+
+        return endpoint
+
     for path, (operation, input_type, output_type) in OPERATIONS.items():
         app.add_api_route(
             path, endpoint_for(operation, input_type, output_type), methods=["POST"], name=operation
+        )
+    for operation in ("overview", "subjects", "records"):
+        app.add_api_route(
+            f"/internal/v1/memory/browser/{operation}",
+            browser_endpoint_for(operation),
+            methods=["POST"],
+            name=f"browse_{operation}",
         )
     # Cannot load or expose the extension until a coordinator-published package is pinned.
     if service is not None and service.contracts.profile_version is not None:
@@ -289,7 +388,7 @@ def configured_app():
     if any(
         "select_profiles" in caller.get("operations", [])
         for caller in config.get("callers", {}).values()
-    ):
+    ) or bool(config.get("browser_readers")):
         contracts.load_profiles()
     store = Store(
         config["database_path"], recovery_path=config.get("source_sync", {}).get("recovery_path")
