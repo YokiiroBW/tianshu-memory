@@ -1,11 +1,11 @@
 # 项目知识与研究笔记受限 HTTP 入口
 
-本入口把已经集成的项目知识检索与研究笔记全生命周期，通过**仅 loopback** 的受限 HTTP 暴露给
+本入口把已经集成的项目知识检索与研究笔记全生命周期，通过受限 HTTP 暴露给
 未来平台服务端的同源连接器。它是产品内部的受限接口候选，**不是已经发布的跨产品合同**，也不代表
 任何网页已经联通：平台侧的同源连接器、用户身份映射、页面位置与浏览器验收必须在 TS-090 释放
 所有权后另行双方冻结。此轮不写网页、不加前端引擎，也不改平台代码。
 
-覆盖范围 = 现有 `KnowledgeApplication.execute` 的十二个操作，语义与之**逐字相同**；本入口只负责
+覆盖范围 = 现有 `KnowledgeApplication.execute` 的既有十二个操作及 CONNECT-M 显式启用的四个只读操作，语义与之**逐字相同**；本入口只负责
 传输与有界准入，不复制授权、版本、幂等或引用校验规则。其中 `document_list` / `document_read` 是
 TS-086 新增的项目资料目录与完整语义块分页阅读，接口、权限、预算、游标与迁移边界见
 `docs/project-knowledge-catalog.md`：它们同样是 `execute` 的操作，同样只读，并同样要求该身份在
@@ -21,8 +21,7 @@ uv run python -m tianshu_memory.knowledge_cli `
 
 - `--client` 必填：本进程唯一的固定身份，来自私有配置 `knowledge.clients`。请求方**无法**通过
   body、query 或 header 改变它。
-- `--port` 必填且无默认值：端口是操作者的决定。不借用聊天入口默认的 8130，也不提供可公开绑定的
-  host 选项——进程只绑 `127.0.0.1`。
+- `--port` 必填且无默认值：端口是操作者的决定。不借用聊天入口默认的 8130。默认绑 `127.0.0.1`；非 loopback 仅由既有 `server_runtime` 在显式 TLS 证书、私钥和 Host 白名单齐备时接受，见 `docs/deployment-runtime.md`。
 - **凭据完全来自每个请求的 `Authorization: Bearer`**，与 `action`/`mcp` 把同一个值交给同一个
   `execute` 完全一致。本入口**不配置任何服务端明文秘密**：没有 `--credential-env`，不读环境变量，
   因此不存在“启动时的服务凭据”这套第二规则。摘要、项目集合与权限仍只由 `knowledge.clients` 判定。
@@ -75,12 +74,13 @@ Host: 127.0.0.1:<本进程端口>    (或 localhost:<本进程端口>)
 {"operation": "note_query", "project_id": "alpha", "arguments": {"text": "receipt", "budget_bytes": 8192}}
 ```
 
-严格十二操作 allowlist；其余操作即使该身份持有权限也不能经此入口调用（返回 415 `unsupported`）：
+严格十六操作 allowlist；新增四项仍需 `knowledge.clients.<固定client>.http_read_operations` 显式逐项启用，旧客户端默认 415 `unsupported`。领域原有同名 permission 与 `experience_query` 的独立 `review` 也必须同时满足：
 
 | 家族 | 操作 |
 |---|---|
 | 项目知识只读 | `query`、`recover`、`check`、`document_list`、`document_read` |
 | 研究笔记 | `note_record`、`note_revise`、`note_withdraw`、`note_query`、`note_recover`、`note_status`、`note_check` |
+| 经验与交接（逐 client HTTP 额外授权） | `lesson_query`、`experience_query`、`continuation_recover`、`continuation_check` |
 
 `document_list` / `document_read` 是只读分页操作，**不**改变本入口的任何传输规则：同样的准入、
 同样的每请求 Bearer、同样的媒体类型与字节上限。它们的参数是封闭集合（分页三参数
@@ -89,8 +89,7 @@ Host: 127.0.0.1:<本进程端口>    (或 localhost:<本进程端口>)
 `docs/project-knowledge-catalog.md`。
 
 经此入口**不可用**：`import`、`delete`、`write_state`、`status`、`directory_scan`、`directory_apply`、
-`continuation_recover`、`continuation_check`、lesson/experience 系列。没有 HTTP 导入、目录扫描、
-Git 观察、经验晋升或迁移端点。
+lesson/experience 的记录、修订、撤回、晋升与全局审查写操作。新增 continuation 仅观察服务端已登记的 checkout 别名，执行只读 Git 命令；不接受原始路径或浏览器指定仓库。没有 HTTP 导入、目录扫描/应用、经验晋升或迁移端点。
 
 成功响应 200，body 就是现有 `execute` 的结果（与 `knowledge_cli action`、MCP 同名工具完全一致），
 例如 `note_record` 返回 `{"status":"recorded","note_id":...,"version":1,"hash":...}`。所有响应（含错误）
@@ -151,7 +150,7 @@ curl.exe -s -X POST http://127.0.0.1:18135/local/v1/project-knowledge/action `
 | 401 | 传输层 | 缺失/畸形 `Authorization: Bearer`（没有可交给领域的凭据） | `unauthorized` |
 | 408 | 传输层 | **读体阶段**或**执行等待阶段**各自超过 10 秒 | `request_timeout` |
 | 413 | 传输层 | 实际到达字节超过 262144 | `request_too_large` |
-| 415 | 传输层 | `Content-Type` 非 `application/json`，或操作不在 allowlist | `unsupported` |
+| 415 | 传输层 | `Content-Type` 非 `application/json`、操作不在 allowlist，或新增操作未获该 client 的 HTTP 额外授权 | `unsupported` |
 | 503 | 传输层 | 四个准入槽已满（无等待队列） | `overloaded` |
 | 503 | 依赖 | 存储/迁移/文件不可用 | `dependency_unavailable` |
 | 422 | **领域**（`execute` 抛出的一切） | 授权、项目、版本、幂等、引用、参数等任何领域拒绝 | 领域原码：`unauthorized`、`forbidden`、`project_unregistered`、`project_uninitialized`、`version_conflict`、`stale_evidence`、`evidence_required`、`idempotency_conflict`、`invalid_input` … |
@@ -199,7 +198,7 @@ curl.exe -s -X POST http://127.0.0.1:18135/local/v1/project-knowledge/action `
 | 准入槽覆盖范围 | 读正文 → 同步 `execute` 真实结束 | 槽只在"读失败/未发起调用"或"那次调用真的返回"时归还；响应写出（408、断连）不归还 |
 | 读体时限 | 10 秒 | 超时 408 `request_timeout`，槽立即归还 |
 | 执行等待时限 | 10 秒 | 超时 408 `request_timeout`，槽保持到调用真正结束 |
-| Host 白名单 | `127.0.0.1`/`localhost` + 本进程端口 | 不接受其他 host、其他端口、任意 Host/DNS rebinding |
+| Host 白名单 | 默认 `127.0.0.1`/`localhost` + 本进程端口 | 非 loopback 仅接受启动时显式验证的 TLS/Host authority；不接受任意 Host/DNS rebinding |
 | 浏览器 | 一律拒绝 | 见 `Origin`/`Sec-Fetch-*` 即 400；无 CORS、无 cookie、不读 `X-Forwarded-*` |
 | 缓存 | 无 | 全部响应 `no-store`；不建 HTTP 全局结果缓存 |
 
@@ -233,7 +232,7 @@ curl.exe -s -X POST http://127.0.0.1:18135/local/v1/project-knowledge/action `
 |---|---|---|---|
 | `knowledge_cli action` | `--client` | `--credential-env`（环境变量） | 单次进程，读一份请求文件 |
 | `knowledge_cli mcp` | `--client` | `--credential-env`（环境变量） | stdio，官方 SDK |
-| `knowledge_cli serve` | `--client` | 每请求 `Authorization: Bearer` | loopback HTTP，长驻进程 |
+| `knowledge_cli serve` | `--client` | 每请求 `Authorization: Bearer` | 默认 loopback；非 loopback 必须 TLS/Host 白名单的长驻进程 |
 
 三者都是用同一个 `KnowledgeApplication.execute` 的适配器，规则只有一份；前两者的 `--credential-env`
 保持不变，本入口不新增第二套凭据规则，也不改它们。
@@ -257,7 +256,7 @@ uv run pytest tests/test_knowledge_catalog_http.py -q --basetemp .runtime/tests-
 `test_knowledge_http.py` 用手写 ASGI 客户端（自己决定正文何时到达、并统计应用向服务器索取正文的
 次数）验证准入先于读体：满载时第 5 条请求 `receive` 次数为 0、`execute` 调用次数不变。另有四个慢体与
 四个慢执行两种饱和、读体超时、断连、调用抛错、以及调用真正返回时释放槽的确定性用例。其中一个用例
-按**精确集合**断言这份 allowlist 就是十二项，并让 `document_list` / `document_read` 经同一入口读到
+按**精确集合**断言这份 allowlist 是既有十二项加四项 opt-in 读，并让 `document_list` / `document_read` 经同一入口读到
 一次真实导入留下的块。
 
 `test_knowledge_catalog_http.py` 覆盖两个目录操作的入口层：真实 `response.content` 字节数与

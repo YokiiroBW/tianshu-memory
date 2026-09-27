@@ -12,7 +12,7 @@ A thin transport for one already-integrated application. It adds no rule of its 
 - no database, source context, project adapter or other product client is held here, and the
   domain never imports this module.
 
-The route surface is fixed: one health route and one action route, with a twelve-operation
+The route surface is fixed: one health route and one action route, with a sixteen-operation
 allowlist. Everything else — authorization, idempotency, version conflicts, byte budgets,
 pagination cursors, evidence freshness and the transaction boundary — is decided inside the
 domain that owns it.
@@ -116,7 +116,16 @@ ALLOWED_OPERATIONS = frozenset(
         "note_recover",
         "note_status",
         "note_check",
+        # CONNECT-M only: existing read operations, each requiring a second, explicit
+        # per-client HTTP grant in addition to the domain's project/operation permissions.
+        "lesson_query",
+        "experience_query",
+        "continuation_recover",
+        "continuation_check",
     }
+)
+HTTP_EXTRA_OPERATIONS = frozenset(
+    {"lesson_query", "experience_query", "continuation_recover", "continuation_check"}
 )
 MAX_BODY_BYTES = 262144
 # Two independent phases, each bounded on its own: reading the request body, and waiting for the
@@ -171,6 +180,10 @@ class Refusal(Fault):
         self.status = DOMAIN_STATUS
 
 
+class HttpGrantRefusal(Fault):
+    """An HTTP-only grant verdict, even when it is rechecked after domain execution."""
+
+
 def transport(code, status):
     """This module's own verdict on a request, carrying the status it is reported with."""
     return Fault(code, status)
@@ -223,6 +236,26 @@ def load_config(config_path, client):
         STATUS_BEARER,
     )
     return config
+
+
+def require_http_extra(config_path, client, operation):
+    """The new HTTP surface is opt-in for this fixed client, independently of domain grants."""
+    if operation not in HTTP_EXTRA_OPERATIONS:
+        return
+    try:
+        principal = load_config(config_path, client)["knowledge"]["clients"][client]
+        granted = principal.get("http_read_operations", [])
+        require(
+            isinstance(granted, list)
+            and len(granted) <= len(HTTP_EXTRA_OPERATIONS)
+            and all(isinstance(item, str) and item in HTTP_EXTRA_OPERATIONS for item in granted)
+            and len(set(granted)) == len(granted),
+            "invalid_configuration",
+            STATUS_DEPENDENCY,
+        )
+        require(operation in granted, "unsupported", STATUS_MEDIA)
+    except Fault as error:
+        raise HttpGrantRefusal(error.code, error.status) from None
 
 
 def serve_port(port):
@@ -581,12 +614,17 @@ def create_app(
                     settle = app.state.settle
                     if settle is not None:
                         settle()
+                    require_http_extra(config_path, client, body["operation"])
                     return result
                 # The observer replaces the call, never a rule of it: it receives the same body and
                 # the same presented credential a production request would, and an observation that
                 # does not perform the call simply performs nothing.
-                return observer(body, presented, application)
+                result = observer(body, presented, application)
+                require_http_extra(config_path, client, body["operation"])
+                return result
         except Fault as error:
+            if isinstance(error, HttpGrantRefusal):
+                raise
             raise Refusal(error.code) from None
 
     async def run_operation(body, presented, lease):
@@ -652,6 +690,7 @@ def create_app(
             except Fault:
                 # The read failed, so no call of this request is running and the slot goes back.
                 raise
+            require_http_extra(config_path, client, body["operation"])
             return correlate(
                 JSONResponse(
                     await run_operation(body, presented, lease), status_code=200, headers=NO_STORE

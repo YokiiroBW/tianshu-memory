@@ -24,4 +24,10 @@
 
 Platform 必须通过正式 Origins.issue 为已登录账号/actor/scope 发放 `platform→memory dialogue` origin；Memory issuer 的独立 resolver 凭据配置 `caller=platform,purpose=dialogue`，并通过正式 route 授权。配置示例和 wire 见 API 文档；总控发放私有配置，不把 token/origin 暴露给浏览器。B 服务器可消费上述三端点，U 只连 B 的会话后端。A 对无 viewer 组合验证和跨范围投影单独验收后，再由总控集成和 NAS 真实数据验证。
 
-知识页 lessons/experiences/continuation 的受权 HTTP 扩展另作本任务第二提交；不能把本交接的三个浏览端点误作项目知识接口。部署、真实发放、完整浏览器链与用户写动作未在本任务执行。
+## 第二提交：项目经验与交接知识 HTTP
+
+用户整体贯通目标新增本 Memory 精确范围。既有 `KnowledgeApplication.execute` 的 `lesson_query`、`experience_query`、`continuation_recover`、`continuation_check` 四个读操作接入**原** `/local/v1/project-knowledge/action`。旧十二操作兼容；新四项对每个固定 knowledge client 默认关闭，必须另外配置 `http_read_operations` 显式列入，再经过领域已有同名 permission/项目授权；经验查询仍独立要求 `review`。入口动作前和领域完成后均重读新增 HTTP 授权，撤权结果不交付。不开放记录、修订、经验晋升、目录扫描/应用或任意 Git 命令。详见 [CONNECT-M-KNOWLEDGE-API.md](CONNECT-M-KNOWLEDGE-API.md)。
+
+`continuation_recover/check` 实际只读已登记 checkout 的 Git/文件和现有项目数据库，生成/验证客户端绑定 seal；不会向 `knowledge_operations` 持久化封装包、不会修改 checkout。包是当次观测快照，不是持续最新状态；必须在网页明示“读取交接”动作时触发，不能后台轮询。受信 Platform 后端只投影安全字段，不把完整包、seal 或本机路径显示给浏览器。`lesson_query`/`experience_query` 为文本检索，不是全量目录；真实没有匹配时按空态展示。
+
+验证：`uv run pytest tests/test_knowledge_http_extra.py tests/test_knowledge_http.py tests/test_knowledge_http_process.py tests/test_knowledge_catalog_http.py tests/test_lessons.py tests/test_knowledge_continuation.py -q --basetemp .runtime/tests-connect-m-knowledge-suite` 为 179 通过、1 跳过；最后把执行中撤销 HTTP 授权的拒绝状态固定为传输层 415 后，`test_knowledge_http_extra.py` 4 项复核通过。用真实独立 HTTP 子进程读到非空 lesson/experience/continuation，lesson 与既有 CLI 实际输出相同；小预算、跨项目 review、未登记 checkout、旧客户端默认拒绝和授权中途撤销均验。`ruff check`/`ruff format --check` 与完整 diff 检查通过。第二提交 SHA 待填写。部署、真实发放、完整浏览器链与用户写动作未在本任务执行。

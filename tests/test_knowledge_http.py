@@ -470,8 +470,8 @@ def test_operations_outside_the_allowlist_are_refused_even_with_permission(notes
             assert response.json() == {"status": "failed", "code": "unsupported"}
 
 
-def test_the_allowlist_carries_exactly_the_twelve_frozen_operations(notes, entry):
-    """The two catalogue operations arrived by this one change, and nothing else moved with them."""
+def test_the_allowlist_carries_twelve_existing_and_four_opt_in_reads(notes, entry):
+    """The original twelve remain; four further reads still require a client HTTP grant."""
     assert ALLOWED_OPERATIONS == {
         "check",
         "query",
@@ -485,8 +485,12 @@ def test_the_allowlist_carries_exactly_the_twelve_frozen_operations(notes, entry
         "note_check",
         "document_list",
         "document_read",
+        "lesson_query",
+        "experience_query",
+        "continuation_recover",
+        "continuation_check",
     }
-    assert len(ALLOWED_OPERATIONS) == 12
+    assert len(ALLOWED_OPERATIONS) == 16
     # A catalogue read through the entry is served on a project that was imported through the same
     # entry, so the whole route is exercised rather than a read of a fixture row.
     notes.config["knowledge"]["clients"]["alpha-writer"]["permissions"] = [
