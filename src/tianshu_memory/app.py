@@ -347,6 +347,65 @@ def create_app(*, service=None, auth=None, body_timeout=5.0, execute_timeout=15.
             methods=["POST"],
             name="check_sources",
         )
+
+    async def observation_endpoint(request: Request, operation: str):
+        lease = None
+        try:
+            if service is None or auth is None or not hasattr(service, "observations"):
+                raise Fault("dependency_unavailable", 503)
+            lease = admission.claim()
+            caller_name, caller = await lease.run(
+                auth.authenticate, request.headers.get("authorization")
+            )
+            if operation not in caller.get("operations", []):
+                raise Fault("forbidden", 403)
+            if not await anote_authenticated():
+                raise Fault("log_unavailable", 503)
+            if (
+                request.headers.get("content-type", "").split(";", 1)[0].lower()
+                != "application/json"
+            ):
+                raise Fault("invalid_input", 400)
+            body = bytearray()
+            async with asyncio.timeout(body_timeout):
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > 65536:
+                        raise Fault("invalid_input", 413)
+                    body.extend(chunk)
+            payload = strict_json(body)
+            method = (
+                service.observations.ingest
+                if operation == "observe_ingest"
+                else service.observations.query
+            )
+            result = await lease.run(method, caller_name, payload, business=True)
+            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+        except Fault as exc:
+            return JSONResponse(
+                exc.wire("request-unavailable"),
+                status_code=exc.status,
+                headers={"Cache-Control": "no-store"},
+            )
+        except (ValueError, KeyError, TypeError):
+            return JSONResponse(
+                Fault("invalid_input", 400).wire("request-unavailable"), status_code=400
+            )
+        except (sqlite3.Error, OSError, TimeoutError):
+            return JSONResponse(
+                Fault("dependency_unavailable", 503).wire("request-unavailable"), status_code=503
+            )
+        finally:
+            if lease is not None:
+                lease.finish()
+
+    @app.post("/internal/v2/memory/observations")
+    async def observation_ingest(request: Request):
+        return await observation_endpoint(request, "observe_ingest")
+
+    @app.post("/internal/v2/memory/observations/query")
+    async def observation_query(request: Request):
+        return await observation_endpoint(request, "observe_query")
+
     return app
 
 
@@ -401,6 +460,10 @@ def configured_app():
         contracts.load_sources()
         sources = SourceAuthority(SourceTransport(config_path, contracts), contracts)
     service = MemoryService(store, contracts, source_authority=sources)
+    if config.get("observation_source") is not None:
+        from .observations import ObservationLedger, PlatformVerifier
+
+        service.observations = ObservationLedger(store, PlatformVerifier(config_path))
     auth = Authenticator(config_path, contracts, now)
     app = create_app(service=service, auth=auth)
     app.state.auth = auth

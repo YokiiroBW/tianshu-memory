@@ -148,6 +148,52 @@ class Store:
 
         return migrate(self, backup_path, contracts)
 
+    def migrate_observations(self, backup_path):
+        """Explicit guarded observation ledger migration; never auto-open old data."""
+        from uuid import uuid4
+
+        backup = Path(backup_path).resolve()
+        if str(backup).startswith("\\\\") or backup in {Path(self.path), self.recovery_path}:
+            raise ValueError("Backup must be a distinct local file")
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        with backup.open("xb"):
+            pass
+        with self.transaction() as db:
+            if db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0] != "3":
+                raise ValueError("Observations require guarded schema 3")
+            if db.execute("SELECT 1 FROM metadata WHERE key='observation_schema'").fetchone():
+                raise ValueError("Observation ledger already migrated")
+            with (
+                closing(sqlite3.connect(self.path)) as reader,
+                closing(sqlite3.connect(backup)) as destination,
+            ):
+                reader.backup(destination)
+            db.execute("""CREATE TABLE observation_sources (
+                source_ref TEXT PRIMARY KEY, digest TEXT NOT NULL,
+                instance_id TEXT NOT NULL, self_id TEXT NOT NULL,
+                conversation TEXT NOT NULL, author TEXT NOT NULL,
+                event_id TEXT NOT NULL, scope_version INTEGER NOT NULL,
+                archive_epoch INTEGER NOT NULL,
+                sent_at TEXT NOT NULL, content_state TEXT NOT NULL,
+                text TEXT NOT NULL, mentioned INTEGER NOT NULL,
+                state TEXT NOT NULL, received_at REAL NOT NULL,
+                UNIQUE(instance_id,self_id,conversation,author,event_id)
+            )""")
+            db.execute(
+                "CREATE INDEX observation_page ON observation_sources("
+                "instance_id,self_id,conversation,received_at,source_ref)"
+            )
+            for action in ("INSERT", "UPDATE", "DELETE"):
+                db.execute(
+                    f"CREATE TRIGGER source_revision_observation_sources_{action} "
+                    f"AFTER {action} ON observation_sources "
+                    "BEGIN UPDATE metadata SET value=CAST(value AS INTEGER)+1 "
+                    "WHERE key='source_revision'; END"
+                )
+            db.execute("INSERT INTO metadata VALUES ('observation_schema','1')")
+            db.execute("INSERT INTO metadata VALUES ('observation_instance',?)", (uuid4().hex,))
+        return {"schema": 3, "observation_schema": 1, "backup": str(backup)}
+
     def migrate_users(self, backup_path):
         from .user_migration import migrate
 

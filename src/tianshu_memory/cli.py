@@ -79,6 +79,10 @@ def main():
         "migrate-sources", help="Stop writers; migrate schema 2 to 3 with a backup"
     )
     migrate_sources.add_argument("--backup", required=True)
+    migrate_observations = sub.add_parser(
+        "migrate-observations", help="Stop writers; add guarded passive sources with backup"
+    )
+    migrate_observations.add_argument("--backup", required=True)
     args = parser.parse_args()
     if args.operation == "serve":
         return serve_deployment(args)
@@ -87,7 +91,12 @@ def main():
 
 def run_local_operation(args, parser):
     """Every non-deployment operation, exactly as the product already ran it."""
-    if args.operation in {"migrate-profiles", "migrate-sources", "migrate-users"}:
+    if args.operation in {
+        "migrate-profiles",
+        "migrate-sources",
+        "migrate-users",
+        "migrate-observations",
+    }:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
         store = Store(
             config["database_path"],
@@ -99,6 +108,8 @@ def run_local_operation(args, parser):
             contracts = Contracts(config["contract_directory"])
             contracts.load_sources()
             result = store.migrate_sources(args.backup, contracts)
+        elif args.operation == "migrate-observations":
+            result = store.migrate_observations(args.backup)
         elif args.operation == "migrate-users":
             result = store.migrate_users(args.backup)
         else:
