@@ -18,6 +18,7 @@
 - `tests/test_role_grants.py`：5 通过，覆盖合同实例、幂等/版本冲突/重启/撤销、静态角色明确接管与旧启用回放拒绝、重启认证器后旧静态 allowlist 仍拒绝、同 person/conversation 的原有 A/动态 B 双向 Memory 越界请求 403。
 - 身份认证、召回及画像边界相关 21 项通过（两项依赖库弃用警告）；Ruff 通过。
 - Platform 联合 HTTPS 测试真实调用本产品的 grant、origin/Memory 路径，1 通过；仅隔离合成账号/来源/模型，不含生产记录。
+- 返修联合验证：Platform 的真实 HTTPS 三项联合测试通过，包含 Memory grant 写入已成功但回执丢失后的精确重放、profile 升版后启用固定人格、active 角色停用后确认 Memory 拒绝，以及浏览器 retry 后继续编辑；Platform 单元覆盖取消时 grant 停用回执丢失与重启恢复。Memory runtime 逻辑未在本轮返修改动，候选合同补充了取消语义。
 
 ## 部署与恢复准备
 

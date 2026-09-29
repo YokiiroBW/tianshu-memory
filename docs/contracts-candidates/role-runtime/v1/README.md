@@ -15,6 +15,13 @@ adopted, a disabled grant overrides that static allowlist; an old enable
 receipt cannot lift the newer denial. Unmanaged static actors keep their
 existing authorization until explicitly adopted.
 
+Platform cancellation writes a new exact disabled grant after checking the
+current grant version. A lost response is retried with the same request ID and
+body; a version conflict requires a new status read and compare-and-swap
+attempt. Platform does not report the role disabled until this denial and the
+Companion denial are both confirmed. Earlier enable receipts remain historical
+and cannot restore authorization.
+
 Set `role_grants_database_path` to an absolute path on durable local storage.
 Back up this sidecar together with the main Memory database and coordinated
 Platform and Companion units. A missing sidecar at rollout creates an empty
