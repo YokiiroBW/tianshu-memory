@@ -3,7 +3,7 @@
 import json
 import re
 
-from .domain import canonical, fingerprint, parse_time, require
+from .domain import canonical, fingerprint, new_id, parse_time, require
 
 
 def qq_id(value):
@@ -124,6 +124,57 @@ def observe_alias(store, payload):
                 )
         db.execute("INSERT INTO qq_alias_events VALUES (?,?)", (ref, digest))
     return {"schema_version": 1, "request_id": payload["request_id"], "deduplicated": False}
+
+
+def register_observed(db, event, proof, source_ref, source_digest):
+    """Enroll only a Platform-verified observation, in the archive's transaction.
+
+    This distinct observation authority grants identity enrollment only. It has
+    no dialogue origin, actor scope, reply permission, or administrator grant.
+    """
+    require(event["schema_version"] == 3, "invalid_input", 400)
+    require(
+        proof.get("valid") is True
+        and proof.get("source_ref") == source_ref
+        and proof.get("source_digest") == source_digest == fingerprint(event)
+        and proof.get("self_id") == event["self_id"]
+        and proof.get("account_id") == event["account_id"]
+        and proof.get("conversation_id") == event["conversation_id"]
+        and proof.get("instance_id") == event["platform_id"]
+        and proof.get("event_id") == event["event_id"],
+        "forbidden",
+        403,
+    )
+    marker = db.execute("SELECT value FROM metadata WHERE key='qq_alias_schema'").fetchone()
+    require(marker is not None and marker[0] == "1", "dependency_unavailable", 503)
+    account_id = qq_id(event["account_id"])
+    bot_id = qq_id(event["self_id"])
+    account_key = canonical({"namespace": "qq", "immutable_account_id": account_id})
+    if db.execute("SELECT 1 FROM accounts WHERE account_key=?", (account_key,)).fetchone() is None:
+        person = new_id("person")
+        db.execute("INSERT INTO people VALUES (?)", (person,))
+        db.execute("INSERT INTO accounts VALUES (?,?,1,NULL)", (account_key, person))
+    previous = db.execute(
+        "SELECT digest FROM qq_alias_events WHERE event_ref=?", (source_ref,)
+    ).fetchone()
+    if previous is not None:
+        require(previous["digest"] == source_digest, "idempotency_conflict", 409)
+        return
+    nickname, card = _display(event["nickname"]), _display(event["group_card"])
+    group_id = event["conversation_id"].split(":", 1)[1]
+    for kind, value, group in (("nickname", nickname, ""), ("group_card", card, group_id)):
+        if value is None:
+            continue
+        prior = db.execute(
+            "SELECT observed_at FROM qq_aliases WHERE account_key=? AND kind=? AND bot_id=? AND group_id=?",
+            (account_key, kind, bot_id, group),
+        ).fetchone()
+        if prior is None or parse_time(prior["observed_at"]) <= parse_time(event["sent_at"]):
+            db.execute(
+                "INSERT INTO qq_aliases VALUES (?,?,?,?,?,?,?) ON CONFLICT(account_key,kind,bot_id,group_id) DO UPDATE SET value=excluded.value,observed_at=excluded.observed_at,event_ref=excluded.event_ref",
+                (account_key, kind, bot_id, group, value, event["sent_at"], source_ref),
+            )
+    db.execute("INSERT INTO qq_alias_events VALUES (?,?)", (source_ref, source_digest))
 
 
 def profiles(store, *, limit, after):

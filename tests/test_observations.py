@@ -108,6 +108,33 @@ def test_archive_requires_attestation_and_is_idempotent(ledger):
         assert db.execute("SELECT count(*) FROM turn_inputs").fetchone()[0] == 0
 
 
+def test_v3_observation_enrolls_verified_identity_without_reply_scope(ledger, tmp_path):
+    app, verifier = ledger
+    first = event()
+    first.update(schema_version=3, nickname="同名", group_card="群名片")
+    value = source(first)
+    verifier.values[value["source_ref"]] = value
+    with pytest.raises(Fault) as unavailable:
+        app.ingest("companion", value)
+    assert unavailable.value.code == "dependency_unavailable"
+    with app.store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM accounts").fetchone()[0] == 0
+    app.store.migrate_qq_aliases(tmp_path / "before-qq-aliases.sqlite")
+    assert app.ingest("companion", value)["state"] == "accepted"
+    assert app.ingest("companion", value)["state"] == "duplicate"
+    with app.store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM accounts").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM qq_aliases").fetchone()[0] == 2
+        assert db.execute("SELECT count(*) FROM qq_alias_events").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM turn_inputs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+    changed = copy.deepcopy(value)
+    changed["event"]["nickname"] = "伪造"
+    changed["source_digest"] = fingerprint(changed["event"])
+    with pytest.raises(Fault):
+        app.ingest("companion", changed)
+
+
 def test_isolation_pagination_pause_and_revocation(ledger):
     app, verifier = ledger
     values = [

@@ -1,4 +1,4 @@
-"""Verified passive source ledger; no dialogue, candidate, or profile side effects."""
+"""Verified passive source ledger and explicitly authorized QQ identity enrollment."""
 
 import re
 import ssl
@@ -11,8 +11,8 @@ import httpx
 
 from .domain import Fault, fingerprint, require, strict_json
 
-QQ = re.compile(r"^[1-9][0-9]{0,19}$")
-CONVERSATION = re.compile(r"^(group|private):[1-9][0-9]{0,19}$")
+QQ = re.compile(r"^[1-9][0-9]*$")
+CONVERSATION = re.compile(r"^(group|private):[1-9][0-9]*$")
 IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 HEX = re.compile(r"^[0-9a-f]{64}$")
 
@@ -83,30 +83,31 @@ def _request(request):
         400,
     )
     event = request["event"]
+    fields = {
+        "schema_version",
+        "platform_id",
+        "self_id",
+        "namespace",
+        "conversation_id",
+        "account_id",
+        "event_id",
+        "revision",
+        "sent_at",
+        "text",
+        "content_state",
+        "mentioned",
+        "scope_revision",
+    }
     require(
         isinstance(event, dict)
         and set(event)
-        == {
-            "schema_version",
-            "platform_id",
-            "self_id",
-            "namespace",
-            "conversation_id",
-            "account_id",
-            "event_id",
-            "revision",
-            "sent_at",
-            "text",
-            "content_state",
-            "mentioned",
-            "scope_revision",
-        },
+        == fields | ({"nickname", "group_card"} if event.get("schema_version") == 3 else set()),
         "invalid_input",
         400,
     )
     require(
         type(event["schema_version"]) is int
-        and event["schema_version"] == 2
+        and event["schema_version"] in (2, 3)
         and type(event["revision"]) is int
         and event["revision"] == 1
         and event["namespace"] == "qq"
@@ -151,6 +152,16 @@ def _request(request):
             "invalid_input",
             400,
         )
+    if event["schema_version"] == 3:
+        from .qq_identity import _display
+
+        require(
+            not event["conversation_id"].startswith("private:") or event["group_card"] is None,
+            "invalid_input",
+            400,
+        )
+        _display(event["nickname"])
+        _display(event["group_card"])
     return event
 
 
@@ -191,6 +202,10 @@ class ObservationLedger:
         )
         with self.store.transaction() as db:
             self._ready(db)
+            if event["schema_version"] == 3:
+                from .qq_identity import register_observed
+
+                register_observed(db, event, proof, request["source_ref"], request["source_digest"])
             old = db.execute(
                 "SELECT digest FROM observation_sources WHERE source_ref=?",
                 (request["source_ref"],),
