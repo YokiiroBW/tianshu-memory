@@ -528,7 +528,11 @@ class MemoryService:
 
     def consume(self, event, publisher):
         require(publisher["authenticated_service"] == "companion")
-        require(event["scope"] in publisher["allowed_scopes"])
+        require(event["scope"]["actor_id"] not in publisher.get("blocked_role_actors", []))
+        require(
+            event["scope"] in publisher["allowed_scopes"]
+            or event["scope"]["actor_id"] in publisher.get("allowed_role_actors", [])
+        )
         require(event["conversation_id"] == event["scope"]["conversation_id"], "invalid_input", 400)
         with self.operation(scope=event["scope"], sources=event["sources"], event=event) as db:
             require(
@@ -651,7 +655,11 @@ class MemoryService:
 
     def check_sources(self, request, publisher):
         require(publisher["authenticated_service"] == "companion")
-        require(request["scope"] in publisher["allowed_scopes"])
+        require(request["scope"]["actor_id"] not in publisher.get("blocked_role_actors", []))
+        require(
+            request["scope"] in publisher["allowed_scopes"]
+            or request["scope"]["actor_id"] in publisher.get("allowed_role_actors", [])
+        )
         require(self.synchronized, "dependency_unavailable", 503)
         with self.operation(
             scope=request["scope"], sources=request["sources"], check=request

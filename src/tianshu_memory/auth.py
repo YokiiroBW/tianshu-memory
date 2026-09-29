@@ -15,6 +15,16 @@ class Authenticator:
 
     def __init__(self, config_path, contracts, clock):
         self.path, self.contracts, self.clock = Path(config_path), contracts, clock
+        config = self.config()
+        grant_path = config.get("role_grants_database_path")
+        if grant_path is not None:
+            if not isinstance(grant_path, str) or not Path(grant_path).is_absolute():
+                raise ValueError("role_grants_database_path must be absolute")
+            from .role_grants import RoleGrants
+
+            self.role_grants = RoleGrants(grant_path)
+        else:
+            self.role_grants = None
 
     def config(self):
         return json.loads(self.path.read_text(encoding="utf-8"))
@@ -106,5 +116,13 @@ class Authenticator:
         )
         require(not context["revoked"] and parse_time(context["expires_at"]) > self.clock())
         allowed = caller.get("allowed_actors", [])
-        require(context["allowed_scope"]["actor_id"] in allowed)
+        actor_id = context["allowed_scope"]["actor_id"]
+        decision = self.role_grants.decision(actor_id) if self.role_grants is not None else None
+        require(
+            decision is not False
+            and (actor_id in allowed
+            or caller.get("allow_runtime_roles") is True
+            and self.role_grants is not None
+            and decision is True)
+        )
         return context
