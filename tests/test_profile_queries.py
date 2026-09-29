@@ -16,7 +16,7 @@ def p(h):
 
 
 def reader(h):
-    account = {"namespace": "qq", "immutable_account_id": "synthetic-reader-A"}
+    account = {"namespace": "qq", "immutable_account_id": "10003"}
     h.add_origin("reader-first", dict(h.private, person_id=None), account)
     h.save_config()
     response = h.post(

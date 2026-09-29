@@ -230,7 +230,7 @@ def test_wrong_resolver_credential(runtime, h, issuer):
         ("audience_service", "companion"),
         ("assertion_ref", "unrelated-ref"),
         ("expires_at", "2000-01-01T00:00:00Z"),
-        ("verified_account", {"namespace": "qq", "immutable_account_id": "someone-else"}),
+        ("verified_account", {"namespace": "qq", "immutable_account_id": "10004"}),
         ("allowed_scope", {"actor_id": "other-actor"}),
     ],
 )

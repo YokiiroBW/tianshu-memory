@@ -68,6 +68,8 @@ def main():
         "migrate-users", help="Stop writers; add guarded local approvals with backup"
     )
     migrate_users.add_argument("--backup", required=True)
+    migrate_qq = sub.add_parser("migrate-qq-aliases", help="Stop writers; add guarded QQ display names with backup")
+    migrate_qq.add_argument("--backup", required=True)
     sub.add_parser("jobs")
     sub.add_parser("rebuild-index")
     sub.add_parser("outbox")
@@ -95,6 +97,7 @@ def run_local_operation(args, parser):
         "migrate-profiles",
         "migrate-sources",
         "migrate-users",
+        "migrate-qq-aliases",
         "migrate-observations",
     }:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
@@ -112,6 +115,8 @@ def run_local_operation(args, parser):
             result = store.migrate_observations(args.backup)
         elif args.operation == "migrate-users":
             result = store.migrate_users(args.backup)
+        elif args.operation == "migrate-qq-aliases":
+            result = store.migrate_qq_aliases(args.backup)
         else:
             result = store.migrate_profiles(args.backup)
         print(json.dumps(result, ensure_ascii=False, indent=2))

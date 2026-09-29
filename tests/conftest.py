@@ -46,7 +46,7 @@ class Harness:
             self.store, contracts, source_authority=LocalFixtureSources(), clock=self.clock
         )
         self.workflow = LocalWorkflow(self.service)
-        self.account = {"namespace": "qq", "immutable_account_id": "synthetic-account"}
+        self.account = {"namespace": "qq", "immutable_account_id": "10001"}
         self.channel = {
             "namespace": "qq",
             "binding_id": "synthetic-binding",

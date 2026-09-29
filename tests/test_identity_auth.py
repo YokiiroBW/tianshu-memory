@@ -8,7 +8,7 @@ from tianshu_memory.service import MemoryService
 
 
 def test_unregistered_then_register_and_group_private_identity(h):
-    account = {"namespace": "qq", "immutable_account_id": "new-user"}
+    account = {"namespace": "qq", "immutable_account_id": "10002"}
     first = dict(h.private, person_id=None, conversation_id=None)
     h.add_origin("new", first, account)
     h.save_config()
@@ -70,7 +70,7 @@ def test_concurrent_registration_one_binding(h):
 
 
 def test_auth_account_scope_expiry_revocation_and_replay_reauthorization(h):
-    payload = {"query": h.query(), "account": dict(h.account, immutable_account_id="someone-else")}
+    payload = {"query": h.query(), "account": dict(h.account, immutable_account_id="10004")}
     assert h.post("identity/resolve", payload).status_code == 403
     request = {"command": h.command(), "account": h.account}
     assert h.post("identity/register", request).status_code == 200

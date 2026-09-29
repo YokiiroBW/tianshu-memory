@@ -16,6 +16,7 @@ from .domain import (
     source_key,
     utc,
 )
+from .qq_identity import validate_account
 
 CATEGORIES = {"identity", "style", "relationship", "current_items", "evidence"}
 
@@ -76,7 +77,9 @@ class MemoryService:
         require(context["audience_service"] == "memory")
         require(not context["revoked"] and parse_time(context["expires_at"]) > self.clock())
         verified = context["verified_account"]
+        validate_account(verified)
         if account is not None:
+            validate_account(account)
             require(verified == account)
         binding = self._binding(db, verified)
         allowed = context["allowed_scope"]

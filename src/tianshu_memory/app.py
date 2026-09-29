@@ -21,6 +21,8 @@ from .diagnostics import (
     record_execution,
 )
 from .domain import Fault, fingerprint, now, strict_json
+from .qq_identity import observe_alias
+from .qq_identity import profiles as qq_profiles
 from .service import MemoryService
 from .sources import LocalFixtureSources
 from .store import Store
@@ -76,6 +78,87 @@ def create_app(*, service=None, auth=None, body_timeout=5.0, execute_timeout=15.
     admission = Requests(max_active)
     app.state.chat_requests = admission
     app.state.memory = service
+
+    async def qq_identity_endpoint(request: Request, operation: str):
+        """Explicit Platform service ports; neither is available to a chat caller."""
+        lease = None
+        request_id = "request-unavailable"
+        try:
+            if service is None or auth is None:
+                raise Fault("dependency_unavailable", 503)
+            callers = auth.config().get("callers", {})
+            profile_credential = callers.get("platform_qq_profiles", {}).get("token")
+            alias_credential = callers.get("platform_qq_alias", {}).get("token")
+            if profile_credential and profile_credential == alias_credential:
+                raise Fault("dependency_unavailable", 503)
+            lease = admission.claim()
+            async with asyncio.timeout(execute_timeout):
+                caller_name, caller = await lease.run(
+                    auth.authenticate, request.headers.get("authorization")
+                )
+            expected_caller = {
+                "qq_profiles": "platform_qq_profiles",
+                "qq_alias": "platform_qq_alias",
+            }[operation]
+            if caller_name != expected_caller or operation not in caller.get("operations", []):
+                raise Fault("forbidden", 403)
+            if not await anote_authenticated():
+                raise Fault("log_unavailable", 503)
+            if (
+                request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                != "application/json"
+            ):
+                raise Fault("invalid_input", 400)
+            body = bytearray()
+            async with asyncio.timeout(body_timeout):
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > 4096:
+                        raise Fault("invalid_input", 400)
+                    body.extend(chunk)
+            payload = strict_json(body)
+            if type(payload) is not dict or payload.get("schema_version") != 1:
+                raise Fault("invalid_input", 400)
+            request_id = payload.get("request_id")
+            if type(request_id) is not str or not 1 <= len(request_id) <= 128:
+                request_id = "request-unavailable"
+                raise Fault("invalid_input", 400)
+            if operation == "qq_profiles":
+                if set(payload) != {"schema_version", "request_id", "limit", "after"}:
+                    raise Fault("invalid_input", 400)
+                result = await lease.run(
+                    lambda: qq_profiles(
+                        service.store, limit=payload["limit"], after=payload["after"]
+                    ),
+                    business=True,
+                )
+            else:
+                result = await lease.run(observe_alias, service.store, payload, business=True)
+            return JSONResponse(
+                {**result, "request_id": request_id}, headers={"Cache-Control": "no-store"}
+            )
+        except Fault as error:
+            return JSONResponse(
+                error.wire(request_id),
+                status_code=error.status,
+                headers={"Cache-Control": "no-store"},
+            )
+        except (ValueError, TypeError, KeyError):
+            return JSONResponse(Fault("invalid_input", 400).wire(request_id), status_code=400)
+        except (sqlite3.Error, OSError, TimeoutError):
+            return JSONResponse(
+                Fault("dependency_unavailable", 503).wire(request_id), status_code=503
+            )
+        finally:
+            if lease is not None:
+                lease.finish()
+
+    @app.post("/internal/v1/identity/qq-profiles")
+    async def qq_profiles_endpoint(request: Request):
+        return await qq_identity_endpoint(request, "qq_profiles")
+
+    @app.post("/internal/v1/identity/qq-alias")
+    async def qq_alias_endpoint(request: Request):
+        return await qq_identity_endpoint(request, "qq_alias")
 
     @app.get("/health")
     def health():
@@ -167,7 +250,8 @@ def create_app(*, service=None, auth=None, body_timeout=5.0, execute_timeout=15.
                             ),
                             "blocked_role_actors": (
                                 auth.role_grants.inactive_ids()
-                                if auth.role_grants is not None else []
+                                if auth.role_grants is not None
+                                else []
                             ),
                         }
                     else:

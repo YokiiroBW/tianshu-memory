@@ -199,6 +199,11 @@ class Store:
 
         return migrate(self, backup_path)
 
+    def migrate_qq_aliases(self, backup_path):
+        from .qq_alias_migration import migrate
+
+        return migrate(self, backup_path)
+
     def migrate_lessons(self, backup_path):
         from .lessons_migration import migrate as migrate_lessons
 
