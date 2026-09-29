@@ -87,10 +87,18 @@ def create_app(*, service=None, auth=None, body_timeout=5.0, execute_timeout=15.
             if service is None or auth is None:
                 raise Fault("dependency_unavailable", 503)
             callers = auth.config().get("callers", {})
-            profile_credential = callers.get("platform_qq_profiles", {}).get("token")
-            alias_credential = callers.get("platform_qq_alias", {}).get("token")
-            if profile_credential and profile_credential == alias_credential:
+            if type(callers) is not dict or any(
+                type(caller) is not dict for caller in callers.values()
+            ):
                 raise Fault("dependency_unavailable", 503)
+            for protected in ("platform_qq_profiles", "platform_qq_alias"):
+                credential = callers.get(protected, {}).get("token")
+                if (
+                    type(credential) is not str
+                    or not credential
+                    or sum(caller.get("token") == credential for caller in callers.values()) != 1
+                ):
+                    raise Fault("dependency_unavailable", 503)
             lease = admission.claim()
             async with asyncio.timeout(execute_timeout):
                 caller_name, caller = await lease.run(

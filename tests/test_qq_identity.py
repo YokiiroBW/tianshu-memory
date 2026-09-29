@@ -49,6 +49,11 @@ def test_platform_alias_auth_scope_idempotency_and_restart(h):
     assert _platform(h, "qq-alias", alias).status_code == 503
     h.config["callers"]["platform_qq_profiles"]["token"] = "test-only-profile-secret"
     h.save_config()
+    h.config["callers"]["platform_qq_alias"]["token"] = "test-only-companion-secret"
+    h.save_config()
+    assert _platform(h, "qq-alias", alias, "test-only-companion-secret").status_code == 503
+    h.config["callers"]["platform_qq_alias"]["token"] = "test-only-alias-secret"
+    h.save_config()
     assert _platform(h, "qq-alias", alias).json()["deduplicated"] is False
     assert (
         _platform(h, "qq-alias", dict(alias, request_id="alias-retry")).json()["deduplicated"]
