@@ -117,13 +117,27 @@ def _cursor_decode(value, token, expected):
         raise Fault("invalid_input", 400) from None
 
 
-def _registration(config, caller_name, context, scope):
+def _registration(auth, caller_name, caller, context, scope):
+    config = auth.config()
     reader = config.get("browser_readers", {}).get(caller_name)
     require(isinstance(reader, dict), "forbidden", 403)
     require(context["verified_account"] == reader.get("account"), "forbidden", 403)
-    require(scope["actor_id"] == reader.get("actor_id"), "forbidden", 403)
-    require(scope in reader.get("scopes", []), "forbidden", 403)
     require(context["allowed_scope"] == scope, "forbidden", 403)
+    templates = reader.get("scopes", [])
+    static = scope["actor_id"] == reader.get("actor_id") and scope in templates
+    runtime = (
+        reader.get("allow_runtime_roles") is True
+        and caller.get("allow_runtime_roles") is True
+        and auth.role_grants is not None
+        and auth.role_grants.decision(scope["actor_id"]) is True
+        and any(
+            isinstance(template, dict)
+            and template.get("actor_id") == reader.get("actor_id")
+            and {**template, "actor_id": scope["actor_id"]} == scope
+            for template in templates
+        )
+    )
+    require(static or runtime, "forbidden", 403)
 
 
 def _group(service, db, row, scope, subject=None):
@@ -325,7 +339,7 @@ def _authorized_db(service, auth, caller_name, caller, body, profile):
         context = auth.resolve(
             current_name, current_caller, body["origin"]["assertion_ref"], body["request_id"]
         )
-        _registration(auth.config(), caller_name, context, scope)
+        _registration(auth, caller_name, current_caller, context, scope)
         with service.store.transaction() as db:
             if service.source_authority.revision(db) != result["local_revision"]:
                 continue
@@ -339,7 +353,7 @@ def read(service, auth, caller_name, caller, body, context, operation):
     """Read only current catalog rows under the existing source and local revision guards."""
     validate_request(operation, body)
     scope = body["scope"]
-    _registration(auth.config(), caller_name, context, scope)
+    _registration(auth, caller_name, caller, context, scope)
     subject = body.get("subject")
     if subject is not None:
         require(service.contracts.profile_version is not None, "dependency_unavailable", 503)

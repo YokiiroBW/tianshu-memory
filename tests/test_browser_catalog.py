@@ -11,13 +11,17 @@ from contextlib import contextmanager
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from source_sync_harness import SyncHarness
 from test_auth_https import certificates as certificates
 from test_process import server
 from test_source_transport import source_contracts as source_contracts
 from test_source_transport import source_examples as source_examples
 
+from tianshu_memory.app import create_app
+from tianshu_memory.auth import Authenticator
 from tianshu_memory.domain import canonical
+from tianshu_memory.role_grants import RoleGrants
 
 
 @pytest.fixture
@@ -341,3 +345,90 @@ def test_existing_serve_runtime_exposes_catalog_without_browser_origin(catalog):
         )
         assert refused.status_code == 400
         assert refused.json()["code"] == "browser_origin_refused"
+
+
+def test_runtime_role_browser_requires_exact_grant_and_template(catalog, tmp_path):
+    first, _, _ = catalog.seed(0)
+    second, _, _ = catalog.seed(1)
+    assert catalog.scope(0)["person_id"] == catalog.scope(1)["person_id"]
+    assert catalog.scope(0)["conversation_id"] == catalog.scope(1)["conversation_id"]
+    path = tmp_path / "browser-role-grants.sqlite"
+    catalog.config["role_grants_database_path"] = str(path)
+    catalog.config["callers"]["platform"]["allowed_actors"] = ["actor:a"]
+    catalog.config["callers"]["platform"]["allow_runtime_roles"] = True
+    reader = catalog.config["browser_readers"]["platform"]
+    reader["allow_runtime_roles"] = True
+    context = copy.deepcopy(catalog.contexts["synthetic-browser"])
+    context.update(assertion_ref="synthetic-browser-b", allowed_scope=catalog.scope(1))
+    catalog.contexts["synthetic-browser-b"] = context
+    catalog.save()
+    grants = RoleGrants(path)
+    grants.apply(
+        {
+            "request_id": "browser-b-on",
+            "actor_id": "actor:b",
+            "expected_version": 0,
+            "enabled": True,
+            "legacy": False,
+        },
+        {"actor:a"},
+    )
+    auth = Authenticator(catalog.config_path, catalog.contracts, catalog.service.clock)
+    original = catalog.client
+    with TestClient(create_app(service=catalog.service, auth=auth)) as client:
+        catalog.client = client
+        try:
+            b = body(catalog, limit=20, cursor=None)
+            b["origin"]["assertion_ref"] = "synthetic-browser-b"
+            b["scope"] = catalog.scope(1)
+            a_groups = post(catalog, "records", body(catalog, limit=20, cursor=None))
+            b_groups = post(catalog, "records", b)
+            assert a_groups.status_code == 200 and b_groups.status_code == 200
+            assert [g["semantic_group_id"] for g in a_groups.json()["items"]] == first["group_ids"]
+            assert [g["semantic_group_id"] for g in b_groups.json()["items"]] == second["group_ids"]
+            assert post(catalog, "overview").json()["memory_group_count"] == 1
+            assert (
+                post(
+                    catalog,
+                    "overview",
+                    {k: b[k] for k in ("schema_version", "request_id", "origin", "scope")},
+                ).json()["memory_group_count"]
+                == 1
+            )
+            forged = copy.deepcopy(b)
+            forged["origin"]["assertion_ref"] = "synthetic-browser"
+            assert_failed(post(catalog, "records", forged), 403, "forbidden")
+            reader["allow_runtime_roles"] = False
+            catalog.save()
+            assert_failed(post(catalog, "records", b), 403, "forbidden")
+            reader["allow_runtime_roles"] = True
+            catalog.save()
+            catalog.config["callers"]["platform"]["allow_runtime_roles"] = False
+            catalog.save()
+            assert_failed(post(catalog, "records", b), 403, "forbidden")
+            catalog.config["callers"]["platform"]["allow_runtime_roles"] = True
+            catalog.save()
+            wrong_conversation = copy.deepcopy(b)
+            wrong_conversation["scope"]["conversation_id"] = "conversation:other"
+            catalog.contexts["synthetic-browser-b"]["allowed_scope"] = wrong_conversation["scope"]
+            assert_failed(post(catalog, "records", wrong_conversation), 403, "forbidden")
+            catalog.contexts["synthetic-browser-b"]["allowed_scope"] = catalog.scope(1)
+            grants.apply(
+                {
+                    "request_id": "browser-b-off",
+                    "actor_id": "actor:b",
+                    "expected_version": 1,
+                    "enabled": False,
+                    "legacy": False,
+                },
+                {"actor:a"},
+            )
+            assert_failed(post(catalog, "records", b), 403, "forbidden")
+            assert post(catalog, "records", body(catalog, limit=20, cursor=None)).status_code == 200
+            catalog.config["callers"]["platform"]["operations"] = []
+            catalog.save()
+            assert_failed(
+                post(catalog, "records", body(catalog, limit=20, cursor=None)), 403, "forbidden"
+            )
+        finally:
+            catalog.client = original
