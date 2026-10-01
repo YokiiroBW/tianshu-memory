@@ -1,5 +1,11 @@
 # 角色—人物关系与好感（TS-114）
 
+## 正式发布绑定（2026-10-01）
+
+发布分支引用协调仓库 `contracts/role-relationship/v1` 1.0.0，schema 的 LF SHA256 为 `e96397bac2b6ad8ff9d23c023d7d3c5ba0701734b27053a05b9d0f65a7ff8ee6`。五类 DTO 与已核对候选保持相同字段和语义；正式包同时固定 HTTPS 信封、managed read/check 与有界 history。Memory 的领域规则与权限边界未因发布绑定扩展。下文候选核对和此前测试数字为原任务历史；本轮正式绑定结果另见 `docs/handoffs/release-2026.10.01-rc.1.md`。发布不表示生产迁移或部署完成。
+
+## 原任务记录（下列候选状态和测试数字保留为历史）
+
 2026-10-01：Memory 隔离本地实现。根 `role-relationship/candidate-v1` 仍是候选，本文没有发布跨产品合同、安装生产表或授予调用权限。
 
 Memory 是 `(actor_id, person_id)` 分数、关系类型、冻结区间和事件账本的唯一写者。Companion 读取投影和提交可信轮次候选；Platform 转发获准后台操作。关系类型不授予管理员、工具或机器人回复权限，不随阶段自动变成恋人。短期情绪仍属于 Companion。

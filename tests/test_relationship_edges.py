@@ -80,10 +80,10 @@ def test_http_four_ports_and_candidate_schema(http_relationship):
         ).status_code
         == 409
     )
-    # Validate actual application output against the coordinator candidate, offline.
+    # Validate actual application output against the published coordinator contract, offline.
     from jsonschema import Draft202012Validator
 
-    directory = h.contracts.directory.parents[1] / "role-relationship/candidate-v1"
+    directory = h.contracts.directory.parents[1] / "role-relationship/v1"
     schema = json.loads((directory / "schema.json").read_text(encoding="utf-8"))
     validator = Draft202012Validator(schema)
     for value in (initial, managed.json()["projection"], current, settled.json()["settlement"]):
