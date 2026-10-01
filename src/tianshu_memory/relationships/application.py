@@ -361,6 +361,13 @@ class Relationships:
                 outcome="accepted",
                 clock=clock,
             )
+            db.execute(
+                "UPDATE relationship_events SET result=json_set(result,'$.audit',json(?)) WHERE event_id=?",
+                (
+                    canonical({"operation": operation, "reason": command.get("reason")}),
+                    "management:" + fingerprint(key),
+                ),
+            )
             result = projection(row, clock)
             db.execute(
                 "INSERT INTO relationship_commands VALUES (?,?,?,?,?,?)",

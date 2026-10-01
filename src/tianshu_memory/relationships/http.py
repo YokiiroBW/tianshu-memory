@@ -10,6 +10,7 @@ from starlette.requests import ClientDisconnect
 
 from ..diagnostics import anote_authenticated, note_fault, record_execution
 from ..domain import Fault, require, strict_json
+from .history import read as read_history
 from .ledger import identifier, pair_key
 
 
@@ -37,7 +38,7 @@ def mount(app, relationships, auth, admission, *, body_timeout, execute_timeout)
                     503,
                 )
                 lease = admission.claim()
-                permission = "relationships." + operation
+                permission = "relationships." + ("read" if operation == "history" else operation)
                 async with asyncio.timeout(execute_timeout):
                     caller_name, caller = await lease.run(
                         auth.authenticate, request.headers.get("authorization")
@@ -69,6 +70,7 @@ def mount(app, relationships, auth, admission, *, body_timeout, execute_timeout)
                 )
                 allowed = {"schema_version", "request_id", "origin"} | {
                     "read": {"pair", "managed"},
+                    "history": {"pair", "managed"},
                     "check": {"pair", "managed", "expected_version"},
                     "manage": {"command"},
                     "settle": {"candidate"},
@@ -86,9 +88,11 @@ def mount(app, relationships, auth, admission, *, body_timeout, execute_timeout)
                     "invalid_input",
                     400,
                 )
-                if operation in {"read", "check"}:
+                if operation in {"read", "check", "history"}:
                     pair_key(payload.get("pair"))
                     require(type(payload.get("managed", False)) is bool, "invalid_input", 400)
+                if operation == "history":
+                    require(payload.get("managed") is True, "invalid_input", 400)
                 if operation == "manage":
                     require(
                         type(payload.get("command")) is dict
@@ -112,6 +116,14 @@ def mount(app, relationships, auth, admission, *, body_timeout, execute_timeout)
                                 payload["command"],
                                 authorization=request.headers.get("authorization"),
                                 assertion_ref=origin["assertion_ref"],
+                            )
+                        if operation == "history":
+                            return read_history(
+                                relationships,
+                                payload["pair"],
+                                authorization=request.headers.get("authorization"),
+                                assertion_ref=origin["assertion_ref"],
+                                request_id=request_id,
                             )
                         if payload.get("managed", False):
                             current = relationships.read_managed(
@@ -143,7 +155,9 @@ def mount(app, relationships, auth, admission, *, body_timeout, execute_timeout)
                 async with asyncio.timeout(execute_timeout):
                     result = await lease.run(execute, business=True)
                 field = (
-                    "settlement"
+                    "history"
+                    if operation == "history"
+                    else "settlement"
                     if operation == "settle"
                     else "check"
                     if operation == "check"
@@ -167,7 +181,7 @@ def mount(app, relationships, auth, admission, *, body_timeout, execute_timeout)
 
         return endpoint
 
-    for operation in ("read", "manage", "settle", "check"):
+    for operation in ("read", "manage", "settle", "check", "history"):
         app.add_api_route(
             "/internal/v1/relationships/" + operation,
             endpoint_for(operation),

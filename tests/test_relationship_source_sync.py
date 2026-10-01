@@ -180,3 +180,34 @@ def test_https_platform_grant_denial_corrects_score_and_rejects_replay(synced):
     replay = h.post("relationships/settle", payload)
     assert replay.status_code in {403, 409}
     assert "settlement" not in replay.json()
+
+
+def test_https_history_retains_manual_reason_and_rejects_ordinary_read(synced):
+    h = synced
+    _, _, _ = h.seed()
+    pair = {k: h.scope()[k] for k in ("actor_id", "person_id")}
+    current = h.post("relationships/read", body(h, pair=pair)).json()["projection"]
+    request = body(h)
+    request["command"] = dict(
+        request_id=request["request_id"],
+        pair=pair,
+        expected_version=current["version"],
+        operation="adjust_affinity",
+        delta=5,
+        reason="合成HTTP原因",
+    )
+    changed = h.post("relationships/manage", request)
+    assert changed.status_code == 200, changed.text
+    history = h.post("relationships/history", body(h, pair=pair, managed=True))
+    assert history.status_code == 200, history.text
+    assert history.json()["history"]["items"][0]["reason"] == "合成HTTP原因"
+    projection = history.json()["history"]["projection"]
+    previous = changed.json()["projection"]
+    assert {k: v for k, v in projection.items() if k != "checked_at"} == {
+        k: v for k, v in previous.items() if k != "checked_at"
+    }
+    assert projection["checked_at"] >= previous["checked_at"]
+    assert h.post("relationships/history", body(h, pair=pair)).status_code == 400
+    h.config["callers"]["companion"]["role_admin"] = False
+    h.save()
+    assert h.post("relationships/history", body(h, pair=pair, managed=True)).status_code == 403

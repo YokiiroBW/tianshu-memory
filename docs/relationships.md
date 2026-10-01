@@ -98,3 +98,14 @@ settle 验证已持久的真实、成功发送且有 reply_ids 的轮次，时�
 本轮最终定向71项已实际通过，含真实本地HTTPS的合成 Core/Platform owner、实际 Memory 鉴权和 SQLite。完整套件1074 passed、1个已在干净基线复现的400/403断言失败、6项因缺少mcp跳过。该测试没有运行真实 Core/Platform 产品、NAS、QQ或模型。准确失败/skip、基线格式问题见 `docs/handoffs/TS-114.md`。
 
 后续需协调者审阅候选、固定交付版本并决定正式合同发布；再接 TS-115/116 和真实三产品联合。生产 alias/关系迁移、角色sidecar一致备份及NAS版本选择另行安排。当前产品main包含未部署QQ身份，不能直接当线上更新版本。
+
+
+## TS-116 接线发现与修正（2026-10-01）
+
+旧0b822425管理接口接受人工原因但仅保存请求摘要，原因无法回读；没有有界历史端口。现对应TS-114分支补齐：人工管理事件的既有result JSON附带操作/原因审计，返回PrivateProjection及命令重放保持原五DTO不变，不新增表/自动迁移。旧事件未记录原因时返回null，不编造。
+
+新增POST /internal/v1/relationships/history，输入schema_version/request_id/origin/pair/managed=true，使用既有relationships.read服务能力，并要求role_admin、relationships.manage、有效Platform操作人和self_private origin；输出history={projection,items,has_more}。按该pair现有索引取最近20+1事件，只回日期、类型、实际增量、结果、有效性和人工原因，不回来源原文/凭据/操作人ID。历史和当前分数在同一来源屏障事务读取，失效来源先纠正。它是本地接口增量，候选五DTO/schema哈希不变，尚未根合同正式发布或部署。
+
+原0b专项71通过；新增原因/边界测试5项及真实TLS端口1项须以本次记录为准，首次遗漏证书工具的5项setup错误不算通过。最终结果见后续提交交接与本轮检查点。
+
+最终本轮验证：76项关系专项通过（9.72s），新增TLS历史端口用例随后在完整回归通过。完整Memory实际1080 passed / 1 failed / 6 skipped / 2 warnings，290.67s，.runtime/tests-ts114-history-full；唯一失败仍是此前已在干净主线复现的test_confirmation_rejects_mismatched_authority[account-403]（400与403旧断言差异），保留不扩修；6项缺MCP跳过保留。本次5个改动Python文件Ruff/format及AST、git diff --check通过。仅对应TS-114分支本地提交，不推送/合主线/部署。
