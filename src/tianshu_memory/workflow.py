@@ -208,6 +208,9 @@ class _WorkflowBase:
                 400,
             )
             db.execute("INSERT INTO relationship_entries VALUES (?,?)", (group_id, delta))
+            from .relationships.legacy import route_legacy
+
+            route_legacy(self.service, db, group_id, scope, delta, event)
         return group_id, ids
 
     def _store_unit(self, db, unit, group_id, scope, field, item):
@@ -458,6 +461,11 @@ class LocalWorkflow(_WorkflowBase):
             return {"indexed_records": count}
 
     def relationship_value(self, scope):
+        from .relationships.legacy import value
+
+        migrated = value(self.service, scope)
+        if migrated is not None:
+            return migrated
         with self.service.store.transaction() as db:
             return sum(
                 r["amount"]

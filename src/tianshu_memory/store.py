@@ -204,6 +204,12 @@ class Store:
 
         return migrate(self, backup_path)
 
+    def migrate_relationships(self, backup_path, *, clock, policy=None):
+        from .relationship_migration import migrate
+        from .relationships.policy import Policy
+
+        return migrate(self, backup_path, clock=clock, policy=policy or Policy())
+
     def migrate_lessons(self, backup_path):
         from .lessons_migration import migrate as migrate_lessons
 

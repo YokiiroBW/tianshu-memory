@@ -64,7 +64,15 @@ async def served(*, service, request, operation, payload, context, module, outpu
     )
 
 
-def create_app(*, service=None, auth=None, body_timeout=5.0, execute_timeout=15.0, max_active=8):
+def create_app(
+    *,
+    service=None,
+    auth=None,
+    relationships=None,
+    body_timeout=5.0,
+    execute_timeout=15.0,
+    max_active=8,
+):
     app = FastAPI(title="Tianshu Memory", version="0.1.0", docs_url=None, redoc_url=None)
     if (
         not all(
@@ -78,6 +86,22 @@ def create_app(*, service=None, auth=None, body_timeout=5.0, execute_timeout=15.
     admission = Requests(max_active)
     app.state.chat_requests = admission
     app.state.memory = service
+    from .relationships import Relationships
+    from .relationships.http import mount as mount_relationships
+
+    if relationships is None and service is not None:
+        relationships = Relationships(service, auth=auth)
+    if service is not None:
+        service.relationships = relationships
+    mount_relationships(
+        app,
+        relationships,
+        auth,
+        admission,
+        body_timeout=body_timeout,
+        execute_timeout=execute_timeout,
+    )
+    app.state.relationships = relationships
 
     async def qq_identity_endpoint(request: Request, operation: str):
         """Explicit Platform service ports; neither is available to a chat caller."""
@@ -620,6 +644,13 @@ def configured_app():
 
         service.observations = ObservationLedger(store, PlatformVerifier(config_path))
     auth = Authenticator(config_path, contracts, now)
-    app = create_app(service=service, auth=auth)
+    from .relationships import Policy, Relationships
+
+    policy_config = dict(config.get("relationships_policy", {}))
+    for name in ("boundaries", "decay_rates"):
+        if name in policy_config:
+            policy_config[name] = tuple(policy_config[name])
+    relationships = Relationships(service, auth=auth, policy=Policy(**policy_config))
+    app = create_app(service=service, auth=auth, relationships=relationships)
     app.state.auth = auth
     return app
