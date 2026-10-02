@@ -21,7 +21,7 @@ from test_lessons import (
 from test_lessons import lessons as lessons
 
 from tianshu_memory import knowledge as module
-from tianshu_memory import lessons as lesson_module
+from tianshu_memory import knowledge_sources as lesson_module
 from tianshu_memory.domain import Fault, canonical
 
 

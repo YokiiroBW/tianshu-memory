@@ -13,6 +13,7 @@ from .domain import (
     source_selector,
     utc,
 )
+from .source_lookup_migration import require_ready
 
 
 class LocalRevisionChanged(Exception):
@@ -22,10 +23,14 @@ class LocalRevisionChanged(Exception):
 class SourceAuthority:
     def __init__(self, transport, contracts):
         require(contracts.source_version == "1.0.0", "dependency_unavailable", 503)
+        if contracts.source_batch_version is None:
+            contracts.load_source_batches()
+        require(contracts.source_batch_version == "1.0.0", "dependency_unavailable", 503)
         self.transport, self.contracts, self.rules = transport, contracts, contracts.source_rules
 
     @staticmethod
     def revision(db):
+        require_ready(db)
         row = db.execute("SELECT value FROM metadata WHERE key='source_revision'").fetchone()
         ready = db.execute("SELECT value FROM metadata WHERE key='source_recovery'").fetchone()
         require(
@@ -57,7 +62,6 @@ class SourceAuthority:
             )
         for row in rows:
             selected[row[0]] = json.loads(row[0])
-        require(len(selected) <= 256, "dependency_unavailable", 503)
         return [selected[k] for k in sorted(selected)]
 
     def _relations(self, name, *args):
@@ -65,6 +69,43 @@ class SourceAuthority:
             return getattr(self.rules, name)(*args)
         except (ValueError, KeyError, TypeError):
             raise Fault("dependency_unavailable", 503) from None
+
+    @staticmethod
+    def batches(selectors, sources, scope):
+        # Event inputs must share the first owner snapshot used by actor_event/check.
+        requested = {canonical(source_selector(source, scope)) for source in sources}
+        require(len(requested) <= 256, "dependency_unavailable", 503)
+        ordered = sorted(
+            selectors, key=lambda item: (canonical(item) not in requested, canonical(item))
+        )
+        return [ordered[index : index + 256] for index in range(0, len(ordered), 256)] or [[]]
+
+    def _read_batch(self, selectors, turn_ids, viewer):
+        request = dict(
+            schema_version=1,
+            request_id=new_id("facts"),
+            mode="snapshot",
+            selectors=selectors,
+            turn_ids=turn_ids,
+            include_content=False,
+        )
+        snapshot = self.transport.facts(request)
+        self._relations("source_snapshot", request, snapshot)
+        access_request, access = self._read_access(snapshot, viewer)
+        return dict(
+            request=request, snapshot=snapshot, access_request=access_request, access=access
+        )
+
+    def _read_access(self, snapshot, viewer):
+        request = dict(
+            schema_version=1,
+            request_id=new_id("access"),
+            operation="current",
+            admissions=snapshot["admissions"],
+            viewer=viewer,
+        )
+        access = self.transport.current(request)
+        return request, access
 
     def barrier(
         self, service, scope, *, sources=(), context=None, profile=False, event=None, check=None
@@ -76,35 +117,42 @@ class SourceAuthority:
                 if context is not None:
                     service._authorize(db, context, scope=scope)
             turn_ids = [event["aggregate_id"]] if event else [check["turn_id"]] if check else []
-            request = dict(
-                schema_version=1,
-                request_id=new_id("facts"),
-                mode="snapshot",
-                selectors=selectors,
-                turn_ids=turn_ids,
-                include_content=False,
-            )
-            snapshot = self.transport.facts(request)
-            self._relations("source_snapshot", request, snapshot)
             viewer = (
                 None
                 if context is None
-                else {
-                    "origin": {"assertion_ref": context["assertion_ref"]},
-                    "scope": scope,
-                }
+                else {"origin": {"assertion_ref": context["assertion_ref"]}, "scope": scope}
             )
-            access_request = dict(
-                schema_version=1,
-                request_id=new_id("access"),
-                operation="current",
-                admissions=snapshot["admissions"],
-                viewer=viewer,
-            )
-            access = self.transport.current(access_request)
-            self._relations(
-                "current_access", access_request, access, snapshot, utc(service.clock())
-            )
+            observations = []
+            for index, batch in enumerate(self.batches(selectors, sources, scope)):
+                observation = self._read_batch(batch, turn_ids if index == 0 else [], viewer)
+                self._relations(
+                    "current_access",
+                    observation["access_request"],
+                    observation["access"],
+                    observation["snapshot"],
+                    utc(service.clock()),
+                )
+                observations.append(observation)
+            first = observations[0]
+            # All batches must describe the same owner states. No prefix is committed.
+            if any(
+                item["snapshot"]["head"] != first["snapshot"]["head"]
+                or item["access"]["head"] != first["access"]["head"]
+                for item in observations
+            ):
+                continue
+            final_access_request, final_access = first["access_request"], first["access"]
+            if len(observations) > 1:
+                final_access_request, final_access = self._read_access({"admissions": []}, viewer)
+                self._relations(
+                    "current_access",
+                    final_access_request,
+                    final_access,
+                    {"admissions": [], "physicals": []},
+                    utc(service.clock()),
+                )
+                if final_access["head"] != first["access"]["head"]:
+                    continue
             final_request = dict(
                 schema_version=1,
                 request_id=new_id("head"),
@@ -115,31 +163,43 @@ class SourceAuthority:
             )
             final = self.transport.facts(final_request)
             self._relations("source_snapshot", final_request, final)
-            if snapshot["head"] != final["head"]:
+            if first["snapshot"]["head"] != final["head"]:
                 continue
-            if context is not None:
-                current = access["viewer_context"]
-                require(
-                    current["verified_account"] == context["verified_account"]
-                    and current["verified_channel"] == context["verified_channel"],
-                    "dependency_unavailable",
-                    503,
-                )
-            observation = dict(
-                request=request,
-                snapshot=snapshot,
-                access_request=access_request,
-                access=access,
-                final_head=final["head"],
-            )
+            for observation in observations:
+                observation["final_head"] = final["head"]
+                current = observation["access"]["viewer_context"]
+                if context is not None:
+                    require(
+                        current["verified_account"] == context["verified_account"]
+                        and current["verified_channel"] == context["verified_channel"]
+                        and current == final_access["viewer_context"],
+                        "dependency_unavailable",
+                        503,
+                    )
             try:
-                result = self.sync(
-                    service, observation, m0=m0, scope=scope, sources=sources, profile=profile
-                )
+                if len(observations) == 1:
+                    result = self.sync(
+                        service, first, m0=m0, scope=scope, sources=sources, profile=profile
+                    )
+                else:
+                    result = self.sync_batches(
+                        service,
+                        dict(
+                            schema_version=1,
+                            observations=observations,
+                            final_access_request=final_access_request,
+                            final_access=final_access,
+                            final_core_head=final["head"],
+                        ),
+                        m0=m0,
+                        scope=scope,
+                        sources=sources,
+                        profile=profile,
+                    )
             except LocalRevisionChanged:
                 continue
-            # Owner negatives are already committed. Bad/stale event or a later scope conflict
-            # must never roll them back.
+            # Negatives are durable before a later bad event or scope conflict is rejected.
+            snapshot = first["snapshot"]
             if event:
                 self._relations("actor_event", event, snapshot["turns"][0], snapshot)
             if check:
@@ -153,27 +213,70 @@ class SourceAuthority:
                     503,
                 )
                 self._relations("current_actor_sources", scope, sources, snapshot)
-            return result, access.get("viewer_context")
+            return result, final_access.get("viewer_context")
         raise Fault("dependency_unavailable", 503)
 
     def sync(self, service, observation, *, m0, scope, sources=(), profile=False):
-        """memory.source_sync trusted application port; only the HTTPS barrier calls this.
-
-        m0 and scope are local execution state captured before network reads, never wire
-        authority. This method is not exposed by the HTTP app or the operator fixture CLI.
-        """
+        """Trusted source-sync port. m0 and scope are local state, never wire authority."""
         self.contracts.validate("sync-workflow#sync_input", observation)
-        self._relations("sync_barrier", dict(observation, now=utc(service.clock())))
+        return self._commit_observations(
+            service, [observation], m0=m0, scope=scope, sources=sources, profile=profile
+        )
+
+    def sync_batches(self, service, observation, *, m0, scope, sources=(), profile=False):
+        self.contracts.validate("sync-batch#barrier", observation)
+        try:
+            self.contracts.source_batch_rules.batch_barrier(observation, utc(service.clock()))
+        except (ValueError, KeyError, TypeError):
+            raise Fault("dependency_unavailable", 503) from None
+        return self._commit_observations(
+            service,
+            observation["observations"],
+            m0=m0,
+            scope=scope,
+            sources=sources,
+            profile=profile,
+        )
+
+    def _commit_observations(self, service, observations, *, m0, scope, sources, profile):
+        for observation in observations:
+            self._relations("sync_barrier", dict(observation, now=utc(service.clock())))
+        selectors = sorted(
+            (selector for item in observations for selector in item["request"]["selectors"]),
+            key=canonical,
+        )
+        first = observations[0]
+        physicals = {}
+        receipts = set()
+        for observation in observations:
+            for physical in observation["snapshot"]["physicals"]:
+                key = fingerprint(physical["key"])
+                require(
+                    key not in physicals or physicals[key] == physical,
+                    "dependency_unavailable",
+                    503,
+                )
+                physicals[key] = physical
+            for admission in observation["snapshot"]["admissions"]:
+                receipt = admission["source"]["receipt_id"]
+                require(receipt not in receipts, "dependency_unavailable", 503)
+                receipts.add(receipt)
+        snapshot = dict(
+            first["snapshot"],
+            physicals=list(physicals.values()),
+            admissions=[a for item in observations for a in item["snapshot"]["admissions"]],
+            turns=[turn for item in observations for turn in item["snapshot"]["turns"]],
+        )
+        access = dict(
+            first["access"], grants=[g for item in observations for g in item["access"]["grants"]]
+        )
         with service.store.transaction() as db:
-            if (
-                self.revision(db) != m0
-                or self.coverage(db, scope, sources, profile) != observation["request"]["selectors"]
-            ):
+            if self.revision(db) != m0 or self.coverage(db, scope, sources, profile) != selectors:
                 raise LocalRevisionChanged()
-            viewer = observation["access"]["viewer_context"]
+            viewer = access["viewer_context"]
             if viewer is not None:
                 service._authorize(db, viewer, scope=scope)
-            result = self._apply(service, db, observation["snapshot"], observation["access"])
+            result = self._apply(service, db, snapshot, access)
             self.contracts.validate("sync-workflow#sync_result", result)
         return result
 
@@ -215,7 +318,15 @@ class SourceAuthority:
                     "SELECT * FROM source_observations WHERE kind=? AND key=?", (kind, key)
                 ).fetchone()
                 if old and old["sequence"] == heads[owner]["sequence"]:
-                    require(old["payload"] == canonical(value), "dependency_unavailable", 503)
+                    retained = json.loads(old["payload"])
+                    observed = value
+                    if kind == "access":
+                        # This digest binds the response to the incoming Core admission.
+                        # A Core revision can change it without changing Platform facts.
+                        # current_access has already verified that request correlation.
+                        retained = {k: v for k, v in retained.items() if k != "admission_digest"}
+                        observed = {k: v for k, v in value.items() if k != "admission_digest"}
+                    require(retained == observed, "dependency_unavailable", 503)
                 db.execute(
                     "INSERT INTO source_observations VALUES (?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET "
                     "sequence=excluded.sequence,payload=excluded.payload "
@@ -233,16 +344,16 @@ class SourceAuthority:
                 "dependency_unavailable",
                 503,
             )
-            for retained in db.execute(
-                "SELECT key,payload FROM source_admissions WHERE payload IS NOT NULL"
-            ):
-                if retained["key"] != fingerprint(admission["selector"]):
-                    require(
-                        json.loads(retained["payload"])["source"]["receipt_id"]
-                        != admission["source"]["receipt_id"],
-                        "dependency_unavailable",
-                        503,
-                    )
+            require(
+                db.execute(
+                    "SELECT 1 FROM source_admissions WHERE payload IS NOT NULL "
+                    "AND json_extract(payload,'$.source.receipt_id')=? AND key!=? LIMIT 1",
+                    (admission["source"]["receipt_id"], fingerprint(admission["selector"])),
+                ).fetchone()
+                is None,
+                "dependency_unavailable",
+                503,
+            )
         invalid_keys = set()
         for key, physical in physicals.items():
             old = db.execute("SELECT * FROM physical_sources WHERE key=?", (key,)).fetchone()

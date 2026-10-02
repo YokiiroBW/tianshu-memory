@@ -24,7 +24,7 @@ from .domain import (
 )
 from .knowledge_evidence import blocks
 from .knowledge_ports import ContinuationReader, DirectoryWriter, EvidenceLookup
-from .knowledge_sources import content_hash, decode, fetch_url, read_file
+from .knowledge_sources import FileReader, content_hash, decode, fetch_url, read_file
 from .store import Store
 
 READ = {
@@ -153,41 +153,6 @@ class CatalogEvidence:
         return self._application._reference(
             self._db, self._project_id, self._project, reference, self._read
         )
-
-
-class FileReader:
-    """Phase-aware file validation for the project-knowledge operations.
-
-    `capture` runs inside the transaction and performs no I/O: it records the expectation.
-    `read` runs outside the transaction and reads the file. `serve` runs inside the final
-    transaction and only compares the recorded expectation with that result, so a file
-    changed in between can never look current.
-    """
-
-    def __init__(self, project):
-        self.project = project
-        self.expected = {}
-        self.cache = {}
-
-    def capture(self, document, expected):
-        self.expected.setdefault(document["locator"], expected)
-        return True
-
-    def read(self, document, expected):
-        return self.read_locator(document["locator"]) == expected
-
-    def read_locator(self, locator):
-        if locator not in self.cache:
-            try:
-                first = content_hash(read_file(self.project, locator)[0])
-                second = content_hash(read_file(self.project, locator)[0])
-                self.cache[locator] = first if first == second else None
-            except (Fault, OSError, ValueError):
-                self.cache[locator] = None
-        return self.cache[locator]
-
-    def serve(self, document, expected):
-        return self.cache.get(document["locator"]) == expected
 
 
 class CatalogReader(FileReader):

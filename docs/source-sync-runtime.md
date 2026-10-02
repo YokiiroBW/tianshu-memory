@@ -2,6 +2,8 @@
 
 TS-033 基线 Memory `69b29f3a6b8cd61d39d733870d136de2caeb75f0`，正式包来自协调根发布提交 `154f068`。固定 source-sync/v1 1.0.0 manifest 的 UTF-8 LF SHA256 为 `178d0ce66210bdfad4cfb85d8b5f0905b0b67f834e2a530efe5636ff0373633d`。加载时校验包内全部文件及固定 text/profile 依赖；不读取历史 candidate，不修改 wire/hash。
 
+DQ11 绑定独立兼容扩展 `source-sync-batch/v1` 1.0.0，固定 UTF-8 LF manifest SHA256 为 `82e8d9043eb2f9a87f0efcb56a16e8f8bb6b119c6cf1683af48e3049024b380b`。来源模式启动时校验其全部文件和原 source-sync 依赖，不新增开关。部署合同目录需要包含该扩展；Core/Platform 原请求、响应和固定包无需变化。
+
 ## 服务配置
 
 配置文件和数据库均使用显式本地路径，放在被忽略的 `.runtime/`。生产来源模式为 `source_sync`，其新增配置结构如下；示例主机是占位，不能作为已部署地址：
@@ -59,13 +61,15 @@ uv run python -m uvicorn tianshu_memory.app:configured_app --factory --host 127.
 每次 select/profiles（包括零预算）、consume、候选提交、revise、check：
 
 1. 本地事务取得 m0 和完整 scope coverage，立即释放锁。
-2. 固定 HTTPS Core C1 → Platform P1（在线重验 viewer）→ Core C2。Core head 改变最多三次重试。
+2. 单批固定 HTTPS Core C1 → Platform P1（在线重验 viewer）→ Core C2。多批分别读取 C1/P1，整轮结束再读空 admissions 的 Platform current 及 Core head。全部 Core、全部 Platform 的 generation/sequence 分别完全相同，viewer 同样一致，否则整轮丢弃，最多三次重试。
 3. 新本地事务比较 m0/coverage；按本地账号绑定核对 person/binding_version，应用 P/A 及所有派生失效、版本、outbox、双水位，然后提交。
 4. 独立业务事务再比较本地 revision/权限/known version。事务间本地变更重新同步；409 不回滚已提交失效。
 
 SQLite 写锁不跨网络。数据库触发器记录依赖变化，跨进程写入同样推进 m0。text coverage 包括本范围保留的历史来源；profile coverage 包括当前 actor 全部活动公开/当前群血缘，不按目标、作者、query 或预算裁剪。P 否定影响所有已知本地 actor 的血缘；只对当前授权 A 正向登记。失效同域一次推进，已失效投影后续私密活动不推进公开 epoch。A correct/forget 只抑制本 A，不删除其他 A 或物理原文。
 
 `SourceAuthority.sync` 对应 `memory.sync` 可信应用端口：只有进程内 HTTPS 编排产生 observation，m0 是网络前捕获的本地执行状态。没有任意 observation HTTP 导入接口。已校验发布包 rules 只作关系断言；认证、当前时钟、本地 binding 与事务是产品实现。
+
+Platform grant 的 `admission_digest` 是本次 Core admission 输入关联，由每批 `current_access` 校验；Core 修订使输入摘要变化时，它不作为 Platform 同水位异事实。其他实际授权字段在相同 Platform sequence 下仍必须相等。
 
 committed_event 比较 owner 持久事件除 event_id 外的全部字段、turn/input revision、scope/conversation、有序 input_sources 和 aggregate 水位；当前 P/A、回执、归档状态及分类同时匹配。允许经 owner 证明的 aggregate 跳号；拒绝同 P 双修订、回执别名、伪 reality、mixed/unclassified 单来源和 archived 来源。
 
@@ -102,6 +106,18 @@ schema 3 迁移同时一次性建立独立恢复检查点，含库实例 UUID、
 
 ## 容量及验证边界
 
-单个完整 coverage 最多 256 个 A，P 去重；Core 请求最多 32 个 turn（本实现每次业务最多一个）；单响应/出站请求最多 1 MiB。Memory 入站保留原 256 KiB 限额。超限/缺项/超时/双水位回退/generation 改变返回不可用，绝不截断、漏墓碑或拼接不同快照分页。长期累积超限会持续 503；稳定分页、增量恢复另审。
+完整历史 coverage 不再因累积超过 256 而不可用。每个请求仍最多 256 个 A，物理 P 在本地聚合时去重，事件/check 的显式输入放在第一批；同一事件输入上限仍为 256。全部批次核验完成后再次比较本地 m0 和完整 coverage，在同一个 Store 事务应用来源、失效和双水位，不逐批提交，也不保存可跳过旧来源的游标。晚到编辑、撤回、授权变化和墓碑仍覆盖全部已登记历史。重启沿用持久来源、墓碑和 owner 水位，重新核验完整范围。
+
+Core 请求最多 32 个 turn（本实现每次业务最多一个）；单响应/出站请求最多 1 MiB。Memory 入站保留原 256 KiB 限额。超限/缺项/超时/双水位回退/generation 改变仍返回不可用，绝不截断或拼接不同 owner 快照。持续变化的 owner 在三轮内无法取得一致状态时仍为 503；本轮没有增加增量恢复或 recall 优化。
+
+### 既有 schema 3 的来源索引升级
+
+已有 schema 3 数据库需要停止全部写者后运行一次显式迁移，备份必须是新文件：
+
+```powershell
+uv run tianshu-memory --config C:/isolated-memory/config.json migrate-source-lookup --backup C:/isolated-memory/backups/before-source-lookup.sqlite
+```
+
+迁移仅建立 `source_admissions` receipt JSON 表达式索引及 `sources.scope` 索引，记录 `source_lookup_schema=1` 并推进既有 source-guard 检查点；不重写原来源 payload、suppression、消费账本或双水位。receipt 索引非唯一，保留旧空值和全部原记录；来源应用仍拒绝不同 selector 重用同一 receipt。查询用索引直接定位，不再逐 admission 全表解析历史 JSON。旧库缺索引时明确不可用，不在启动或请求路径自动执行 DDL。全新显式 schema 2→3 迁移包含相同索引。备份保留迁移前库；不得覆盖当前 guard 或把旧备份直接盖回正在运行的 schema 3。
 
 测试区分：真实 loopback HTTPS 上的正式合成 owner、实际 Memory 认证与 SQLite 事务；真实 Memory HTTP 子进程与重启；隔离 SQLite 迁移/恢复故障；替换 operation 的工作流局部测试。它们都不是已发布 Core/Platform 的联合验收。真实账号、设备、模型、渠道发送、归档和 PostgreSQL 未操作，完整 L0 保持未通过。Core 稳定区间内 P1 是共同读点，返回/外部发送仍可与后续远端变更竞争，不声称分布式发送事务。

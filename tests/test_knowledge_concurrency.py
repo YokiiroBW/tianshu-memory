@@ -8,6 +8,7 @@ from test_knowledge import imported, query, state
 from test_knowledge import knowledge as knowledge
 
 from tianshu_memory import knowledge as module
+from tianshu_memory import knowledge_sources as source_module
 from tianshu_memory.domain import Fault, canonical
 from tianshu_memory.service import MemoryService
 
@@ -63,6 +64,8 @@ def gate(monkeypatch, name, real):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(module, name, paused)
+    if name == "read_file":
+        monkeypatch.setattr(source_module, name, paused)
     return entered, release
 
 
@@ -250,6 +253,7 @@ def test_file_change_during_external_validation_cannot_yield_current_evidence(
         return raw
 
     monkeypatch.setattr(module, "read_file", changed)
+    monkeypatch.setattr(source_module, "read_file", changed)
     if name == "write_state":
         with pytest.raises(Fault, match="stale_evidence"):
             operation(run, name, pack, note)

@@ -1434,7 +1434,7 @@ def test_two_url_sources_promote_and_read_without_fetching(lessons, monkeypatch)
     assert calls == []
     # A URL locator is never handed to the file reader.
     with monkeypatch.context() as patch:
-        patch.setattr("tianshu_memory.lessons.read_file", forbid_file_read)
+        patch.setattr("tianshu_memory.knowledge_sources.read_file", forbid_file_read)
         assert check_effect(lessons, promoted["entry_id"])["effect"] == "live"
         assert [entry["effect"] for entry in status(lessons)["entries"]] == ["live"]
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .domain import admission_key, canonical, source_key, source_selector
+from .source_lookup_migration import install as install_lookup
 
 SCHEMA = """
 CREATE TABLE physical_sources (
@@ -169,6 +170,7 @@ def migrate(store, backup_path, contracts):
                     "WHERE key='source_revision'; END"
                 )
         db.execute("UPDATE metadata SET value='3' WHERE key='schema'")
+        install_lookup(db)
         if db.execute("PRAGMA foreign_key_check").fetchone():
             raise ValueError("Source migration foreign key mismatch")
     return {"schema": 3, "backup": str(backup), "unverified_admissions": len(rows)}

@@ -194,6 +194,11 @@ class Store:
             db.execute("INSERT INTO metadata VALUES ('observation_instance',?)", (uuid4().hex,))
         return {"schema": 3, "observation_schema": 1, "backup": str(backup)}
 
+    def migrate_source_lookup(self, backup_path):
+        from .source_lookup_migration import migrate
+
+        return migrate(self, backup_path)
+
     def migrate_users(self, backup_path):
         from .user_migration import migrate
 

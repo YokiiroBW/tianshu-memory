@@ -68,7 +68,9 @@ def main():
         "migrate-users", help="Stop writers; add guarded local approvals with backup"
     )
     migrate_users.add_argument("--backup", required=True)
-    migrate_qq = sub.add_parser("migrate-qq-aliases", help="Stop writers; add guarded QQ display names with backup")
+    migrate_qq = sub.add_parser(
+        "migrate-qq-aliases", help="Stop writers; add guarded QQ display names with backup"
+    )
     migrate_qq.add_argument("--backup", required=True)
     sub.add_parser("jobs")
     sub.add_parser("rebuild-index")
@@ -81,6 +83,10 @@ def main():
         "migrate-sources", help="Stop writers; migrate schema 2 to 3 with a backup"
     )
     migrate_sources.add_argument("--backup", required=True)
+    migrate_lookup = sub.add_parser(
+        "migrate-source-lookup", help="Stop writers; index guarded source receipts with backup"
+    )
+    migrate_lookup.add_argument("--backup", required=True)
     migrate_observations = sub.add_parser(
         "migrate-observations", help="Stop writers; add guarded passive sources with backup"
     )
@@ -99,6 +105,7 @@ def run_local_operation(args, parser):
         "migrate-users",
         "migrate-qq-aliases",
         "migrate-observations",
+        "migrate-source-lookup",
     }:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
         store = Store(
@@ -113,6 +120,8 @@ def run_local_operation(args, parser):
             result = store.migrate_sources(args.backup, contracts)
         elif args.operation == "migrate-observations":
             result = store.migrate_observations(args.backup)
+        elif args.operation == "migrate-source-lookup":
+            result = store.migrate_source_lookup(args.backup)
         elif args.operation == "migrate-users":
             result = store.migrate_users(args.backup)
         elif args.operation == "migrate-qq-aliases":
