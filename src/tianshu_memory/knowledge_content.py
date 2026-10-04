@@ -11,8 +11,19 @@ from .knowledge_sources import content_hash, fetch_url
 
 
 class KnowledgeContent:
-    def __init__(self, service, auth):
+    def __init__(self, service, auth, *, authorize_scope=None, validate_reader=None):
         self.service, self.auth = service, auth
+        self.authorize_scope = authorize_scope or service._authorize
+        self.validate_reader = validate_reader or self._local_reader
+
+    @staticmethod
+    def _local_reader(db, scope):
+        require(
+            db.execute("SELECT 1 FROM people WHERE id=?", (scope["person_id"],)).fetchone()
+            is not None,
+            "not_found",
+            404,
+        )
 
     def authorize(self, principal, caller_name, caller):
         if principal["kind"] == "actor":
@@ -36,7 +47,7 @@ class KnowledgeContent:
                 caller_name, caller, query["origin"]["assertion_ref"], query["request_id"]
             )
             with self.service.store.transaction() as db:
-                self.service._authorize(db, context, scope=scope)
+                self.authorize_scope(db, context, scope=scope)
             owner, request_id = {"kind": "user", "scope": scope}, query["request_id"]
         return {"owner": owner, "context": context, "request_id": request_id, "caller": caller_name}
 
@@ -44,7 +55,7 @@ class KnowledgeContent:
         ready(db)
         owner = authority["owner"]
         if owner["kind"] == "user":
-            self.service._authorize(db, authority["context"], scope=owner["scope"])
+            self.authorize_scope(db, authority["context"], scope=owner["scope"])
         else:
             caller = self.auth.config().get("callers", {}).get(authority["caller"], {})
             decision = (
@@ -391,12 +402,7 @@ class KnowledgeContent:
                     "actor_id", authority["owner"].get("scope", {}).get("actor_id")
                 )
                 require(scope["actor_id"] == actor)
-                require(
-                    db.execute("SELECT 1 FROM people WHERE id=?", (scope["person_id"],)).fetchone()
-                    is not None,
-                    "not_found",
-                    404,
-                )
+                self.validate_reader(db, scope)
                 db.execute(
                     "INSERT INTO knowledge_content_grants VALUES (?,?,?,?,?) ON CONFLICT(document_id,reader) DO UPDATE SET version=excluded.version,hash=excluded.hash,enabled=excluded.enabled",
                     (

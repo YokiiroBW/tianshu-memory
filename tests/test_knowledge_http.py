@@ -1561,6 +1561,7 @@ def test_http_module_calls_only_the_public_execute_and_holds_no_domain_state():
         "starlette",
         "domain",
         "knowledge",
+        "knowledge_content_runtime",
     }, imported
     attributes = {
         node.attr

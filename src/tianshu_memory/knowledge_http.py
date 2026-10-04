@@ -1,6 +1,11 @@
-"""Restricted loopback HTTP entry for project knowledge and research notes.
+"""Project Knowledge entry for the legacy project actions and original content.
 
-A thin transport for one already-integrated application. It adds no rule of its own:
+The original action transport below retains its fixed client and public execute boundary.
+When explicit content callers are configured, the same process also mounts the existing
+KnowledgeContent and RoleGrants transports. Those routes use live issuer scopes and
+service grants; they do not use project IDs or create a second identity authority.
+
+The legacy action transport below adds no domain rule of its own:
 
 - every request builds a fresh `KnowledgeApplication` and calls only its public `execute`;
 - the identity is the fixed knowledge client the operator named when the process started, so no
@@ -12,7 +17,7 @@ A thin transport for one already-integrated application. It adds no rule of its 
 - no database, source context, project adapter or other product client is held here, and the
   domain never imports this module.
 
-The route surface is fixed: one health route and one action route, with a sixteen-operation
+The legacy route surface is fixed: one health route and one action route, with a sixteen-operation
 allowlist. Everything else — authorization, idempotency, version conflicts, byte budgets,
 pagination cursors, evidence freshness and the transaction boundary — is decided inside the
 domain that owns it.
@@ -493,7 +498,7 @@ def create_app(
     The two phase limits exist so a test can exercise a deadline without waiting ten seconds. The
     wire contract is the defaults; production never passes them.
     """
-    load_config(config_path, client)
+    config = load_config(config_path, client)
     require(
         isinstance(client, str) and 0 < len(client) <= MAX_CLIENT_LENGTH,
         "invalid_input",
@@ -522,6 +527,25 @@ def create_app(
     app.state.active = 0
     app.state.observer = None
     app.state.settle = None
+    from .knowledge_content_runtime import mount as mount_content_runtime
+
+    mount_content_runtime(
+        app, config_path, config, body_timeout=read_deadline, execute_timeout=execute_deadline
+    )
+
+    if getattr(app.state, "content_auth", None) is not None:
+
+        @app.middleware("http")
+        async def content_authority(request, call_next):
+            if request.url.path.startswith(
+                ("/internal/v1/knowledge/content/", "/internal/v1/role-runtime/")
+            ):
+                try:
+                    check_host(request.headers.get("host"), port, authorities)
+                    check_origin(request)
+                except Fault as error:
+                    return failed(error.code, error.status)
+            return await call_next(request)
 
     def claim_slot():
         """Take one of the four admission slots, or report that none is free.

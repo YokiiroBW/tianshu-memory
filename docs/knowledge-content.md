@@ -2,7 +2,7 @@
 
 本服务是内容唯一 owner。项目 import 与生活 acquisition 共用 `knowledge_originals.store_version`、`knowledge_documents/versions/blocks/index`，保留原 bytes、sha256、版本和原始地址。生活文档的 `project_id=NULL`，范围由真实角色或精确人物受众拥有，不创建假工程项目；Companion 只保存引用、阅读范围和进度。
 
-正式合同为协调者发布的 `knowledge-content/v1`，单向依赖 `life-runtime/v2` 和 `text-dialogue/v1`，唯一 pin 在 `contracts.py`。部署装配会核验所有包、依赖 manifest 与文件 hash，不从网络加载 schema。所有端口在现有 Memory HTTP 服务，无新服务/容器。
+正式合同为协调者发布的 `knowledge-content/v1`，单向依赖 `life-runtime/v2` 和 `text-dialogue/v1`，唯一 pin 在 `contracts.py`。部署装配会核验所有包、依赖 manifest 与文件 hash，不从网络加载 schema。现有 Memory HTTP 和独立 Knowledge HTTP 入口复用同一内容模块；生产独立 Knowledge 使用自己的原件数据库，无新内容服务或 Companion 副本库。
 
 ## 准备与实际配置
 
@@ -19,6 +19,12 @@ uv run python -m tianshu_memory.knowledge_cli --config <既有Memory私有配置
 在现有 `callers.companion` 注册 `content_acquire/content_read/content_original`，按需要注册 `content_uploads/content_upload_status`。角色自主分支另需 `runtime_content:true`，沿原 `allowed_actors` 或 `allow_runtime_roles:true` + 已配置 `role_grants_database_path`；每次检查真实 Platform 注册的 RoleGrants，disabled 总拒。C3 每个实际动作检查自身 runtime/life epoch，principal 的 operation_ref 指向真实持久 activity/reading。没有伪人、伪账号或伪入站 assertion。
 
 Platform 已登录用户上传/管理沿其既有 issuer/token、真实 origin/account binding 与精确 scope。`content_access` 只给已注册管理调用方；actor 管理还需 `content_actor_access`，普通模型/角色 reader 不获得 grant 工具。QQ 实际附件发送只物化角色有权读的原件 bytes，Platform 用原实际收件人与主动许可查权后发送；发送附件不会自动授予网页原件读取权。网页打开仍按 Knowledge 精确 scope 的对象 version/sha 授权。
+
+独立 Knowledge 仍以 `knowledge_cli ... serve --client <既有项目客户端> --port <显式端口>` 启动，保留原 `/local/v1/project-knowledge/action` 及其固定 client。配置任一 `content_*` caller 后挂载下列正式内容路由；配置 `callers.platform.role_admin:true` 后同进程挂载 `/internal/v1/role-runtime/authorize` 的 apply/status。Platform 使用现有 durable RoleRuntime stages 分别同步 Memory 与 Knowledge 的 `role_grants_database_path`；角色授权文件为 Knowledge 自己的绝对路径，不读 Memory DB。未配置内容 caller 的旧项目服务行为保持。
+
+每个内容 caller 在 `callers.<名称>` 保留独立 `token` 和所需 `operations`。用户 caller 需要既有 `issuer:"platform"`、实际 HTTPS `issuer_url`、`issuer_token`，自签部署使用绝对 `issuer_ca_file`；角色自主 caller 需要上述 runtime_content/allow_runtime_roles。Web 管理 caller 配置 uploads/upload_status/acquire/read/original/access，角色 runtime reader 配置 acquire/read/original；Platform role_admin caller 不自动获得内容权限。生产不能使用 local_fixture 或 origins 配置模拟真实账号。
+
+独立 Knowledge 的人物身份不依赖其本地 people/accounts 表。每次实际用户操作由 Authenticator 实时向 Platform resolve origin：Platform 复核当前 entry、owner、撤销、摘要、期限与 route，然后投影由 Memory 真实回执确认的当前身份/渠道精确 scope。Knowledge 只接受该 exact scope，拒绝请求自行替换 actor/person/audience/conversation；不会复制身份，也不声称每次 HTTP 又向 Memory 查询。owner 显式 grant 只保存同 actor 的完整 reader_scope 和原件 version/hash，不创建人物或 origin。即使保存了不存在的目标 scope，没有 issuer 的当前有效 exact origin 仍不能读取；撤销 grant 或 origin、停用角色后即拒绝。
 
 `knowledge_content.trusted_urls` 是可选的部署登记精确内部来源，不需要为每个公共 URL 登记。默认用户/角色提交的公共 HTTP/HTTPS 地址逐跳 DNS 公网检查、连接地址 pin，HTTPS 验证证书；非公网仅允许配置中完全匹配的 URL，重定向也逐跳核验，禁用代理、压缩响应与凭据 URL。既有项目 import 的默认 exact HTTPS allowlist 保持。
 
