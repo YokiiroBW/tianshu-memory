@@ -15,12 +15,10 @@ from .domain import (
     Fault,
     canonical,
     fingerprint,
-    now,
     query_terms,
     require,
     strict_json,
     terms,
-    utc,
 )
 from .knowledge_evidence import blocks
 from .knowledge_ports import ContinuationReader, DirectoryWriter, EvidenceLookup
@@ -1110,60 +1108,9 @@ class KnowledgeApplication:
     def _store_version(
         self, db, project_id, document_id, source_id, kind, locator, prepared, old, version
     ):
-        """Write one imported version with its blocks and index rows.
+        from .knowledge_originals import store_version
 
-        The caller owns the transaction. A directory apply reuses this so a confirmed preview
-        and a single explicit import produce identically shaped versions, provenance and
-        index rows; `old` is the current document row, or None for a first import.
-        """
-        if old:
-            db.execute(
-                "UPDATE knowledge_documents SET version=?,state='ready' WHERE id=?",
-                (version, document_id),
-            )
-        else:
-            db.execute(
-                "INSERT INTO knowledge_documents VALUES (?,?,?,?,?,?,?)",
-                (document_id, project_id, source_id, kind, locator, version, "ready"),
-            )
-        provenance = {
-            "kind": kind,
-            "locator": locator,
-            "resolved": prepared["resolved"],
-            "imported_at": utc(now()),
-            "processing": "verbatim",
-            "citation_space": (
-                "visible_text_lines" if prepared["media"] == "text/html" else "text_lines"
-            ),
-        }
-        db.execute(
-            "INSERT INTO knowledge_versions VALUES (?,?,?,?,?,?,?)",
-            (
-                document_id,
-                version,
-                prepared["digest"],
-                prepared["raw"],
-                prepared["text"],
-                prepared["media"],
-                canonical(provenance),
-            ),
-        )
-        db.execute(
-            "DELETE FROM knowledge_index WHERE block_id IN "
-            "(SELECT id FROM knowledge_blocks WHERE document_id=?)",
-            (document_id,),
-        )
-        for index, unit in enumerate(prepared["units"]):
-            block_id = f"{document_id}:{version}:{index:03d}"
-            db.execute(
-                "INSERT INTO knowledge_blocks VALUES (?,?,?,?)",
-                (block_id, document_id, version, canonical(unit)),
-            )
-            db.execute(
-                "INSERT INTO knowledge_index VALUES (?,?,?)",
-                (block_id, project_id, prepared["index"][index]),
-            )
-        self._bump(db, project_id)
+        store_version(db, project_id, document_id, source_id, kind, locator, prepared, old, version)
 
     def _delete(self, db, project_id, project, args, preview):
         exact(args, "key document_id expected_version")

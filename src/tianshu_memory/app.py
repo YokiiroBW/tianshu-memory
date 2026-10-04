@@ -122,6 +122,14 @@ def create_app(
         body_timeout=body_timeout,
         execute_timeout=execute_timeout,
     )
+    from .knowledge_content import KnowledgeContent
+    from .knowledge_content_http import mount as mount_content
+
+    content = KnowledgeContent(service, auth) if service is not None and auth is not None else None
+    app.state.knowledge_content = content
+    mount_content(
+        app, content, auth, admission, body_timeout=body_timeout, execute_timeout=execute_timeout
+    )
 
     async def qq_identity_endpoint(request: Request, operation: str):
         """Explicit Platform service ports; neither is available to a chat caller."""
@@ -664,6 +672,11 @@ def configured_app():
         sources = SourceAuthority(SourceTransport(config_path, contracts), contracts)
     if wants_context:
         contracts.load_context()
+    if any(
+        any(operation.startswith("content_") for operation in caller.get("operations", []))
+        for caller in config.get("callers", {}).values()
+    ):
+        contracts.load_content()
     service = MemoryService(store, contracts, source_authority=sources)
     if config.get("observation_source") is not None:
         from .observations import ObservationLedger, PlatformVerifier

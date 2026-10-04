@@ -10,7 +10,9 @@ MANIFEST_SHA256 = "90697e6ecbb587d3db8c8e4682f7f8f43a8b1a98f70d8835c8282b03828d2
 PROFILE_MANIFEST_SHA256 = "757b243a25945a75d55dafab9da94828e79a009a0a77ce2aeb43039e4c2565c9"
 SOURCE_MANIFEST_SHA256 = "6d5c417c2e407aaf055151c1a3639d3b4e2ce4ad7da999f95273b6fcbf487370"
 SOURCE_BATCH_MANIFEST_SHA256 = "ac6f39d1f0afe55677fbbb0ce2da1b212d22c49f18917d8fe2ed613d424c4327"
-CONTEXT_MANIFEST_SHA256 = "90400a5a344a51006fed241ee1fca56b361c3c2899a04139e9207213352f02b5"
+CONTEXT_MANIFEST_SHA256 = "d44a23ac674d5fd3f8e9325c80884dc1426305055b873be1da239f126056e570"
+CONTENT_MANIFEST_SHA256 = "e8821e71f49c5d9709297b12f0cd7a345e2e85747e16e19ba79feea93c3354f7"
+LIFE_MANIFEST_SHA256 = "e2ab03ec163b15c350795fbe5f75a279cdc5f86a3c5475db44982eddbe3ff0e1"
 
 
 def digest(data: bytes) -> str:
@@ -48,6 +50,7 @@ class Contracts:
         self.source_batch_version = None
         self.source_batch_rules = None
         self.context_version = None
+        self.content_version = None
 
     def load_profiles(self):
         directory = self.directory.parent.parent / "profile-memory/v1"
@@ -213,6 +216,60 @@ class Contracts:
         self.schemas["memory-context"] = schema
         self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
         self.context_version = manifest["version"]
+
+    def load_content(self):
+        """Verify the full one-direction Knowledge -> Life -> Common dependency graph."""
+        Contracts(self.directory)
+        for package, pin, version, dependencies, filename, name in (
+            (
+                "life-runtime/v2",
+                LIFE_MANIFEST_SHA256,
+                "2.0.0",
+                {"text-dialogue/v1": MANIFEST_SHA256},
+                "schemas/life.json",
+                "life",
+            ),
+            (
+                "knowledge-content/v1",
+                CONTENT_MANIFEST_SHA256,
+                "1.0.0",
+                {"text-dialogue/v1": MANIFEST_SHA256, "life-runtime/v2": LIFE_MANIFEST_SHA256},
+                "schema.json",
+                "knowledge-content",
+            ),
+        ):
+            directory = self.directory.parent.parent / package
+            contents = (directory / "manifest.json").read_bytes()
+            if digest(contents) != pin:
+                raise ValueError("Content dependency manifest mismatch: " + package)
+            manifest = json.loads(contents)
+            if (
+                manifest["package"] != package
+                or manifest["version"] != version
+                or manifest["dependencies"] != dependencies
+            ):
+                raise ValueError("Unsupported content dependency: " + package)
+            for relative, expected in manifest["sha256"].items():
+                path = directory / relative
+                if (
+                    not path.resolve().is_relative_to(directory.resolve())
+                    or digest(path.read_bytes()) != expected
+                ):
+                    raise ValueError("Content dependency file mismatch: " + relative)
+            schema = json.loads((directory / filename).read_bytes())
+            expected_id = (
+                "https://contracts.tianshu.invalid/"
+                + package
+                + "/"
+                + ("life.json" if name == "life" else "schema.json")
+            )
+            if schema["$id"] != expected_id:
+                raise ValueError("Content schema identifier mismatch")
+            self.schemas[name] = schema
+            self.registry = self.registry.with_resource(
+                schema["$id"], Resource.from_contents(schema)
+            )
+        self.content_version = "1.0.0"
 
     def validate(self, name: str, document: dict):
         module, definition = name.split("#")

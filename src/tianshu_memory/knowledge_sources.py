@@ -7,6 +7,8 @@ import os
 import socket
 import ssl
 import time
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -251,35 +253,48 @@ def decode(raw, media_type):
     return text
 
 
-def fetch_url(url, allowed_urls):
-    """Exact allowlist for every hop; public addresses pinned through TLS (no proxy).
+def fetch_url(
+    url, allowed_urls, *, submitted=False, media_types=None, max_bytes=MAX_BYTES, include_time=False
+):
+    """Project exact allowlist or submitted public URLs; every hop pins the address.
 
     DNS resolution uses the host resolver; OS DNS timeout is additional to the 15s
-    network deadline. A configured URL never authorizes its links or another redirect.
+    network deadline. Internal submitted sources need their exact configured URL;
+    a configured URL never authorizes its links or another redirect. TLS verifies hosts.
     """
     deadline = time.monotonic() + 15
     for _ in range(4):
-        require(url in allowed_urls)
+        trusted = submitted and url in allowed_urls
+        require(submitted or url in allowed_urls)
         parsed = urlsplit(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
         require(
-            parsed.scheme == "https"
+            parsed.scheme in ({"http", "https"} if submitted else {"https"})
             and parsed.hostname
             and not parsed.username
             and not parsed.password
             and not parsed.fragment
-            and parsed.port in {None, 443}
+            and (trusted or port in ({80, 443} if submitted else {443}))
         )
-        addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
-        require(addresses and all(ipaddress.ip_address(a[4][0]).is_global for a in addresses))
+        addresses = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+        require(
+            addresses
+            and (trusted or all(ipaddress.ip_address(a[4][0]).is_global for a in addresses))
+        )
         remaining = deadline - time.monotonic()
         require(remaining > 0, "source_timeout", 408)
-        connection = http.client.HTTPSConnection(parsed.hostname, timeout=remaining)
+        connection_type = (
+            http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        )
+        connection = connection_type(parsed.hostname, port=port, timeout=remaining)
         try:
             # Pin the resolved address while retaining certificate/hostname verification.
             sock = socket.create_connection(addresses[0][4][:2], timeout=remaining)
             try:
-                connection.sock = ssl.create_default_context().wrap_socket(
-                    sock, server_hostname=parsed.hostname
+                connection.sock = (
+                    ssl.create_default_context().wrap_socket(sock, server_hostname=parsed.hostname)
+                    if parsed.scheme == "https"
+                    else sock
                 )
             except BaseException:
                 sock.close()
@@ -296,7 +311,9 @@ def fetch_url(url, allowed_urls):
                 "GET",
                 parsed.path + ("?" + parsed.query if parsed.query else "") or "/",
                 headers={
-                    "Accept": "text/plain, text/markdown, text/html",
+                    "Accept": ", ".join(
+                        sorted(media_types or {"text/plain", "text/markdown", "text/html"})
+                    ),
                     "Accept-Encoding": "identity",
                 },
             )
@@ -308,13 +325,17 @@ def fetch_url(url, allowed_urls):
                 continue
             require(response.status == 200, "source_unavailable", 503)
             media = response.getheader("Content-Type", "").split(";")[0].lower().strip()
-            require(media in {"text/plain", "text/markdown", "text/html"}, "unsupported", 415)
+            require(
+                media in (media_types or {"text/plain", "text/markdown", "text/html"}),
+                "unsupported",
+                415,
+            )
             require(
                 response.getheader("Content-Encoding", "identity") == "identity", "unsupported", 415
             )
             length = response.getheader("Content-Length")
             require(
-                length is None or (length.isdigit() and int(length) <= MAX_BYTES),
+                length is None or (length.isdigit() and int(length) <= max_bytes),
                 "source_too_large",
                 413,
             )
@@ -324,14 +345,27 @@ def fetch_url(url, allowed_urls):
                 require(remaining > 0, "source_timeout", 408)
                 # read1 avoids an unbounded series of slow reads inside a single call.
                 timeout()
-                chunk = response.read1(min(65536, MAX_BYTES + 1 - size))
+                chunk = response.read1(min(65536, max_bytes + 1 - size))
                 if not chunk:
                     break
                 size += len(chunk)
-                require(size <= MAX_BYTES, "source_too_large", 413)
+                require(size <= max_bytes, "source_too_large", 413)
                 chunks.append(chunk)
             require(length is None or size == int(length), "incomplete_source", 503)
-            return b"".join(chunks), media, url
+            result = (b"".join(chunks), media, url)
+            if include_time:
+                modified = response.getheader("Last-Modified")
+                try:
+                    parsed_time = parsedate_to_datetime(modified) if modified else None
+                    source_time = (
+                        parsed_time.astimezone(UTC).isoformat().replace("+00:00", "Z")
+                        if parsed_time and parsed_time.tzinfo
+                        else None
+                    )
+                except (ValueError, TypeError, OverflowError):
+                    source_time = None
+                return (*result, source_time)
+            return result
         finally:
             connection.close()
     raise Fault("redirect_limit", 400)

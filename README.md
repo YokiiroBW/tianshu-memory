@@ -1,5 +1,7 @@
 # 天枢记忆
 
+C5 URL/真实上传、Knowledge 唯一原件、角色自主和精确读者授权、实际图片/视频帧/音频及文档范围读取见 [生活内容原件](docs/knowledge-content.md)。沿现有 Memory HTTP 服务与 Knowledge 版本库，无 Companion 正文副本；`migrate-content --backup` 是停写后的显式步骤。
+
 C1 连续上下文的正式 query/propose/receipt/batch/association 路由、真实用户证明消费、原始发送时间筛选和显式升级见 [连续上下文服务](docs/memory-context.md)。复用本服务既有事实与来源权威，当前外部证明签发与跨产品联合由协调者接续。
 
 TS-080 项目资料、显式写回、短恢复包与可选 MCP stdio 入口见 [项目知识运行说明](docs/project-knowledge.md)。独立项目域不写人物画像；默认不启用 MCP 或自动配置任何客户端。
