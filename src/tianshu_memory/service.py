@@ -155,10 +155,9 @@ class MemoryService:
             return self._idempotent(db, "register", request, context, create)
 
     def link(self, request, context):
-        with self.store.transaction() as db:
-            self._authorize(db, context, account=request["source_account"])
-        # No proof issuer/challenge has been implemented. Never trust arbitrary proof strings.
-        raise Fault("dependency_unavailable", 503)
+        application = getattr(self, "memory_context", None)
+        require(application is not None, "dependency_unavailable", 503)
+        return application.legacy_link(request, context)
 
     def _source_rows(self, db, sources, scope, *, reality=None):
         if self.source_authority is None:
@@ -271,95 +270,95 @@ class MemoryService:
         with self.operation(
             scope=context["allowed_scope"], sources=request["evidence_refs"], context=context
         ) as db:
-            binding = self._authorize(db, context)
-            row = db.execute(
-                "SELECT r.*,g.scope FROM records r JOIN groups g ON g.id=r.group_id WHERE r.id=?",
-                (request["record_id"],),
+            return self._revision_in_transaction(db, request, context)
+
+    def _revision_in_transaction(self, db, request, context):
+        """One revision implementation, reusable inside an atomic continuity item."""
+        binding = self._authorize(db, context)
+        row = db.execute(
+            "SELECT r.*,g.scope FROM records r JOIN groups g ON g.id=r.group_id WHERE r.id=?",
+            (request["record_id"],),
+        ).fetchone()
+        require(row is not None and binding is not None, "not_found", 404)
+        scope = json.loads(row["scope"])
+        require("profile_subject" not in scope, "not_found", 404)
+        try:
+            self._authorize(db, context, scope=scope)
+        except Fault as error:
+            if error.code == "forbidden":
+                raise Fault("not_found", 404) from None
+            raise
+
+        # Replays still need current authority but may reference already consumed confirmation.
+        def apply():
+            if row["version"] != request["expected_version"]:
+                raise Fault("version_conflict", 409, row["version"])
+            # v1 has no restore operation. Do not return corrected for a retained tombstone.
+            require(
+                not (row["state"] == "tombstoned" and request["revision_kind"] == "correct"),
+                "invalid_input",
+                400,
+            )
+            proof = db.execute(
+                "SELECT * FROM confirmations WHERE ref=?", (request["confirmation_ref"],)
             ).fetchone()
-            require(row is not None and binding is not None, "not_found", 404)
-            scope = json.loads(row["scope"])
-            require("profile_subject" not in scope, "not_found", 404)
-            try:
-                self._authorize(db, context, scope=scope)
-            except Fault as error:
-                if error.code == "forbidden":
-                    raise Fault("not_found", 404) from None
-                raise
-
-            # Replays still need current authority but may reference already consumed confirmation.
-            def apply():
-                if row["version"] != request["expected_version"]:
-                    raise Fault("version_conflict", 409, row["version"])
-                # v1 has no restore operation. Do not return corrected for a retained tombstone.
+            require(
+                proof is not None
+                and not proof["consumed"]
+                and proof["digest"] == fingerprint(semantic_request(request))
+                and proof["account_key"] == canonical(context["verified_account"])
+                and proof["scope"] == canonical(scope)
+                and parse_time(proof["expires_at"]) > self.clock()
+            )
+            if self.synchronized:
                 require(
-                    not (row["state"] == "tombstoned" and request["revision_kind"] == "correct"),
-                    "invalid_input",
-                    400,
+                    proof["binding_version"] == binding["version"]
+                    and proof["record_id"] == request["record_id"]
+                    and proof["expected_version"] == request["expected_version"]
                 )
-                proof = db.execute(
-                    "SELECT * FROM confirmations WHERE ref=?", (request["confirmation_ref"],)
-                ).fetchone()
-                require(
-                    proof is not None
-                    and not proof["consumed"]
-                    and proof["digest"] == fingerprint(semantic_request(request))
-                    and proof["account_key"] == canonical(context["verified_account"])
-                    and proof["scope"] == canonical(scope)
-                    and parse_time(proof["expires_at"]) > self.clock()
+            self._source_rows(db, request["evidence_refs"], scope)
+            # Invalidate every group derived from any target source; blocks late candidates too.
+            keys = [
+                r[0]
+                for r in db.execute(
+                    "SELECT source_key FROM lineage WHERE group_id=?", (row["group_id"],)
                 )
-                if self.synchronized:
-                    require(
-                        proof["binding_version"] == binding["version"]
-                        and proof["record_id"] == request["record_id"]
-                        and proof["expected_version"] == request["expected_version"]
-                    )
-                self._source_rows(db, request["evidence_refs"], scope)
-                # Invalidate every group derived from any target source; blocks late candidates too.
-                keys = [
+            ]
+            groups = {row["group_id"]}
+            for key in keys:
+                groups.update(
                     r[0]
-                    for r in db.execute(
-                        "SELECT source_key FROM lineage WHERE group_id=?", (row["group_id"],)
-                    )
-                ]
-                groups = {row["group_id"]}
-                for key in keys:
-                    groups.update(
-                        r[0]
-                        for r in db.execute(
-                            "SELECT group_id FROM lineage WHERE source_key=?", (key,)
-                        )
-                    )
-                    db.execute(
-                        "UPDATE sources SET epoch=epoch+1,state='withdrawn' WHERE key=?", (key,)
-                    )
-                    if self.synchronized:
-                        db.execute(
-                            "INSERT OR IGNORE INTO suppression VALUES (?,?)",
-                            (key, request["revision_kind"]),
-                        )
-                self._invalidate(
-                    db,
-                    groups,
-                    forgotten=request["revision_kind"] == "forget",
-                    replacement=request["replacement_statement"],
-                    target=request["record_id"],
+                    for r in db.execute("SELECT group_id FROM lineage WHERE source_key=?", (key,))
                 )
-                self._invalidate_jobs(db, source_keys=keys)
-                db.execute("UPDATE confirmations SET consumed=1 WHERE ref=?", (proof["ref"],))
-                return {
-                    "schema_version": 1,
-                    "request_id": request["command"]["request_id"],
-                    "record_id": row["id"],
-                    "record_version": row["version"] + 1,
-                    "scope_version": self._scope_version(db, scope),
-                    "index_state": "pending",
-                    "authoritative_state": (
-                        "tombstoned" if request["revision_kind"] == "forget" else "corrected"
-                    ),
-                    "semantic_state": "invalidated",
-                }
+                db.execute("UPDATE sources SET epoch=epoch+1,state='withdrawn' WHERE key=?", (key,))
+                if self.synchronized:
+                    db.execute(
+                        "INSERT OR IGNORE INTO suppression VALUES (?,?)",
+                        (key, request["revision_kind"]),
+                    )
+            self._invalidate(
+                db,
+                groups,
+                forgotten=request["revision_kind"] == "forget",
+                replacement=request["replacement_statement"],
+                target=request["record_id"],
+            )
+            self._invalidate_jobs(db, source_keys=keys)
+            db.execute("UPDATE confirmations SET consumed=1 WHERE ref=?", (proof["ref"],))
+            return {
+                "schema_version": 1,
+                "request_id": request["command"]["request_id"],
+                "record_id": row["id"],
+                "record_version": row["version"] + 1,
+                "scope_version": self._scope_version(db, scope),
+                "index_state": "pending",
+                "authoritative_state": (
+                    "tombstoned" if request["revision_kind"] == "forget" else "corrected"
+                ),
+                "semantic_state": "invalidated",
+            }
 
-            return self._idempotent(db, "revise", request, context, apply)
+        return self._idempotent(db, "revise", request, context, apply)
 
     def select(self, request, context):
         scope = request["requested_scope"]

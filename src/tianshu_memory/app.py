@@ -69,6 +69,7 @@ def create_app(
     service=None,
     auth=None,
     relationships=None,
+    memory_context=None,
     body_timeout=5.0,
     execute_timeout=15.0,
     max_active=8,
@@ -102,6 +103,25 @@ def create_app(
         execute_timeout=execute_timeout,
     )
     app.state.relationships = relationships
+    from .memory_context import MemoryContext
+    from .memory_context.http import mount as mount_context
+    from .memory_context.proofs import PlatformProofs
+
+    if memory_context is None and service is not None:
+        memory_context = MemoryContext(
+            service, proofs=PlatformProofs(auth, service.contracts, service.clock) if auth else None
+        )
+    if service is not None:
+        service.memory_context = memory_context
+    app.state.memory_context = memory_context
+    mount_context(
+        app,
+        memory_context,
+        auth,
+        admission,
+        body_timeout=body_timeout,
+        execute_timeout=execute_timeout,
+    )
 
     async def qq_identity_endpoint(request: Request, operation: str):
         """Explicit Platform service ports; neither is available to a chat caller."""
@@ -623,6 +643,10 @@ def configured_app():
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     # All paths and credentials are explicit; no production database or remote service defaults.
     contracts = Contracts(config["contract_directory"])
+    wants_context = any(
+        any(operation.startswith("context_") for operation in caller.get("operations", []))
+        for caller in config.get("callers", {}).values()
+    )
     if any(
         "select_profiles" in caller.get("operations", [])
         for caller in config.get("callers", {}).values()
@@ -638,6 +662,8 @@ def configured_app():
 
         contracts.load_sources()
         sources = SourceAuthority(SourceTransport(config_path, contracts), contracts)
+    if wants_context:
+        contracts.load_context()
     service = MemoryService(store, contracts, source_authority=sources)
     if config.get("observation_source") is not None:
         from .observations import ObservationLedger, PlatformVerifier

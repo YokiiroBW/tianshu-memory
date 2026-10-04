@@ -204,6 +204,11 @@ class Store:
 
         return migrate(self, backup_path)
 
+    def migrate_context(self, backup_path):
+        from .memory_context.migration import migrate
+
+        return migrate(self, backup_path)
+
     def migrate_qq_aliases(self, backup_path):
         from .qq_alias_migration import migrate
 

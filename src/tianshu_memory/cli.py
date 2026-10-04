@@ -68,6 +68,10 @@ def main():
         "migrate-users", help="Stop writers; add guarded local approvals with backup"
     )
     migrate_users.add_argument("--backup", required=True)
+    migrate_context = sub.add_parser(
+        "migrate-context", help="Stop writers; install guarded continuity with a complete backup"
+    )
+    migrate_context.add_argument("--backup", required=True)
     migrate_qq = sub.add_parser(
         "migrate-qq-aliases", help="Stop writers; add guarded QQ display names with backup"
     )
@@ -103,6 +107,7 @@ def run_local_operation(args, parser):
         "migrate-profiles",
         "migrate-sources",
         "migrate-users",
+        "migrate-context",
         "migrate-qq-aliases",
         "migrate-observations",
         "migrate-source-lookup",
@@ -124,6 +129,8 @@ def run_local_operation(args, parser):
             result = store.migrate_source_lookup(args.backup)
         elif args.operation == "migrate-users":
             result = store.migrate_users(args.backup)
+        elif args.operation == "migrate-context":
+            result = store.migrate_context(args.backup)
         elif args.operation == "migrate-qq-aliases":
             result = store.migrate_qq_aliases(args.backup)
         else:

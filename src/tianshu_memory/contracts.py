@@ -6,10 +6,11 @@ from pathlib import Path
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
 
-MANIFEST_SHA256 = "81e6cc4ddef7c6f82e055d4cb04b090db036dd5c52763473ce697aa02db478a1"
-PROFILE_MANIFEST_SHA256 = "488d05438dd5b5abaa43a66a7eab0eb5cf615d5af01a964a7286cd23e68f7eb7"
-SOURCE_MANIFEST_SHA256 = "178d0ce66210bdfad4cfb85d8b5f0905b0b67f834e2a530efe5636ff0373633d"
-SOURCE_BATCH_MANIFEST_SHA256 = "82e8d9043eb2f9a87f0efcb56a16e8f8bb6b119c6cf1683af48e3049024b380b"
+MANIFEST_SHA256 = "90697e6ecbb587d3db8c8e4682f7f8f43a8b1a98f70d8835c8282b03828d2d3a"
+PROFILE_MANIFEST_SHA256 = "757b243a25945a75d55dafab9da94828e79a009a0a77ce2aeb43039e4c2565c9"
+SOURCE_MANIFEST_SHA256 = "6d5c417c2e407aaf055151c1a3639d3b4e2ce4ad7da999f95273b6fcbf487370"
+SOURCE_BATCH_MANIFEST_SHA256 = "ac6f39d1f0afe55677fbbb0ce2da1b212d22c49f18917d8fe2ed613d424c4327"
+CONTEXT_MANIFEST_SHA256 = "90400a5a344a51006fed241ee1fca56b361c3c2899a04139e9207213352f02b5"
 
 
 def digest(data: bytes) -> str:
@@ -46,6 +47,7 @@ class Contracts:
         self.source_rules = None
         self.source_batch_version = None
         self.source_batch_rules = None
+        self.context_version = None
 
     def load_profiles(self):
         directory = self.directory.parent.parent / "profile-memory/v1"
@@ -180,6 +182,37 @@ class Contracts:
         self.source_rules, self.source_version = verified.source_rules, verified.source_version
         self.profile_version = verified.profile_version
         self.source_batch_rules, self.source_batch_version = rules, manifest["version"]
+
+    def load_context(self):
+        """Load the coordinator's extension and its complete pinned dependency tree."""
+        directory = self.directory.parent.parent / "memory-context/v1"
+        manifest_bytes = (directory / "manifest.json").read_bytes()
+        if digest(manifest_bytes) != CONTEXT_MANIFEST_SHA256:
+            raise ValueError("Memory context contract manifest hash mismatch")
+        manifest = json.loads(manifest_bytes)
+        if (
+            manifest["package"] != "memory-context/v1"
+            or manifest["version"] != "1.0.0"
+            or manifest["dependencies"]
+            != {"text-dialogue": MANIFEST_SHA256, "source-sync": SOURCE_MANIFEST_SHA256}
+        ):
+            raise ValueError("Unsupported memory context contract")
+        files = {}
+        for relative, expected in manifest["sha256"].items():
+            path = directory / relative
+            if not path.resolve().is_relative_to(directory.resolve()):
+                raise ValueError("Memory context contract path escapes version directory")
+            contents = path.read_bytes()
+            if digest(contents) != expected:
+                raise ValueError("Memory context contract file hash mismatch: " + relative)
+            files[relative] = contents
+        self.load_source_batches()
+        schema = json.loads(files["schema.json"])
+        if schema["$id"] != "https://contracts.tianshu.invalid/memory-context/v1/schema.json":
+            raise ValueError("Memory context schema identifier mismatch")
+        self.schemas["memory-context"] = schema
+        self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
+        self.context_version = manifest["version"]
 
     def validate(self, name: str, document: dict):
         module, definition = name.split("#")

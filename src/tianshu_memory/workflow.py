@@ -70,25 +70,68 @@ class _WorkflowBase:
                 409,
             )
             source_map = {r["key"]: r for r in rows}
-            # An already-accounted source cannot be re-used under a new turn id or job id.
-            duplicate = any(
-                db.execute(
-                    "SELECT job_id FROM source_writes WHERE source_key=? AND revision=? AND scope=?",
-                    (r["key"], r["revision"], canonical(event["scope"])),
-                ).fetchone()
-                for r in rows
+            from .memory_context.migration import installed, target_key
+
+            contextual = installed(db)
+            # After migration a source may support distinct targets. Legacy whole-job
+            # consumption is retained only for databases not yet explicitly upgraded.
+            pending = (
+                [
+                    draft
+                    for draft in drafts
+                    if not db.execute(
+                        "SELECT 1 FROM context_applications WHERE scope=? AND target_key=? AND digest=? LIMIT 1",
+                        (canonical(event["scope"]), target_key(draft), fingerprint(draft)),
+                    ).fetchone()
+                ]
+                if contextual
+                else drafts
+            )
+            duplicate = (
+                bool(drafts) and not pending
+                if contextual
+                else any(
+                    db.execute(
+                        "SELECT job_id FROM source_writes WHERE source_key=? AND revision=? AND scope=?",
+                        (r["key"], r["revision"], canonical(event["scope"])),
+                    ).fetchone()
+                    for r in rows
+                )
             )
             if duplicate:
                 result = {"state": "duplicate_source", "record_ids": [], "group_ids": []}
             else:
                 record_ids, group_ids = [], []
-                for draft in drafts:
+                for draft in pending:
                     result_group = self._write_group(db, draft, event, source_map)
                     group_ids.append(result_group[0])
                     record_ids.extend(result_group[1])
+                    if contextual:
+                        used_sources = {
+                            row[0]
+                            for row in db.execute(
+                                "SELECT source_key FROM lineage WHERE group_id=?",
+                                (result_group[0],),
+                            )
+                        }
+                        for row in rows:
+                            if row["key"] not in used_sources:
+                                continue
+                            db.execute(
+                                "INSERT INTO context_applications VALUES (?,?,?,?,?,?,?)",
+                                (
+                                    row["key"],
+                                    row["revision"],
+                                    canonical(event["scope"]),
+                                    target_key(draft),
+                                    job_id + ":" + str(len(group_ids)),
+                                    fingerprint(draft),
+                                    result_group[0],
+                                ),
+                            )
                 for row in rows:
                     db.execute(
-                        "INSERT INTO source_writes VALUES (?,?,?,?)",
+                        "INSERT OR IGNORE INTO source_writes VALUES (?,?,?,?)",
                         (
                             row["key"],
                             row["revision"],
@@ -96,6 +139,8 @@ class _WorkflowBase:
                             job_id,
                         ),
                     )
+                if contextual and pending:
+                    self.service._bump(db, event["scope"])
                 result = {
                     "state": "committed" if drafts else "skipped",
                     "record_ids": record_ids,
