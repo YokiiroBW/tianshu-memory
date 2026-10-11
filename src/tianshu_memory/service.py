@@ -31,8 +31,10 @@ class MemoryService:
         max_units=32,
         max_pending_jobs=256,
         source_authority=None,
+        retrieval=None,
     ):
         self.store, self.contracts, self.clock, self.max_units = store, contracts, clock, max_units
+        self.retrieval = retrieval
         self.source_authority = source_authority
         self.max_pending_jobs = max_pending_jobs
 
@@ -64,6 +66,8 @@ class MemoryService:
         return row[0] if row else 1
 
     def _bump(self, db, scope):
+        if self.retrieval is not None:
+            self.retrieval.invalidate()
         if "profile_subject" in scope:
             scope = {k: v for k, v in scope.items() if k != "profile_subject"}
         db.execute(
@@ -362,6 +366,7 @@ class MemoryService:
 
     def select(self, request, context):
         scope = request["requested_scope"]
+        settings = self.retrieval.settings_for(request) if self.retrieval else None
         with self.operation(scope=scope, context=context) as db:
             self._authorize(db, context, scope=scope)
             version = self._scope_version(db, scope)
@@ -393,7 +398,7 @@ class MemoryService:
             exact_kind, separator, exact_value = request["query_text"].partition(":")
             exact = separator and exact_kind in {"field", "item"}
             search_terms = [] if exact else query_terms(request["query_text"])
-            if not exact and not search_terms:
+            if not exact and not search_terms and (not settings or settings["mode"] == "keyword"):
                 response["omissions"] = ["no_match"]
                 return response
             # Materialize only authorized, current groups BEFORE any lexical/FTS matching.
@@ -429,14 +434,54 @@ class MemoryService:
                 if not self._projections_current(db, units):
                     continue
                 eligible.append((group, rows, units))
-            if not exact:
-                eligible = self._rank_groups(db, eligible, search_terms)
-            response.update(self._fit_groups(eligible, request["budget"]))
+            lexical = self._rank_groups(db, eligible, search_terms) if not exact else eligible
+            if exact or settings is None:
+                response.update(self._fit_groups(lexical, request["budget"]))
+                return response
+        ranked = self.retrieval.rank(request["query_text"], eligible, lexical, settings)
+        with self.operation(scope=scope, context=context) as db:
+            self._authorize(db, context, scope=scope)
+            require(self._scope_version(db, scope) == version, "scope_changed", 409)
+            self._verify_retrieval(db, ranked)
+            response.update(self._fit_groups(ranked, request["budget"]))
+            verified = self.clock()
+            response.update(
+                verified_at=utc(verified),
+                valid_until=utc(
+                    min(verified + timedelta(seconds=30), parse_time(context["expires_at"]))
+                ),
+            )
             return response
+
+    def _verify_retrieval(self, db, candidates):
+        for group, records, units in candidates:
+            current_group = db.execute(
+                "SELECT state,members FROM groups WHERE id=?", (group["id"],)
+            ).fetchone()
+            require(
+                current_group is not None
+                and current_group["state"] == "active"
+                and current_group["members"] == group["members"],
+                "scope_changed",
+                409,
+            )
+            require(self._group_current(db, group["id"]), "scope_changed", 409)
+            current = db.execute(
+                "SELECT id,version,state FROM records WHERE group_id=?", (group["id"],)
+            ).fetchall()
+            require(
+                {(r["id"], r["version"], r["state"]) for r in current}
+                == {(r["id"], r["version"], "active") for r in records}
+                and self._projections_current(db, units),
+                "scope_changed",
+                409,
+            )
 
     def _rank_groups(self, db, eligible, search_terms):
         # One FTS document per complete authorized group: qualifiers/members contribute
         # to relevance together. Neither private nor stale rows influence corpus scores.
+        if not search_terms:
+            return []
         db.execute("CREATE VIRTUAL TABLE temp.allowed_search USING fts5(group_id UNINDEXED,text)")
         for group, rows, _ in eligible:
             texts = []

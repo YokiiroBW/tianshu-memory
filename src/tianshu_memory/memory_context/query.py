@@ -65,6 +65,7 @@ def checks(service, db, scopes):
 
 def execute(application, request, context):
     service = application.service
+    settings = service.retrieval.settings_for(request) if service.retrieval else None
     scope = request["requested_scope"]
     period = request["time_range"]
     if period is not None:
@@ -126,7 +127,7 @@ def execute(application, request, context):
         exact_kind, separator, exact_value = request["query_text"].partition(":")
         exact = separator and exact_kind in {"field", "item"}
         search_terms = [] if exact else query_terms(request["query_text"])
-        if not exact and not search_terms:
+        if not exact and not search_terms and (not settings or settings["mode"] == "keyword"):
             result["omissions"] = ["no_match"]
             return result
         candidates = []
@@ -141,21 +142,22 @@ def execute(application, request, context):
             if exact:
                 predicates.append(f"g.{exact_kind}_key=?")
                 parameters.append(exact_value)
-            else:
+            elif settings is None or settings["mode"] == "keyword":
                 predicates.append(
                     "EXISTS(SELECT 1 FROM records r JOIN search_index i ON i.record_id=r.id AND i.record_version=r.version WHERE r.group_id=g.id AND i.scope=g.scope AND i.text MATCH ?)"
                 )
                 parameters.append(expression)
-            parameters.append(request["limit"] + 1)
+            candidate_limit = request["limit"] if settings is None else 4096
+            parameters.append(candidate_limit + 1)
             rows = db.execute(
                 "SELECT g.* FROM groups g WHERE "
                 + " AND ".join(predicates)
                 + " ORDER BY g.rowid DESC LIMIT ?",
                 parameters,
             ).fetchall()
-            if len(rows) > request["limit"]:
+            if len(rows) > candidate_limit:
                 result["coverage"]["complete"] = False
-                rows = rows[: request["limit"]]
+                rows = rows[:candidate_limit]
             for group in rows:
                 if not service._group_current(db, group["id"]):
                     continue
@@ -177,15 +179,25 @@ def execute(application, request, context):
                     continue
                 if service._projections_current(db, units):
                     candidates.append((group, records, units))
-        if not exact:
-            candidates = service._rank_groups(db, candidates, search_terms)
-        if period is None or not candidates:
+        lexical = service._rank_groups(db, candidates, search_terms) if not exact else candidates
+        remote_rank = settings is not None and not exact
+        if not remote_rank:
+            candidates = lexical
+        if not remote_rank and (period is None or not candidates):
             return finish(service, db, request, context, candidates, result)
         prepared = prepare(db, candidates)
-    # Remote content reads happen without the SQLite authority write lock. The
-    # final transaction rejects any local authority change during these reads.
-    candidates, missing = filter_candidates(service, prepared, candidates, scope, context, period)
-    with service.store.transaction() as db:
+    # Model and content I/O never hold the authority write transaction.
+    missing = 0
+    if period is not None and candidates:
+        candidates, missing = filter_candidates(
+            service, prepared, candidates, scope, context, period
+        )
+        allowed = {entry[0]["id"] for entry in candidates}
+        lexical = [entry for entry in lexical if entry[0]["id"] in allowed]
+    if remote_rank:
+        result["coverage"]["complete"] &= len(candidates) <= settings["candidates"]
+        candidates = service.retrieval.rank(request["query_text"], candidates, lexical, settings)
+    with service.operation(scope=scope, context=context) as db:
         require(
             int(db.execute("SELECT value FROM metadata WHERE key='source_revision'").fetchone()[0])
             == prepared["revision"],
@@ -199,6 +211,7 @@ def execute(application, request, context):
             "scope_changed",
             409,
         )
+        service._verify_retrieval(db, candidates)
         result["coverage"]["missing_source_times"] = missing
         result["coverage"]["complete"] &= not missing
         return finish(service, db, request, context, candidates, result)

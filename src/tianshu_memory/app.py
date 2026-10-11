@@ -634,7 +634,13 @@ def configured_app():
         for caller in config.get("callers", {}).values()
     ):
         contracts.load_content()
-    service = MemoryService(store, contracts, source_authority=sources)
+    retrieval = None
+    if config.get("retrieval") is not None:
+        from .retrieval import Retrieval
+        from .retrieval_transport import RetrievalTransport
+
+        retrieval = Retrieval(RetrievalTransport(config_path))
+    service = MemoryService(store, contracts, source_authority=sources, retrieval=retrieval)
     if config.get("observation_source") is not None:
         from .observations import ObservationLedger, PlatformVerifier
 
