@@ -1,0 +1,148 @@
+"""Memory-owned candidate read/commit port; models never choose scope or authority."""
+
+import json
+
+from .domain import Fault, canonical, fingerprint, new_id, require, source_selector, utc
+from .workflow import TrustedWorkflow
+
+
+class CandidateExtraction:
+    def __init__(self, service):
+        self.service = service
+
+    def execute(self, request, publisher):
+        require(
+            type(request) is dict and set(request) == {"job_id", "output"}, "invalid_input", 400
+        )
+        require(
+            type(request["job_id"]) is str and 0 < len(request["job_id"]) <= 256,
+            "invalid_input",
+            400,
+        )
+        service = self.service
+        require(service.synchronized, "dependency_unavailable", 503)
+        with service.store.transaction() as db:
+            job = db.execute("SELECT * FROM jobs WHERE id=?", (request["job_id"],)).fetchone()
+            require(job is not None, "not_found", 404)
+            event = json.loads(job["event"])
+            scope = event["scope"]
+            require(publisher["authenticated_service"] == "companion")
+            require(scope["actor_id"] not in publisher.get("blocked_role_actors", []))
+            require(
+                scope in publisher["allowed_scopes"]
+                or scope["actor_id"] in publisher.get("allowed_role_actors", [])
+            )
+            receipt = db.execute(
+                "SELECT result FROM write_ledger WHERE job_id=?", (job["id"],)
+            ).fetchone()
+            if receipt:
+                return dict(state="completed", result=json.loads(receipt[0]), content=[])
+            if job["state"] != "pending":
+                return dict(state="invalidated", result=None, content=[])
+        content = self._content(event)
+        if request["output"] is None:
+            return dict(state="pending", result=None, content=content)
+        try:
+            drafts = self._drafts(event, content, request["output"])
+        except Fault as error:
+            if error.code != "invalid_input":
+                raise
+            return dict(state="rejected", result={"error_code": "invalid_input"}, content=[])
+        result = TrustedWorkflow(service).commit_candidate(dict(job_id=job["id"], drafts=drafts))
+        return dict(state="completed", result=result, content=[])
+
+    def _content(self, event):
+        service = self.service
+        scope, sources = event["scope"], event["sources"]
+        with service.operation(scope=scope, sources=sources, event=event) as db:
+            service._source_rows(db, sources, scope, reality=event["reality"])
+        authority = service.source_authority
+        request = dict(
+            schema_version=1,
+            request_id=new_id("extract-source"),
+            mode="snapshot",
+            selectors=[source_selector(source, scope) for source in sources],
+            turn_ids=[event["aggregate_id"]],
+            include_content=True,
+        )
+        snapshot = authority.transport.facts(request)
+        authority._relations("source_snapshot", request, snapshot)
+        access_request, access = authority._read_access(snapshot, None)
+        authority._relations(
+            "current_access", access_request, access, snapshot, utc(service.clock())
+        )
+        authority._relations("actor_event", event, snapshot["turns"][0], snapshot)
+        authority._relations("current_actor_sources", scope, sources, snapshot)
+        physicals = {canonical(p["key"]): p for p in snapshot["physicals"]}
+        result = []
+        for index, source in enumerate(sources):
+            data = physicals[canonical(source_selector(source, scope)["key"])]["content"]
+            text = "\n".join(p["text"] for p in data["parts"] if p["kind"] == "text")
+            result.append(dict(index=index, text=text, sent_at=data["sent_at"]))
+        require(len(canonical(result).encode()) <= 65536, "budget_exceeded", 413)
+        with service.operation(scope=scope, sources=sources, event=event) as db:
+            service._source_rows(db, sources, scope, reality=event["reality"])
+        return result
+
+    def _drafts(self, event, content, output):
+        require(type(output) is dict and set(output) == {"memories"}, "invalid_input", 400)
+        memories = output["memories"]
+        require(type(memories) is list and len(memories) <= 8, "invalid_input", 400)
+        drafts = []
+        for memory in memories:
+            require(
+                type(memory) is dict
+                and set(memory)
+                == {"statement", "conditions", "negations", "valid_time", "evidence"},
+                "invalid_input",
+                400,
+            )
+            for name in ("statement", "valid_time"):
+                require(
+                    type(memory[name]) is str and 0 < len(memory[name].strip()) <= 1200,
+                    "invalid_input",
+                    400,
+                )
+            for name in ("conditions", "negations"):
+                require(
+                    type(memory[name]) is list
+                    and len(memory[name]) <= 16
+                    and all(type(v) is str and 0 < len(v.strip()) <= 512 for v in memory[name]),
+                    "invalid_input",
+                    400,
+                )
+            evidence = memory["evidence"]
+            require(type(evidence) is list and 0 < len(evidence) <= 16, "invalid_input", 400)
+            indexes = set()
+            for proof in evidence:
+                require(
+                    type(proof) is dict and set(proof) == {"source_index", "quote"},
+                    "invalid_input",
+                    400,
+                )
+                index, quote = proof["source_index"], proof["quote"]
+                require(type(index) is int and 0 <= index < len(content), "invalid_input", 400)
+                require(
+                    type(quote) is str and bool(quote.strip()) and quote in content[index]["text"],
+                    "invalid_input",
+                    400,
+                )
+                indexes.add(index)
+            require(event["reality"] in {"real", "fictional"}, "invalid_input", 400)
+            unit = {k: memory[k] for k in ("statement", "conditions", "negations", "valid_time")}
+            unit.update(
+                uncertainty="inferred",
+                reality=event["reality"],
+                sources=[event["sources"][i] for i in sorted(indexes)],
+            )
+            drafts.append(
+                dict(
+                    scope=event["scope"],
+                    category="evidence",
+                    units=[unit],
+                    field_key="automatic." + fingerprint(memory["statement"]),
+                    item_key=None,
+                    relationship_delta=None,
+                )
+            )
+        return drafts

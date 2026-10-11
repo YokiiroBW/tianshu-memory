@@ -86,6 +86,11 @@ def create_app(
         raise ValueError("Invalid chat request limits")
     admission = Requests(max_active)
     app.state.chat_requests = admission
+    from .candidate_http import mount as mount_candidates
+
+    mount_candidates(
+        app, service, auth, admission, body_timeout=body_timeout, execute_timeout=execute_timeout
+    )
     app.state.memory = service
     from .relationships import Relationships
     from .relationships.http import mount as mount_relationships
