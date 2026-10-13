@@ -134,6 +134,41 @@ def commit(writer, db, draft, event, source_map):
         (scope, fact["key"], value_key),
     ).fetchall()
     duplicate = next((r for r in existing if service._group_current(db, r["group_id"])), None)
+    if (
+        duplicate is None
+        and fact["state"] == "current"
+        and not fact["valid_from"]
+        and not fact["valid_to"]
+    ):
+        # A new undated confirmation may reinforce an explicitly dated current fact.
+        # Retain that original interval and its evidence instead of erasing or splitting it.
+        for prior_row in db.execute(
+            "SELECT f.*,g.members FROM automatic_facts f JOIN groups g ON g.id=f.group_id "
+            "WHERE f.scope=? AND f.fact_key=? AND g.state='active' AND f.superseded_by IS NULL "
+            "ORDER BY f.observed_at DESC",
+            (scope, fact["key"]),
+        ).fetchall():
+            prior = json.loads(prior_row["payload"])
+            if (
+                prior["state"] != "current"
+                or (prior["valid_from"] and parse_time(prior["valid_from"]) > service.clock())
+                or (prior["valid_to"] and parse_time(prior["valid_to"]) <= service.clock())
+                or not service._group_current(db, prior_row["group_id"])
+            ):
+                continue
+            prior_record = db.execute(
+                "SELECT payload FROM records WHERE group_id=? AND state='active'",
+                (prior_row["group_id"],),
+            ).fetchone()
+            if (
+                prior_record
+                and _semantic(
+                    dict(prior, valid_from=None, valid_to=None), json.loads(prior_record[0])
+                )
+                == value_key
+            ):
+                duplicate = prior_row
+                break
     raw = {k: v for k, v in draft.items() if k not in {"fact", "observed_at", "quotes"}}
     if duplicate:
         group_id, ids = duplicate["group_id"], json.loads(duplicate["members"])

@@ -173,7 +173,9 @@ class CandidateExtraction:
                 )
             )
             if "fact" in memory:
-                fact = facts.validate(memory["fact"])
+                from .temporal_facts import sourced_times
+
+                fact = sourced_times(facts.validate(memory["fact"]), evidence, content)
                 # Scope/subject/reality come only from the authenticated source event.
                 require(event["reality"] == "real", "invalid_input", 400)
                 drafts[-1].update(

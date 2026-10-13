@@ -225,7 +225,7 @@ def test_past_and_expired_reports_do_not_replace_current_state(sync):
     assert {u["record_id"] for u in recall(sync, "我现在住哪")} == set(current["record_ids"])
     add(
         sync,
-        "过去出差去合肥，已经结束",
+        "过去出差去合肥，于2026年9月30日已经结束",
         "event.business_trip",
         second=3,
         state="historical",

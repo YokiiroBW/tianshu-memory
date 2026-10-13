@@ -136,13 +136,20 @@ def query_terms(value: str) -> list[str]:
         "you",
         "remember",
     }
+    # Remove complete question scaffolding before CJK bigrams are formed.
+    # Otherwise "我平常" and "我平时" match unrelated topics through "我平".
+    lexical_value = re.sub(r"(?:我|你|他|她)?(?:平常|平时|通常|常用|一般来说)", " ", value)
     topics = topic_tokens(value)
+    if "topic2" in topics or "工作室" in value or "工作坊" in value:
+        # Occupation already has a topic token; its raw bigram also occurs in studios.
+        scaffolding.update({"工作", "work", "job"})
     if topics and not re.search(r"(我的|本人|我自己|本人的)(名字|姓名)|my name", value.casefold()):
         # Naming a pet/company/topic is not a request for the speaker's own name.
         scaffolding.update({"名字", "姓名", "名称", "称呼", "name"})
     return list(
         dict.fromkeys(
-            [term for term in terms(value) if term not in CONTEXT_TERMS | scaffolding] + topics
+            [term for term in terms(lexical_value) if term not in CONTEXT_TERMS | scaffolding]
+            + topics
         )
     )[:64]
 

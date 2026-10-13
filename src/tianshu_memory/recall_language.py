@@ -22,6 +22,7 @@ TOPICS = (
     ("陶艺", "陶瓷", "捏陶", "拉坯", "pottery", "ceramics"),
     ("旅行", "旅游", "出差", "行程", "travel", "trip"),
     ("笔记", "备忘", "记事", "note", "notebook"),
+    ("软件", "工具", "应用", "software", "tool", "application", "app"),
 )
 
 
@@ -33,7 +34,11 @@ def topic_tokens(value):
             (
                 re.search(r"(?<![a-z])" + re.escape(alias) + r"(?![a-z])", lowered)
                 if alias.isascii()
-                else alias in lowered
+                else (
+                    re.search(r"工作(?!室|坊|台|间|服|证|餐)", lowered)
+                    if alias == "工作"
+                    else alias in lowered
+                )
             )
             for alias in aliases
         ):
