@@ -22,7 +22,17 @@ TOPICS = (
     ("陶艺", "陶瓷", "捏陶", "拉坯", "pottery", "ceramics"),
     ("旅行", "旅游", "出差", "行程", "travel", "trip"),
     ("笔记", "备忘", "记事", "note", "notebook"),
-    ("软件", "工具", "应用", "software", "tool", "application", "app"),
+    (
+        "软件",
+        "工具",
+        "应用",
+        "编程语言",
+        "software",
+        "tool",
+        "application",
+        "app",
+        "programming language",
+    ),
 )
 
 

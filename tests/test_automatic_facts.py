@@ -40,6 +40,7 @@ def add(
     valid_from=None,
     valid_to=None,
     valid_time=None,
+    keywords=None,
     conditions=(),
     negations=(),
     explicit=False,
@@ -157,7 +158,7 @@ def add(
                     state=state,
                     valid_from=valid_from,
                     valid_to=valid_to,
-                    keywords=[key, text[:20]],
+                    keywords=keywords if keywords is not None else [key, text[:20]],
                 ),
             )
         ]

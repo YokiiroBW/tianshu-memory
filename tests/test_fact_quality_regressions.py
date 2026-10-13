@@ -155,3 +155,35 @@ def test_unspecified_time_preserves_sourced_fact_without_invented_dates(sync, va
 
     replay = sync.post(PATH, dict(job_id=job, output=None))
     assert replay.json()["result"] == written
+
+
+def test_preference_and_duration_scaffolding_does_not_recall_unrelated_topics(sync):
+    initialize(sync)
+    coffee, _ = add(sync, "我的长期习惯是晚上不喝咖啡", "beverage.coffee")
+    tea, _ = add(sync, "我喜欢白茶", "beverage.tea", second=2)
+    pottery, _ = add(sync, "我长期喜欢做陶艺", "hobby.pottery", second=3)
+    assert recall(sync, "今天只是临时心烦，不是我的长期性格") == []
+    assert recall(sync, "我喜欢香菜，但不吃生葱") == []
+    assert {u["record_id"] for u in recall(sync, "我长期喜欢的陶艺活动")} == set(
+        pottery["record_ids"]
+    )
+    assert {u["record_id"] for u in recall(sync, "我平常喝什么咖啡")} == set(coffee["record_ids"])
+    assert {u["record_id"] for u in recall(sync, "我喜欢什么茶")} == set(tea["record_ids"])
+
+
+@pytest.mark.parametrize("language", ["Rust", "Lua"])
+def test_tool_recall_includes_sourced_programming_language_predicates(sync, language):
+    initialize(sync)
+    job, _ = add(sync, "我的职业是后端工程师", "occupation", "后端工程师")
+    tool, _ = add(
+        sync,
+        f"我平常用 {language}",
+        "language." + language.lower(),
+        "平常使用 " + language,
+        second=2,
+        keywords=[language, "编程语言", "常用", "后端开发"],
+    )
+    add(sync, "我喜欢白茶", "beverage.tea", second=3)
+    assert {u["record_id"] for u in recall(sync, "我主要做什么工作、常用什么工具？")} == set(
+        job["record_ids"] + tool["record_ids"]
+    )

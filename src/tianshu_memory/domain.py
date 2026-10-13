@@ -135,10 +135,19 @@ def query_terms(value: str) -> list[str]:
         "does",
         "you",
         "remember",
+        "like",
+        "prefer",
+        "usually",
+        "normally",
+        "currently",
     }
     # Remove complete question scaffolding before CJK bigrams are formed.
     # Otherwise "我平常" and "我平时" match unrelated topics through "我平".
-    lexical_value = re.sub(r"(?:我|你|他|她)?(?:平常|平时|通常|常用|一般来说)", " ", value)
+    lexical_value = re.sub(
+        r"(?:我|你|他|她)?(?:平常|平时|通常|常用|一般来说|长期|短期|目前|喜欢|喜爱|偏爱)",
+        " ",
+        value,
+    )
     topics = topic_tokens(value)
     if "topic2" in topics or "工作室" in value or "工作坊" in value:
         # Occupation already has a topic token; its raw bigram also occurs in studios.
