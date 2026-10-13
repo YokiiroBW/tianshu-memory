@@ -9,6 +9,7 @@ import re
 import unicodedata
 
 from .domain import fingerprint, require
+from .recall_language import topic_aliases
 
 
 def normalize_mention(value):
@@ -44,6 +45,8 @@ def compatible(left, right):
     nouns = [
         re.sub(r"第[0-9]+(?:只|支|个|本|张|台|辆|件)?", "", label) for _, label in (left, right)
     ]
+    if not all(nouns):
+        return True
     return any(len(short) == 1 and long.endswith(short) for short, long in (nouns, nouns[::-1]))
 
 
@@ -78,6 +81,13 @@ def resolve(service, db, scope, fact, quotes):
     if entity is None:
         return fact
     require(any(entity["mention"] in q["quote"] for q in quotes), "invalid_input", 400)
+    if re.fullmatch(
+        r"第[一二三四五六七八九十百零两0-9]+(?:只|支|个|本|张|台|辆|件)?",
+        normalize_mention(entity["mention"]),
+    ):
+        # An ordinal-only reference may reuse a uniquely matching server identity;
+        # it cannot establish a new object without a sourced distinguishing noun.
+        require(entity["id"] is not None, "invalid_input", 400)
     objects = {}
     for row in db.execute("SELECT group_id,payload FROM automatic_facts WHERE scope=?", (scope,)):
         prior = json.loads(row["payload"]).get("entity")
@@ -125,28 +135,24 @@ def filter_targets(db, candidates, query):
             by_group[group["id"]] = entity
             objects.setdefault(entity["kind"], []).append(entity)
     wanted = {}
-    query_ordinals = {
-        ordinal(match[0])
-        for match in re.finditer(
-            r"第[一二三四五六七八九十百零两0-9]+(?:只|支|个|本|张|台|辆|件)?", query
-        )
-    }
+    number = r"第[一二三四五六七八九十百零两0-9]+(?:只|支|个|本|张|台|辆|件)?"
     for kind, entities in objects.items():
         direct = {e["id"] for e in entities if normalize_mention(e["mention"]) in normalized}
-        if direct:
+        numbered = False
+        for entity in entities:
+            noun = re.sub(number, "", normalize_mention(entity["mention"]))
+            label = noun or entity["kind"]
+            aliases = {normalize_mention(alias) for alias in {label, *topic_aliases(label)}}
+            pattern = number + "(?:" + "|".join(re.escape(alias) for alias in sorted(aliases)) + ")"
+            positions = {ordinal(match[0]) for match in re.finditer(pattern, normalized)}
+            if positions:
+                numbered = True
+                if ordinal(entity["mention"]) in positions:
+                    direct.add(entity["id"])
+        # Bind each ordinal to its following noun; unrelated numbered objects must
+        # not widen this target. Unknown positions deliberately select no object.
+        if direct or numbered:
             wanted[kind] = direct
-            continue
-        # A numbered request must not fall back to another numbered item of the same kind.
-        nouns = {
-            re.sub(
-                r"第[一二三四五六七八九十百零两0-9]+(?:只|支|个|本|张|台|辆|件)?",
-                "",
-                normalize_mention(e["mention"]),
-            )
-            for e in entities
-        }
-        if query_ordinals and any(noun and noun in normalized for noun in nouns):
-            wanted[kind] = {e["id"] for e in entities if ordinal(e["mention"]) in query_ordinals}
     return [
         entry
         for entry in candidates

@@ -201,3 +201,92 @@ def test_quoted_replacement_retrieves_old_target_before_background_update(sync):
     )
     assert recall(sync, "哪本笔记本叫《夜航》") == []
     assert {u["record_id"] for u in recall(sync, "第一本笔记本叫什么")} == set(first["record_ids"])
+
+
+def test_numbered_recall_aliases_keep_ordinals_with_their_objects(sync):
+    initialize(sync)
+    first, _ = add(
+        sync,
+        "第一本笔记本标题是《晨光》",
+        "notebook.title",
+        "晨光",
+        entity=entity("第一本笔记本", kind="notebook"),
+    )
+    second, _ = add(
+        sync,
+        "第二本笔记本标题是《暮色》",
+        "notebook.title",
+        "暮色",
+        second=2,
+        entity=entity("第二本笔记本", kind="notebook"),
+    )
+    cat, _ = add(
+        sync,
+        "第一只猫叫团团",
+        "cat.name",
+        "团团",
+        second=3,
+        entity=entity("第一只猫", kind="cat"),
+    )
+    assert {u["record_id"] for u in recall(sync, "只告诉我第二本笔记的标题。")} == set(
+        second["record_ids"]
+    )
+    assert recall(sync, "第三本笔记的标题是什么") == []
+    assert {u["record_id"] for u in recall(sync, "第二本笔记的标题、第一只猫的名字")} == set(
+        second["record_ids"] + cat["record_ids"]
+    )
+    assert {u["record_id"] for u in recall(sync, "第一本笔记本、第二本笔记的标题")} == set(
+        first["record_ids"] + second["record_ids"]
+    )
+
+
+def test_ordinal_only_reference_requires_unique_existing_sourced_identity(sync):
+    initialize(sync)
+    first, _ = add(
+        sync,
+        "第一本笔记本标题是《晨光》",
+        "notebook.title",
+        "晨光",
+        entity=entity("第一本笔记本", kind="notebook"),
+    )
+    one = saved_entity(sync, first)
+    short = entity("第一本", one["id"], kind="notebook")
+    repeated, _ = add(sync, "第一本还是《晨光》", "notebook.title", "晨光", second=2, entity=short)
+    assert repeated["record_ids"] == first["record_ids"]
+    changed, _ = add(sync, "第一本改叫《暮色》", "notebook.title", "暮色", second=3, entity=short)
+    assert saved_entity(sync, changed)["id"] == one["id"]
+    assert {u["record_id"] for u in recall(sync, "第一本笔记的标题")} == set(changed["record_ids"])
+    assert recall(sync, "第三本笔记叫什么") == []
+    add(
+        sync,
+        "第二本叫《夜航》",
+        "notebook.title",
+        "夜航",
+        second=4,
+        entity=entity("第二本", kind="notebook"),
+        expected_status=400,
+    )
+    add(
+        sync,
+        "第二本叫《夜航》",
+        "notebook.title",
+        "夜航",
+        second=5,
+        entity=entity("第二本", one["id"], kind="notebook"),
+        expected_status=400,
+    )
+
+
+def test_ordinal_only_reference_cannot_choose_between_numbered_subtypes(sync):
+    initialize(sync)
+    one, _ = add(sync, "第一支钢笔用蓝墨水", "pen.ink", "蓝色", entity=entity("第一支钢笔"))
+    add(sync, "第一支圆珠笔用黑墨水", "pen.ink", "黑色", second=2, entity=entity("第一支圆珠笔"))
+    add(
+        sync,
+        "第一支改用红墨水",
+        "pen.ink",
+        "红色",
+        second=3,
+        entity=entity("第一支", saved_entity(sync, one)["id"]),
+        expected_status=400,
+    )

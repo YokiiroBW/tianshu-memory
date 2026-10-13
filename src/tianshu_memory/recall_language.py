@@ -123,6 +123,17 @@ def topic_tokens(value):
     return result
 
 
+def topic_aliases(value):
+    """Return the existing lexical aliases for an explicitly mentioned topic."""
+    topics = set(topic_tokens(value))
+    return {
+        alias
+        for index, aliases in enumerate(TOPICS)
+        if f"topic{index}" in topics
+        for alias in aliases
+    }
+
+
 # Query-side literal expansion also works with indexes created before these aliases
 # existed. It never changes stored facts or adds a value absent from their sources.
 QUERY_ALIASES = (
