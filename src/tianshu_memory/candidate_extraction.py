@@ -124,12 +124,16 @@ class CandidateExtraction:
                 "invalid_input",
                 400,
             )
-            for name in ("statement", "valid_time"):
-                require(
-                    type(memory[name]) is str and 0 < len(memory[name].strip()) <= 1200,
-                    "invalid_input",
-                    400,
-                )
+            require(
+                type(memory["statement"]) is str and 0 < len(memory["statement"].strip()) <= 1200,
+                "invalid_input",
+                400,
+            )
+            require(
+                type(memory["valid_time"]) is str and len(memory["valid_time"]) <= 1200,
+                "invalid_input",
+                400,
+            )
             for name in ("conditions", "negations"):
                 require(
                     type(memory[name]) is list
@@ -157,6 +161,9 @@ class CandidateExtraction:
                 indexes.add(index)
             require(event["reality"] in {"real", "fictional"}, "invalid_input", 400)
             unit = {k: memory[k] for k in ("statement", "conditions", "negations", "valid_time")}
+            # Unknown timing is not an invalid fact or a claim of current validity.
+            # Keep the published nonempty label without inventing an effective date.
+            unit["valid_time"] = memory["valid_time"].strip() or "未说明有效时间"
             unit.update(
                 uncertainty="inferred",
                 reality=event["reality"],

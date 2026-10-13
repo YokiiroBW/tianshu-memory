@@ -39,6 +39,7 @@ def add(
     state="current",
     valid_from=None,
     valid_to=None,
+    valid_time=None,
     conditions=(),
     negations=(),
     explicit=False,
@@ -146,7 +147,9 @@ def add(
                 statement=text,
                 conditions=list(conditions),
                 negations=list(negations),
-                valid_time="当前" if state == "current" else "过去",
+                valid_time=valid_time
+                if valid_time is not None
+                else ("当前" if state == "current" else "过去"),
                 evidence=[dict(source_index=0, quote=text)],
                 fact=dict(
                     key=key,

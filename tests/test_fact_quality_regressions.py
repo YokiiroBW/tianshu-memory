@@ -138,3 +138,20 @@ def test_same_value_with_different_negation_is_not_a_duplicate(sync):
         sync, "我早上不喝红茶", "beverage.tea", "红茶", second=2, negations=["早上不喝"]
     )
     assert first["record_ids"] != repeated["record_ids"]
+
+
+@pytest.mark.parametrize("valid_time", ["", "   "])
+def test_unspecified_time_preserves_sourced_fact_without_invented_dates(sync, valid_time):
+    initialize(sync)
+    written, job = add(sync, "我养的猫叫米糕", "pet.cat.name", "米糕", valid_time=valid_time)
+    units = recall(sync, "我的猫叫什么")
+    assert {u["record_id"] for u in units} == set(written["record_ids"])
+    assert units[0]["valid_time"] == "未说明有效时间"
+    assert units[0]["sources"]
+    with sync.store.transaction() as db:
+        fact = json.loads(db.execute("SELECT payload FROM automatic_facts").fetchone()[0])
+        assert fact["valid_from"] is None and fact["valid_to"] is None
+    from test_candidate_extraction import PATH
+
+    replay = sync.post(PATH, dict(job_id=job, output=None))
+    assert replay.json()["result"] == written

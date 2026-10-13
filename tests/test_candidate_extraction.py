@@ -101,6 +101,8 @@ def test_source_revocation_between_prepare_and_commit_blocks_memory(sync):
     [
         {"scope": {}},
         {"statement": ""},
+        {"valid_time": None},
+        {"valid_time": 0},
         {"evidence": [{"source_index": 999, "quote": TEXT}]},
         {"evidence": [{"source_index": True, "quote": TEXT}]},
         {"evidence": [{"source_index": 0, "quote": "不存在的原文"}]},
