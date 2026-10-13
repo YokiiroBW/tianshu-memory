@@ -17,6 +17,10 @@ class LocalUserApplication:
         from .workflow import TrustedWorkflow
 
         require(isinstance(action, dict), "invalid_input", 400)
+        if action.get("operation") == "prepare_evidence_profile":
+            from .profile_evidence import prepare
+
+            return prepare(self, action, principal, credential)
         approval = LocalUserApproval(self.service, self.config_path, principal, credential, action)
         workflow = TrustedWorkflow(self.service, approval, approval)
         if action["operation"] == "confirm_revision":

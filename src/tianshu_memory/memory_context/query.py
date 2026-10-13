@@ -179,6 +179,9 @@ def execute(application, request, context):
                     continue
                 if service._projections_current(db, units):
                     candidates.append((group, records, units))
+        from ..automatic_facts import filter_current
+
+        candidates = filter_current(db, candidates, request["query_text"], service.clock)
         lexical = service._rank_groups(db, candidates, search_terms) if not exact else candidates
         remote_rank = settings is not None and not exact
         if not remote_rank:

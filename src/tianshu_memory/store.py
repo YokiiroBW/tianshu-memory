@@ -204,6 +204,11 @@ class Store:
 
         return migrate(self, backup_path)
 
+    def migrate_facts(self, backup_path):
+        from .fact_migration import migrate
+
+        return migrate(self, backup_path)
+
     def migrate_context(self, backup_path):
         from .memory_context.migration import migrate
 

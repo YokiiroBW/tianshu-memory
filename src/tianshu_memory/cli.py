@@ -76,6 +76,10 @@ def main():
         "migrate-qq-aliases", help="Stop writers; add guarded QQ display names with backup"
     )
     migrate_qq.add_argument("--backup", required=True)
+    migrate_facts = sub.add_parser(
+        "migrate-facts", help="Stop writers; add sourced fact identity with a guarded backup"
+    )
+    migrate_facts.add_argument("--backup", required=True)
     sub.add_parser("jobs")
     sub.add_parser("rebuild-index")
     sub.add_parser("outbox")
@@ -111,6 +115,7 @@ def run_local_operation(args, parser):
         "migrate-qq-aliases",
         "migrate-observations",
         "migrate-source-lookup",
+        "migrate-facts",
     }:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
         store = Store(
@@ -129,6 +134,8 @@ def run_local_operation(args, parser):
             result = store.migrate_source_lookup(args.backup)
         elif args.operation == "migrate-users":
             result = store.migrate_users(args.backup)
+        elif args.operation == "migrate-facts":
+            result = store.migrate_facts(args.backup)
         elif args.operation == "migrate-context":
             result = store.migrate_context(args.backup)
         elif args.operation == "migrate-qq-aliases":

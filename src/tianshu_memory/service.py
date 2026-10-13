@@ -434,6 +434,9 @@ class MemoryService:
                 if not self._projections_current(db, units):
                     continue
                 eligible.append((group, rows, units))
+            from .automatic_facts import filter_current
+
+            eligible = filter_current(db, eligible, request["query_text"], self.clock)
             lexical = self._rank_groups(db, eligible, search_terms) if not exact else eligible
             if exact or settings is None:
                 response.update(self._fit_groups(lexical, request["budget"]))

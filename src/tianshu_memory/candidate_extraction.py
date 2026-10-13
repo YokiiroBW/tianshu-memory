@@ -2,7 +2,9 @@
 
 import json
 
-from .domain import Fault, canonical, fingerprint, new_id, require, source_selector, utc
+from . import automatic_facts as facts
+from .domain import Fault, canonical, fingerprint, new_id, parse_time, require, source_selector, utc
+from .memory_context.migration import installed as context_installed
 from .workflow import TrustedWorkflow
 
 
@@ -41,14 +43,20 @@ class CandidateExtraction:
                 return dict(state="invalidated", result=None, content=[])
         content = self._content(event)
         if request["output"] is None:
-            return dict(state="pending", result=None, content=content)
+            with service.operation(scope=scope, sources=event["sources"], event=event) as db:
+                hints = facts.known(service, db, scope)
+                version = 2 if facts.installed(db) else 1
+            result = dict(state="pending", result=None, content=content)
+            if version == 2:
+                result.update(extraction_schema=2, known_facts=hints)
+            return result
         try:
             drafts = self._drafts(event, content, request["output"])
         except Fault as error:
             if error.code != "invalid_input":
                 raise
             return dict(state="rejected", result={"error_code": "invalid_input"}, content=[])
-        result = TrustedWorkflow(service).commit_candidate(dict(job_id=job["id"], drafts=drafts))
+        result = TrustedWorkflow(service).commit_extracted(dict(job_id=job["id"], drafts=drafts))
         return dict(state="completed", result=result, content=[])
 
     def _content(self, event):
@@ -81,7 +89,23 @@ class CandidateExtraction:
             result.append(dict(index=index, text=text, sent_at=data["sent_at"]))
         require(len(canonical(result).encode()) <= 65536, "budget_exceeded", 413)
         with service.operation(scope=scope, sources=sources, event=event) as db:
-            service._source_rows(db, sources, scope, reality=event["reality"])
+            rows = service._source_rows(db, sources, scope, reality=event["reality"])
+            if context_installed(db):
+                covered = {
+                    row["key"]
+                    for row in rows
+                    if db.execute(
+                        "SELECT 1 FROM context_applications WHERE source_key=? AND revision=? "
+                        "AND scope=? LIMIT 1",
+                        (row["key"], row["revision"], canonical(scope)),
+                    ).fetchone()
+                }
+                # An explicit committed tool action owns its exact source revision. Never
+                # create a second inferred copy, including after the explicit record is forgotten.
+                # Other source messages in this aggregate remain eligible for extraction.
+                for index, source in enumerate(sources):
+                    if service.source_identity(source, scope) in covered:
+                        result[index]["text"] = ""
         return result
 
     def _drafts(self, event, content, output):
@@ -93,7 +117,10 @@ class CandidateExtraction:
             require(
                 type(memory) is dict
                 and set(memory)
-                == {"statement", "conditions", "negations", "valid_time", "evidence"},
+                in (
+                    {"statement", "conditions", "negations", "valid_time", "evidence"},
+                    {"statement", "conditions", "negations", "valid_time", "evidence", "fact"},
+                ),
                 "invalid_input",
                 400,
             )
@@ -145,4 +172,27 @@ class CandidateExtraction:
                     relationship_delta=None,
                 )
             )
+            if "fact" in memory:
+                fact = facts.validate(memory["fact"])
+                # Scope/subject/reality come only from the authenticated source event.
+                require(event["reality"] == "real", "invalid_input", 400)
+                drafts[-1].update(
+                    fact=fact,
+                    field_key="automatic." + fact["key"],
+                    item_key=None,
+                    observed_at=max((content[i]["sent_at"] for i in indexes), key=parse_time),
+                    quotes=[
+                        dict(
+                            source_key=self.service.source_identity(
+                                event["sources"][proof["source_index"]], event["scope"]
+                            ),
+                            quote=proof["quote"],
+                        )
+                        for proof in evidence
+                    ],
+                )
+                if fact["state"] == "historical":
+                    unit["valid_time"] = "历史事实，不能据此认定仍然有效：" + unit["valid_time"]
+                if fact["valid_to"]:
+                    unit["valid_time"] += "；有效期截止 " + fact["valid_to"]
         return drafts

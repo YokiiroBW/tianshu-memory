@@ -156,6 +156,13 @@ class _WorkflowBase:
             return result
 
     def _write_group(self, db, draft, event, source_map):
+        if "fact" in draft:
+            from .automatic_facts import commit
+
+            return commit(self, db, draft, event, source_map)
+        return self._write_raw_group(db, draft, event, source_map)
+
+    def _write_raw_group(self, db, draft, event, source_map):
         require(
             set(draft)
             <= {"scope", "category", "field_key", "item_key", "units", "relationship_delta"},
@@ -273,6 +280,9 @@ class _WorkflowBase:
         self._index(db, unit, scope, field, item)
 
     def _index(self, db, unit, scope, field, item):
+        from .automatic_facts import index_text
+        from .recall_language import topic_tokens
+
         text = " ".join(
             [
                 unit["statement"],
@@ -289,7 +299,10 @@ class _WorkflowBase:
                 unit["record_id"],
                 unit["record_version"],
                 canonical(scope),
-                " ".join(terms(text)),
+                " ".join(
+                    terms(text + " " + index_text(db, unit))
+                    + topic_tokens(text + " " + index_text(db, unit))
+                ),
             ),
         )
 
@@ -541,6 +554,21 @@ class TrustedWorkflow(_WorkflowBase):
 
     def commit_candidate(self, input):
         self.service.contracts.validate("sync-workflow#candidate_commit", input)
+        result = self._commit_candidate(input["job_id"], input["drafts"], exact_scope=True)
+        self.service.contracts.validate("sync-workflow#candidate_result", result)
+        return result
+
+    def commit_extracted(self, input):
+        # The published write envelope is unchanged. The paired extractor supplies only
+        # internal derived metadata alongside the validated sourced semantic units.
+        portable = dict(
+            job_id=input["job_id"],
+            drafts=[
+                {k: v for k, v in draft.items() if k not in {"fact", "observed_at", "quotes"}}
+                for draft in input["drafts"]
+            ],
+        )
+        self.service.contracts.validate("sync-workflow#candidate_commit", portable)
         result = self._commit_candidate(input["job_id"], input["drafts"], exact_scope=True)
         self.service.contracts.validate("sync-workflow#candidate_result", result)
         return result

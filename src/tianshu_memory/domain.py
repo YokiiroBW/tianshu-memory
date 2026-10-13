@@ -93,7 +93,58 @@ CONTEXT_TERMS = frozenset(
 
 
 def query_terms(value: str) -> list[str]:
-    return [term for term in terms(value) if term not in CONTEXT_TERMS][:64]
+    from .recall_language import topic_tokens
+
+    scaffolding = {
+        "我的",
+        "你的",
+        "我是",
+        "我在",
+        "用户",
+        "自己",
+        "记得",
+        "记住",
+        "知道",
+        "告诉",
+        "一下",
+        "关于",
+        "之前",
+        "以前",
+        "还是",
+        "不是",
+        "哪些",
+        "几个",
+        "给我",
+        "是什么",
+        "的事",
+        "情况",
+        "相关",
+        "what",
+        "where",
+        "when",
+        "who",
+        "how",
+        "my",
+        "me",
+        "i",
+        "the",
+        "a",
+        "user",
+        "is",
+        "do",
+        "does",
+        "you",
+        "remember",
+    }
+    topics = topic_tokens(value)
+    if topics and not re.search(r"(我的|本人|我自己|本人的)(名字|姓名)|my name", value.casefold()):
+        # Naming a pet/company/topic is not a request for the speaker's own name.
+        scaffolding.update({"名字", "姓名", "名称", "称呼", "name"})
+    return list(
+        dict.fromkeys(
+            [term for term in terms(value) if term not in CONTEXT_TERMS | scaffolding] + topics
+        )
+    )[:64]
 
 
 class Fault(Exception):
