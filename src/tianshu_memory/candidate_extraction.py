@@ -45,10 +45,10 @@ class CandidateExtraction:
         if request["output"] is None:
             with service.operation(scope=scope, sources=event["sources"], event=event) as db:
                 hints = facts.known(service, db, scope)
-                version = 2 if facts.installed(db) else 1
+                version = 3 if facts.installed(db) else 1
             result = dict(state="pending", result=None, content=content)
-            if version == 2:
-                result.update(extraction_schema=2, known_facts=hints)
+            if version == 3:
+                result.update(extraction_schema=3, known_facts=hints)
             return result
         try:
             drafts = self._drafts(event, content, request["output"])

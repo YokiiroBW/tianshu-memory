@@ -44,6 +44,8 @@ def add(
     conditions=(),
     negations=(),
     explicit=False,
+    entity=None,
+    expected_status=200,
 ):
     physical, admission, grant = [
         copy.deepcopy(items[0]) for items in (h.physicals, h.admissions, h.grants)
@@ -141,7 +143,7 @@ def add(
     job = response.json()["candidate_job_ref"]
     pending = h.post(PATH, dict(job_id=job, output=None))
     assert pending.status_code == 200, pending.text
-    assert pending.json()["extraction_schema"] == 2
+    assert pending.json()["extraction_schema"] == 3
     proposed = dict(
         memories=[
             dict(
@@ -163,8 +165,12 @@ def add(
             )
         ]
     )
+    if entity is not None:
+        proposed["memories"][0]["fact"]["entity"] = entity
     committed = h.post(PATH, dict(job_id=job, output=proposed))
-    assert committed.status_code == 200, committed.text
+    assert committed.status_code == expected_status, committed.text
+    if expected_status != 200:
+        return committed.json(), job
     assert committed.json()["state"] == "completed", committed.text
     return committed.json()["result"], job
 

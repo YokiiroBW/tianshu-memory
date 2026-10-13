@@ -2,6 +2,73 @@
 
 import re
 
+
+def clean_query(value):
+    """Remove operation wording outside quoted titles, retaining the requested content."""
+    parts = re.split(r'([“「《"].*?[”」》"])', value)
+    for index in range(0, len(parts), 2):
+        text = re.sub(
+            r"(?:请|帮我|替我|现在)?(?:调用|使用|用一下|用)?(?:显式)?(?:记忆|memory\s+)工具",
+            " ",
+            parts[index],
+            flags=re.I,
+        )
+        parts[index] = re.sub(
+            r"(?:没有|并未|并没有|未曾)(?:再)?(?:变化|改变)|"
+            r"(?:和|跟)(?:以前|之前|原来)一样|(?:请|帮我|替我)(?:记住|记下|更正|忘掉|忘记|查一下)",
+            " ",
+            text,
+        )
+    return "".join(parts)
+
+
+def query_focus(value):
+    """An explicit possessive/object question supplies stronger anchors than its preamble."""
+    ending = r"(?=(?:存放在|放在|放|在)?哪|叫什么|叫啥|用什么|使用什么|是什么|的(?:位置|名字|名称)|位置|[？?])"
+    owned = re.search(r"(?:我的|我家(?:的)?|我那)(.+?)" + ending, value)
+    if owned:
+        return owned[1].strip()
+    body = re.split(r"[：:，,]", value)[-1].strip()
+    body = re.sub(r"^(?:(?:请|帮我|替我|记住|记下|更正|忘掉|忘记|查一下|查询)\s*)+", "", body)
+    # An activity such as "我写手账" is not the name of the requested instrument.
+    # Explicit possessives were handled above; preserve query aliases for activities.
+    if body.startswith(("我", "你", "他", "她")):
+        return None
+    target = re.match(r"(.+?)(?:的位置|位置|在哪里|在哪|用什么|叫什么|叫啥)", body)
+    return re.sub(r"^(?:我|你|他|她)", "", target[1].strip()) if target else None
+
+
+def correction_target(value):
+    body = re.sub(r"^(?:我的|我家(?:的)?|本人的)", "", value.strip())
+    target = re.match(
+        r"(?![我你他她])(.+?)的(?:标题|名字|名称|颜色|位置|墨水)"
+        r"(?:更正为|改为|改成|调整为)",
+        body,
+    )
+    return target[1] if target else None
+
+
+def query_clauses(value):
+    clauses = [""]
+    for index, part in enumerate(re.split(r'([“「《"].*?[”」》"])', clean_query(value))):
+        if index % 2:
+            clauses[-1] += part
+            continue
+        pieces = re.split(r"[，,。；;！？!?、\n]|\b(?:and|also)\b", part)
+        clauses[-1] += pieces[0]
+        clauses.extend(pieces[1:])
+    return [clause.strip() for clause in clauses if clause.strip()]
+
+
+def topic_family(tokens):
+    result = set(tokens)
+    if result.intersection({"topic11", "topic12"}):
+        result.add("topic10")
+    if result.intersection({"topic5", "topic6"}):
+        result.add("topic4")
+    return result
+
+
 # General retrieval vocabulary, not user facts. Index and query use the same normalization.
 TOPICS = (
     ("居住", "住址", "住在", "住所", "住哪", "搬家", "家在哪", "residence", "address", "live"),

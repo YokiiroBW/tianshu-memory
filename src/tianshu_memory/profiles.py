@@ -250,6 +250,6 @@ def select(service, request, context):
                     service.contracts.validate("profiles#unit", unit)
             eligible.append((group, rows, units))
         if not exact:
-            eligible = service._rank_groups(db, eligible, search_terms)
+            eligible = service._rank_groups(db, eligible, search_terms, request["query_text"])
         response.update(service._fit_groups(eligible, request["budget"]))
         return response

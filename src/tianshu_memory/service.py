@@ -437,7 +437,11 @@ class MemoryService:
             from .automatic_facts import filter_current
 
             eligible = filter_current(db, eligible, request["query_text"], self.clock)
-            lexical = self._rank_groups(db, eligible, search_terms) if not exact else eligible
+            lexical = (
+                self._rank_groups(db, eligible, search_terms, request["query_text"])
+                if not exact
+                else eligible
+            )
             if exact or settings is None:
                 response.update(self._fit_groups(lexical, request["budget"]))
                 return response
@@ -480,7 +484,9 @@ class MemoryService:
                 409,
             )
 
-    def _rank_groups(self, db, eligible, search_terms):
+    def _rank_groups(self, db, eligible, search_terms, query):
+        from .recall_relevance import admits
+
         # One FTS document per complete authorized group: qualifiers/members contribute
         # to relevance together. Neither private nor stale rows influence corpus scores.
         if not search_terms:
@@ -505,6 +511,8 @@ class MemoryService:
             "SELECT group_id,text,bm25(allowed_search) AS relevance FROM temp.allowed_search WHERE allowed_search MATCH ?",
             (expression,),
         ):
+            if not admits(query, set(match["text"].split())):
+                continue
             coverage = len(set(search_terms).intersection(match["text"].split()))
             matches[match["group_id"]] = (-coverage, match["relevance"], match["group_id"])
         eligible = sorted(

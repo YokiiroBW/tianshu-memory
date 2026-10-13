@@ -8,6 +8,7 @@ import json
 import re
 import unicodedata
 
+from . import fact_entities
 from .domain import canonical, fingerprint, parse_time, require
 from .fact_migration import installed
 
@@ -19,7 +20,10 @@ def normalize(value):
 
 
 def validate(value):
-    require(type(value) is dict and set(value) == FIELDS, "invalid_input", 400)
+    require(
+        type(value) is dict and set(value) in (FIELDS, FIELDS | {"entity"}), "invalid_input", 400
+    )
+    fact_entities.validate(value.get("entity"))
     require(
         type(value["key"]) is str and re.fullmatch(r"[a-z][a-z0-9_.-]{0,119}", value["key"]),
         "invalid_input",
@@ -125,13 +129,15 @@ def commit(writer, db, draft, event, source_map):
     unit = draft["units"][0]
     value_key = _semantic(fact, unit)
     scope = canonical(draft["scope"])
+    fact = fact_entities.resolve(service, db, scope, fact, draft["quotes"])
+    identity_key = fact_entities.fact_key(fact)
     observed = draft["observed_at"]
     require(parse_time(observed).tzinfo is not None, "invalid_input", 400)
     existing = db.execute(
         "SELECT f.*,g.members FROM automatic_facts f JOIN groups g ON g.id=f.group_id "
         "WHERE f.scope=? AND f.fact_key=? AND f.value_key=? AND g.state='active' "
         "AND f.superseded_by IS NULL ORDER BY f.observed_at DESC",
-        (scope, fact["key"], value_key),
+        (scope, identity_key, value_key),
     ).fetchall()
     duplicate = next((r for r in existing if service._group_current(db, r["group_id"])), None)
     if (
@@ -146,7 +152,7 @@ def commit(writer, db, draft, event, source_map):
             "SELECT f.*,g.members FROM automatic_facts f JOIN groups g ON g.id=f.group_id "
             "WHERE f.scope=? AND f.fact_key=? AND g.state='active' AND f.superseded_by IS NULL "
             "ORDER BY f.observed_at DESC",
-            (scope, fact["key"]),
+            (scope, identity_key),
         ).fetchall():
             prior = json.loads(prior_row["payload"])
             if (
@@ -202,7 +208,7 @@ def commit(writer, db, draft, event, source_map):
         group_id, ids = writer._write_raw_group(db, raw, event, source_map)
         db.execute(
             "INSERT INTO automatic_facts VALUES (?,?,?,?,?,?,NULL)",
-            (group_id, scope, fact["key"], value_key, observed, canonical(fact)),
+            (group_id, scope, identity_key, value_key, observed, canonical(fact)),
         )
     for quote in draft["quotes"]:
         require(quote["source_key"] in source_map, "invalid_input", 400)
@@ -232,7 +238,7 @@ def commit(writer, db, draft, event, source_map):
         previous = db.execute(
             "SELECT * FROM automatic_facts WHERE scope=? AND fact_key=? "
             "AND group_id!=? AND superseded_by IS NULL",
-            (scope, fact["key"], group_id),
+            (scope, identity_key, group_id),
         ).fetchall()
         for old in previous:
             prior = json.loads(old["payload"])
@@ -276,7 +282,8 @@ def index_text(db, unit):
             (group_id,),
         )
     ]
-    return " ".join([fact["key"], fact["value"], *fact["keywords"], *quotes])
+    mention = fact["entity"]["mention"] if fact.get("entity") else ""
+    return " ".join([fact["key"], fact["value"], mention, *fact["keywords"], *quotes])
 
 
 def filter_current(db, candidates, query, clock):
@@ -323,4 +330,4 @@ def filter_current(db, candidates, query, clock):
             ):
                 continue
         result.append(entry)
-    return result
+    return fact_entities.filter_targets(db, result, query)

@@ -93,7 +93,9 @@ CONTEXT_TERMS = frozenset(
 
 
 def query_terms(value: str) -> list[str]:
-    from .recall_language import query_aliases, topic_tokens
+    from .recall_language import clean_query, query_aliases, topic_tokens
+
+    value = clean_query(value)
 
     scaffolding = {
         "我的",
@@ -142,6 +144,10 @@ def query_terms(value: str) -> list[str]:
         "currently",
     }
     topics = topic_tokens(value)
+    if "topic10" in topics and not {"topic11", "topic12"}.intersection(topics):
+        topics += ["topic11", "topic12"]
+    if "topic4" in topics and not {"topic5", "topic6"}.intersection(topics):
+        topics += ["topic5", "topic6"]
     aliases = query_aliases(value)
     if "topic2" in topics or "工作室" in value or "工作坊" in value:
         # Occupation already has a topic token; its raw bigram also occurs in studios.
