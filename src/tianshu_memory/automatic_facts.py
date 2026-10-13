@@ -294,14 +294,17 @@ def filter_current(db, candidates, query, clock):
             "去年",
             "上个月",
             "历史",
+            "那次",
+            "那时候",
+            "当时",
+            "经历",
+            "that trip",
+            "back then",
             "previous",
             "before",
             "history",
             "used to",
         )
-    )
-    current = any(
-        x in query.casefold() for x in ("现在", "当前", "目前", "正在", "最新", "current", "now")
     )
     result = []
     for entry in candidates:
@@ -314,13 +317,9 @@ def filter_current(db, candidates, query, clock):
                 continue
             if fact["valid_from"] and parse_time(fact["valid_from"]) > clock():
                 continue
-            if (
-                current
-                and not history
-                and (
-                    fact["state"] == "historical"
-                    or (fact["valid_to"] and parse_time(fact["valid_to"]) <= clock())
-                )
+            if not history and (
+                fact["state"] == "historical"
+                or (fact["valid_to"] and parse_time(fact["valid_to"]) <= clock())
             ):
                 continue
         result.append(entry)

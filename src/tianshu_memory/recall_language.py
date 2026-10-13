@@ -54,3 +54,26 @@ def topic_tokens(value):
         ):
             result.append("topic" + str(index))
     return result
+
+
+# Query-side literal expansion also works with indexes created before these aliases
+# existed. It never changes stored facts or adds a value absent from their sources.
+QUERY_ALIASES = (
+    ("小鸟", "鸟儿", "鹦鹉", "文鸟", "虎皮鹦鹉", "bird", "parrot", "budgie"),
+    ("什么笔", "哪种笔", "钢笔", "圆珠笔", "铅笔", "pen", "pencil"),
+)
+
+
+def query_aliases(value):
+    lowered = value.casefold()
+    return [
+        alias
+        for group in QUERY_ALIASES
+        if any(
+            re.search(r"(?<![a-z])" + re.escape(term) + r"(?![a-z])", lowered)
+            if term.isascii()
+            else term in lowered
+            for term in group
+        )
+        for alias in group
+    ]

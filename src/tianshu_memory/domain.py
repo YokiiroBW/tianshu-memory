@@ -93,7 +93,7 @@ CONTEXT_TERMS = frozenset(
 
 
 def query_terms(value: str) -> list[str]:
-    from .recall_language import topic_tokens
+    from .recall_language import query_aliases, topic_tokens
 
     scaffolding = {
         "我的",
@@ -141,24 +141,38 @@ def query_terms(value: str) -> list[str]:
         "normally",
         "currently",
     }
-    # Remove complete question scaffolding before CJK bigrams are formed.
-    # Otherwise "我平常" and "我平时" match unrelated topics through "我平".
-    lexical_value = re.sub(
-        r"(?:我|你|他|她)?(?:平常|平时|通常|常用|一般来说|长期|短期|目前|喜欢|喜爱|偏爱)",
-        " ",
-        value,
-    )
     topics = topic_tokens(value)
+    aliases = query_aliases(value)
     if "topic2" in topics or "工作室" in value or "工作坊" in value:
         # Occupation already has a topic token; its raw bigram also occurs in studios.
         scaffolding.update({"工作", "work", "job"})
-    if topics and not re.search(r"(我的|本人|我自己|本人的)(名字|姓名)|my name", value.casefold()):
+    if (topics or aliases) and not re.search(
+        r"(我的|本人|我自己|本人的)(名字|姓名)|my name", value.casefold()
+    ):
         # Naming a pet/company/topic is not a request for the speaker's own name.
         scaffolding.update({"名字", "姓名", "名称", "称呼", "name"})
+    # Remove full context phrases before tokenization so adjacent pronouns/time words
+    # cannot create shared bigrams across unrelated facts. Topic aliases use the original.
+    context = (
+        CONTEXT_TERMS
+        | scaffolding
+        | set(
+            "平常 平时 通常 常用 一般来说 长期 短期 目前 当前 喜欢 喜爱 偏爱 "
+            "已经 主要 一直 仍然 仍是 还会 还在 原来 曾经 那次 那时候 那只 这只 "
+            "是我 是你 是他 是她 我也 我的 你的 他的 她的 本人".split()
+        )
+    )
+    chinese = sorted((word for word in context if not word.isascii()), key=len, reverse=True)
+    lexical_value = re.sub(
+        r"(?:我|你|他|她)?(?:" + "|".join(map(re.escape, chinese)) + ")",
+        " ",
+        value,
+    )
     return list(
         dict.fromkeys(
             [term for term in terms(lexical_value) if term not in CONTEXT_TERMS | scaffolding]
             + topics
+            + terms(" ".join(aliases))
         )
     )[:64]
 

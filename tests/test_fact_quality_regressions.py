@@ -187,3 +187,45 @@ def test_tool_recall_includes_sourced_programming_language_predicates(sync, lang
     assert {u["record_id"] for u in recall(sync, "我主要做什么工作、常用什么工具？")} == set(
         job["record_ids"] + tool["record_ids"]
     )
+
+
+def test_current_summary_excludes_old_values_and_context_only_matches(sync):
+    initialize(sync)
+    home, _ = add(sync, "我现在搬到杭州滨江了", "residence", "杭州滨江")
+    add(sync, "我以前住在宁波", "residence", "宁波", second=2, state="historical")
+    job, _ = add(sync, "我的职业是工程师", "occupation", "工程师", second=3)
+    pet, _ = add(sync, "我的狗叫核桃", "pet.dog.name", "核桃", second=4)
+    add(sync, "我已经给猫改名叫米糕", "pet.cat.name", "米糕", second=5)
+    add(sync, "我之前学过葡萄牙语", "language.portuguese", "葡萄牙语", second=6)
+    assert {u["record_id"] for u in recall(sync, "概括我的住址、工作和狗")} == set(
+        home["record_ids"] + job["record_ids"] + pet["record_ids"]
+    )
+    assert {u["record_id"] for u in recall(sync, "我现在已经搬到哪里了")} == set(home["record_ids"])
+    assert recall(sync, "我之前是否已经换了银行卡") == []
+    assert any("宁波" in u["statement"] for u in recall(sync, "我以前住在哪里"))
+
+
+def test_question_about_that_ended_trip_keeps_historical_evidence(sync):
+    initialize(sync)
+    trip, _ = add(
+        sync,
+        "去青岛出差，那次已于2026年9月30日结束",
+        "event.trip",
+        "青岛出差",
+        state="historical",
+        valid_to="2026-09-30T00:00:00Z",
+    )
+    assert recall(sync, "我现在出差吗") == []
+    units = recall(sync, "我现在还在青岛那次出差中吗")
+    assert {u["record_id"] for u in units} == set(trip["record_ids"])
+    assert all("不能" in u["valid_time"] for u in units)
+
+
+def test_query_aliases_retrieve_existing_literal_words_without_reindexing(sync):
+    initialize(sync)
+    bird, _ = add(sync, "我的文鸟叫小满", "pet.bird.name", "小满")
+    pen, _ = add(sync, "我用铅笔写日记", "writing.instrument", "铅笔", second=2)
+    add(sync, "我养的狗叫核桃", "pet.dog.name", "核桃", second=3)
+    add(sync, "我的名字叫小林", "identity.name", "小林", second=4)
+    assert {u["record_id"] for u in recall(sync, "那只小鸟的名字是什么")} == set(bird["record_ids"])
+    assert {u["record_id"] for u in recall(sync, "我写手账用什么笔")} == set(pen["record_ids"])
