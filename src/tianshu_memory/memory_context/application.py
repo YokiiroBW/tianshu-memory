@@ -16,6 +16,11 @@ class MemoryContext:
     def query(self, request, context):
         return query.execute(self, request, context)
 
+    def history(self, request, context):
+        from .history import execute
+
+        return execute(self, request, context)
+
     def _old(self, db, request, context):
         row = db.execute(
             "SELECT digest,receipt FROM context_operations WHERE service=? AND scope=? AND operation_id=?",
@@ -239,7 +244,7 @@ class MemoryContext:
                     group_id,
                 ),
             )
-        service._bump(db, scope)
+        service._bump(db, scope, history_changed=kind == "correct")
         return self._receipt(
             db,
             request,

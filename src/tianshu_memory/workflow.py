@@ -140,7 +140,7 @@ class _WorkflowBase:
                         ),
                     )
                 if contextual and pending:
-                    self.service._bump(db, event["scope"])
+                    self.service._bump(db, event["scope"], history_changed=False)
                 result = {
                     "state": "committed" if drafts else "skipped",
                     "record_ids": record_ids,

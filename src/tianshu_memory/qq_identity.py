@@ -132,7 +132,7 @@ def register_observed(db, event, proof, source_ref, source_digest):
     This distinct observation authority grants identity enrollment only. It has
     no dialogue origin, actor scope, reply permission, or administrator grant.
     """
-    require(event["schema_version"] == 3, "invalid_input", 400)
+    require(event["schema_version"] in (3, 4), "invalid_input", 400)
     require(
         proof.get("valid") is True
         and proof.get("source_ref") == source_ref

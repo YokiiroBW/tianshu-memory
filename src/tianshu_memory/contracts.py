@@ -11,6 +11,7 @@ PROFILE_MANIFEST_SHA256 = "757b243a25945a75d55dafab9da94828e79a009a0a77ce2aeb430
 SOURCE_MANIFEST_SHA256 = "6d5c417c2e407aaf055151c1a3639d3b4e2ce4ad7da999f95273b6fcbf487370"
 SOURCE_BATCH_MANIFEST_SHA256 = "ac6f39d1f0afe55677fbbb0ce2da1b212d22c49f18917d8fe2ed613d424c4327"
 CONTEXT_MANIFEST_SHA256 = "d44a23ac674d5fd3f8e9325c80884dc1426305055b873be1da239f126056e570"
+HISTORY_MANIFEST_SHA256 = "3b535e58c34eedba5589e45cc11ce44468f312251eb719cedd66368fdda02a2d"
 CONTENT_MANIFEST_SHA256 = "beecd2f75b09df089f7d20c10c1ba39cdaa79c5ba78b8db702ef5005129e9199"
 LIFE_MANIFEST_SHA256 = "ff7cbaf5bb9cf1330a11821c0e5f0eefb728a934e9fb8698c9b644e09f43042c"
 
@@ -216,6 +217,30 @@ class Contracts:
         self.schemas["memory-context"] = schema
         self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
         self.context_version = manifest["version"]
+        self.load_history()
+
+    def load_history(self):
+        directory = self.directory.parent.parent / "context-history/v1"
+        raw = (directory / "manifest.json").read_bytes()
+        if digest(raw) != HISTORY_MANIFEST_SHA256:
+            raise ValueError("History contract manifest hash mismatch")
+        manifest = json.loads(raw)
+        if (
+            manifest["package"] != "context-history/v1"
+            or manifest["version"] != "1.0.0"
+            or manifest["dependencies"] != {"memory-context/v1": CONTEXT_MANIFEST_SHA256}
+        ):
+            raise ValueError("Unsupported history contract")
+        for relative, expected in manifest["sha256"].items():
+            path = (directory / relative).resolve()
+            if (
+                not path.is_relative_to(directory.resolve())
+                or digest(path.read_bytes()) != expected
+            ):
+                raise ValueError("History contract file hash mismatch")
+        schema = json.loads((directory / "schema.json").read_text(encoding="utf-8"))
+        self.schemas["context-history"] = schema
+        self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
 
     def load_content(self):
         """Verify the full one-direction Knowledge -> Life -> Common dependency graph."""

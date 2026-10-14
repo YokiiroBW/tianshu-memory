@@ -65,16 +65,21 @@ class MemoryService:
         row = db.execute("SELECT version FROM scopes WHERE key=?", (canonical(scope),)).fetchone()
         return row[0] if row else 1
 
-    def _bump(self, db, scope):
+    def _bump(self, db, scope, *, history_changed=True):
+        from .memory_context.history import history_version, record_version
+
         if self.retrieval is not None:
             self.retrieval.invalidate()
         if "profile_subject" in scope:
             scope = {k: v for k, v in scope.items() if k != "profile_subject"}
+        previous_history = history_version(self, db, scope)
         db.execute(
             "INSERT INTO scopes VALUES (?,2) ON CONFLICT(key) DO UPDATE SET version=version+1",
             (canonical(scope),),
         )
-        return self._scope_version(db, scope)
+        version = self._scope_version(db, scope)
+        record_version(db, scope, version, version if history_changed else previous_history)
+        return version
 
     def _authorize(self, db, context, scope=None, account=None):
         # Context is only the receiver's resolved result, never a wire body field.

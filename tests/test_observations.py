@@ -108,10 +108,13 @@ def test_archive_requires_attestation_and_is_idempotent(ledger):
         assert db.execute("SELECT count(*) FROM turn_inputs").fetchone()[0] == 0
 
 
-def test_v3_observation_enrolls_verified_identity_without_reply_scope(ledger, tmp_path):
+@pytest.mark.parametrize("version", [3, 4])
+def test_v3_observation_enrolls_verified_identity_without_reply_scope(ledger, tmp_path, version):
     app, verifier = ledger
     first = event()
-    first.update(schema_version=3, nickname="同名", group_card="群名片")
+    first.update(schema_version=version, nickname="同名", group_card="群名片")
+    if version == 4:
+        first["message_context"] = {"reply_ids": ["43"], "mentioned_accounts": ["30004"]}
     value = source(first)
     verifier.values[value["source_ref"]] = value
     with pytest.raises(Fault) as unavailable:

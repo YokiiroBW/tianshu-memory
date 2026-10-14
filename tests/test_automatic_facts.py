@@ -13,6 +13,7 @@ from test_source_sync import sync as sync
 from test_user_actions import EXPIRES, execute, profile_action, setup_user
 
 from tianshu_memory.domain import Fault, canonical, fingerprint
+from tianshu_memory.memory_context.history import history_version
 from tianshu_memory.store import Store
 
 
@@ -185,8 +186,14 @@ def recall(h, text):
 
 def test_correction_recall_retains_auditable_past_without_old_current(sync):
     initialize(sync)
+    with sync.store.transaction() as db:
+        original = history_version(sync.service, db, sync.scope())
     first, _ = add(sync, "我住在杭州西湖区", "residence")
+    with sync.store.transaction() as db:
+        assert history_version(sync.service, db, sync.scope()) == original
     newer, _ = add(sync, "现在搬到杭州滨江区了", "residence", second=2)
+    with sync.store.transaction() as db:
+        assert history_version(sync.service, db, sync.scope()) > original
     units = recall(sync, "我目前的住所在哪")
     assert {u["record_id"] for u in units} == set(newer["record_ids"])
     history = recall(sync, "我以前的住址")

@@ -13,6 +13,7 @@ from ..domain import Fault, require, strict_json
 
 DEFINITIONS = {
     "query": ("query_request", "query_response"),
+    "history": ("request", "response"),
     "propose": ("proposal_request", "receipt"),
     "receipt": ("receipt_request", "receipt_response"),
     "batch": ("batch_request", "batch_response"),
@@ -48,7 +49,7 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                     caller_name, caller = await lease.run(
                         auth.authenticate, request.headers.get("authorization")
                     )
-                permission = "context_" + operation
+                permission = "context_query" if operation == "history" else "context_" + operation
                 require(permission in caller.get("operations", []))
                 require(await anote_authenticated(), "log_unavailable", 503)
                 require(not request.headers.get("origin") and not request.headers.get("cookie"))
@@ -65,7 +66,8 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                         body.extend(chunk)
                 payload = strict_json(body)
                 input_type, output_type = DEFINITIONS[operation]
-                application.service.contracts.validate("memory-context#" + input_type, payload)
+                package = "context-history" if operation == "history" else "memory-context"
+                application.service.contracts.validate(package + "#" + input_type, payload)
                 header = payload["command" if mutation else "query"]
                 request_id = header["request_id"]
                 lease.request = request
@@ -86,9 +88,7 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                             request_id,
                         )
                         result = getattr(application, operation)(payload, context)
-                        application.service.contracts.validate(
-                            "memory-context#" + output_type, result
-                        )
+                        application.service.contracts.validate(package + "#" + output_type, result)
                         if result.get("state") == "rejected":
                             note_fault(result["error_code"])
                         return result

@@ -252,6 +252,8 @@ def commit(writer, db, draft, event, source_map):
                 "UPDATE automatic_facts SET superseded_by=? WHERE group_id=?",
                 (group_id, old["group_id"]),
             )
+            # A changed current fact invalidates replies that relied on its old value.
+            service._bump(db, draft["scope"])
             for record in db.execute(
                 "SELECT * FROM records WHERE group_id=? AND state='active'", (old["group_id"],)
             ).fetchall():

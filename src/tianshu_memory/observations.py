@@ -101,13 +101,15 @@ def _request(request):
     require(
         isinstance(event, dict)
         and set(event)
-        == fields | ({"nickname", "group_card"} if event.get("schema_version") == 3 else set()),
+        == fields
+        | ({"nickname", "group_card"} if event.get("schema_version") in (3, 4) else set())
+        | ({"message_context"} if event.get("schema_version") == 4 else set()),
         "invalid_input",
         400,
     )
     require(
         type(event["schema_version"]) is int
-        and event["schema_version"] in (2, 3)
+        and event["schema_version"] in (2, 3, 4)
         and type(event["revision"]) is int
         and event["revision"] == 1
         and event["namespace"] == "qq"
@@ -152,7 +154,7 @@ def _request(request):
             "invalid_input",
             400,
         )
-    if event["schema_version"] == 3:
+    if event["schema_version"] >= 3:
         from .qq_identity import _display
 
         require(
@@ -162,6 +164,22 @@ def _request(request):
         )
         _display(event["nickname"])
         _display(event["group_card"])
+    if event["schema_version"] == 4:
+        value = event["message_context"]
+        require(
+            isinstance(value, dict) and set(value) == {"reply_ids", "mentioned_accounts"},
+            "invalid_input",
+            400,
+        )
+        for key, limit, pattern in (("reply_ids", 16, IDENT), ("mentioned_accounts", 64, QQ)):
+            items = value[key]
+            require(isinstance(items, list) and len(items) <= limit, "invalid_input", 400)
+            require(
+                all(type(item) is str and pattern.fullmatch(item) for item in items),
+                "invalid_input",
+                400,
+            )
+            require(len(set(items)) == len(items), "invalid_input", 400)
     return event
 
 
@@ -202,7 +220,7 @@ class ObservationLedger:
         )
         with self.store.transaction() as db:
             self._ready(db)
-            if event["schema_version"] == 3:
+            if event["schema_version"] >= 3:
                 from .qq_identity import register_observed
 
                 register_observed(db, event, proof, request["source_ref"], request["source_digest"])
