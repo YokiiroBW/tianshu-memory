@@ -24,7 +24,7 @@ class _WorkflowBase:
     def __init__(self, service):
         self.service = service
 
-    def _commit_candidate(self, job_id, drafts, *, exact_scope=False):
+    def _commit_candidate(self, job_id, drafts, *, exact_scope=False, source_extraction=False):
         """Commit complete reviewed groups, or [] to skip. No LLM call or auto-confirmation.
 
         A job is atomic and single-consumption. Source-version ledger deduplicates overlapping
@@ -59,8 +59,27 @@ class _WorkflowBase:
                 require(old["digest"] == digest, "idempotency_conflict", 409)
                 return json.loads(old["result"])
             event, snapshot = json.loads(job["event"]), json.loads(job["source_snapshot"])
-            if event["scope_version"] != self.service._scope_version(db, event["scope"]):
-                raise Fault("scope_changed", 409)
+            if source_extraction:
+                require(job["state"] == "pending", "scope_changed", 409)
+            current_version = self.service._scope_version(db, event["scope"])
+            if event["scope_version"] != current_version:
+                from .memory_context.history import history_version
+
+                # Independent sourced extraction survives additive facts committed
+                # while it was queued. Semantic revisions still reject a nonempty
+                # proposal; an empty proposal cannot restore any old fact. All
+                # paths still recheck the current job, authority and exact sources.
+                require(
+                    source_extraction
+                    and event["scope_version"] < current_version
+                    and (
+                        not drafts
+                        or history_version(self.service, db, event["scope"])
+                        <= event["scope_version"]
+                    ),
+                    "scope_changed",
+                    409,
+                )
             rows = self.service._source_rows(
                 db, event["sources"], event["scope"], reality=event["reality"]
             )
@@ -569,7 +588,9 @@ class TrustedWorkflow(_WorkflowBase):
             ],
         )
         self.service.contracts.validate("sync-workflow#candidate_commit", portable)
-        result = self._commit_candidate(input["job_id"], input["drafts"], exact_scope=True)
+        result = self._commit_candidate(
+            input["job_id"], input["drafts"], exact_scope=True, source_extraction=True
+        )
         self.service.contracts.validate("sync-workflow#candidate_result", result)
         return result
 

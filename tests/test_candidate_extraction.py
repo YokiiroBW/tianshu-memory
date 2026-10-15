@@ -1,6 +1,7 @@
 """Real Memory and TLS source owners with explicitly synthetic source/model content."""
 
 import copy
+from contextlib import contextmanager
 
 import pytest
 from test_source_sync import certificates as certificates
@@ -8,7 +9,8 @@ from test_source_sync import source_contracts as source_contracts
 from test_source_sync import source_examples as source_examples
 from test_source_sync import sync as sync
 
-from tianshu_memory.domain import canonical, fingerprint
+from tianshu_memory.domain import Fault, canonical, fingerprint
+from tianshu_memory.workflow import TrustedWorkflow
 
 TEXT = "晚上不喝咖啡，白天偶尔可以"
 PATH = "memory/candidates/process"
@@ -84,16 +86,66 @@ def test_read_commit_recall_replay_and_role_isolation(sync):
     assert recall(sync)[0]["record_id"] == units[0]["record_id"]
 
 
-def test_source_revocation_between_prepare_and_commit_blocks_memory(sync):
+@pytest.mark.parametrize("empty", [False, True])
+def test_source_revocation_between_prepare_and_commit_blocks_memory(sync, empty):
     job = prepare(sync)
     assert sync.post(PATH, dict(job_id=job, output=None)).status_code == 200
     sync.grants[0]["state"] = "denied"
     sync.platform_head["sequence"] += 1
-    response = sync.post(PATH, dict(job_id=job, output=output()))
+    response = sync.post(PATH, dict(job_id=job, output={"memories": []} if empty else output()))
     assert response.status_code != 200, response.text
     with sync.store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0
     assert sync.post(PATH, dict(job_id=job, output=None)).json()["state"] == "invalidated"
+
+
+def test_queued_extraction_survives_additions_but_reviewed_snapshot_stays_strict(sync):
+    job = prepare(sync)
+    assert sync.post(PATH, dict(job_id=job, output=None)).status_code == 200
+    with sync.store.transaction() as db:
+        sync.service._bump(db, sync.scope(0), history_changed=False)
+    with pytest.raises(Fault) as error:
+        TrustedWorkflow(sync.service).commit_candidate(dict(job_id=job, drafts=[]))
+    assert error.value.code == "scope_changed"
+    response = sync.post(PATH, dict(job_id=job, output=output()))
+    assert response.status_code == 200, response.text
+    assert response.json()["result"]["state"] == "committed"
+    assert len(recall(sync)) == 1
+    assert sync.post(PATH, dict(job_id=job, output=output())).json() == response.json()
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_semantic_version_change_rejects_facts_but_empty_current_source_can_skip(sync, empty):
+    job = prepare(sync)
+    assert sync.post(PATH, dict(job_id=job, output=None)).status_code == 200
+    with sync.store.transaction() as db:
+        sync.service._bump(db, sync.scope(0))
+    response = sync.post(PATH, dict(job_id=job, output={"memories": []} if empty else output()))
+    if empty:
+        assert response.status_code == 200, response.text
+        assert response.json()["result"]["state"] == "skipped"
+    else:
+        assert response.status_code == 409
+        assert response.json()["code"] == "scope_changed"
+    assert recall(sync) == []
+
+
+def test_candidate_invalidated_during_barrier_cannot_commit_even_empty(sync, monkeypatch):
+    job = prepare(sync)
+    original = sync.service.operation
+
+    @contextmanager
+    def invalidated(**kwargs):
+        with original(**kwargs) as db:
+            db.execute("UPDATE jobs SET state='scope_changed' WHERE id=?", (job,))
+            yield db
+
+    monkeypatch.setattr(sync.service, "operation", invalidated)
+    with pytest.raises(Fault) as error:
+        TrustedWorkflow(sync.service).commit_extracted(dict(job_id=job, drafts=[]))
+    assert error.value.code == "scope_changed"
+    with sync.store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM write_ledger").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(
