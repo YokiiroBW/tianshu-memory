@@ -9,7 +9,7 @@ import re
 import unicodedata
 
 from .domain import fingerprint, require
-from .recall_language import topic_aliases
+from .recall_language import history_query, normalize_objects, topic_aliases
 
 OBJECT_NOUNS = {
     "notebook": ("本", ("笔记本", "笔记", "手账")),
@@ -83,6 +83,11 @@ def ordinal(value):
 
 def anchor(entity):
     mention = normalize_mention(entity["mention"])
+    if entity["kind"] in {"notebook", "book", "journal", "diary"}:
+        mention = normalize_objects(mention)
+        if "封面" in mention:
+            mention = re.sub(r"(?:这|那|的)?本|笔记本|笔记|手账|书籍|书", "", mention)
+            mention = mention.replace("的", "")
     position = ordinal(mention)
     if position:
         mention = re.sub(r"第[一二三四五六七八九十百零两0-9]+", "第" + position, mention, count=1)
@@ -92,6 +97,11 @@ def anchor(entity):
 def compatible(left, right):
     if left == right:
         return True
+    if left[0] == right[0] and "封面" in left[1] and "封面" in right[1]:
+        positions = [ordinal(label) for _, label in (left, right)]
+        labels = [re.sub(r"第[0-9一二三四五六七八九十]+", "", label) for _, label in (left, right)]
+        if labels[0] == labels[1] and (not all(positions) or positions[0] == positions[1]):
+            return True
     if left[0] != right[0] or not ordinal(left[1]) or ordinal(left[1]) != ordinal(right[1]):
         return False
     # A short generic noun can abbreviate a uniquely identified numbered object.
@@ -179,7 +189,7 @@ def filter_targets(db, candidates, query):
     if query.partition(":")[0] in {"field", "item"}:
         return candidates
     objects, by_group = {}, {}
-    normalized = normalize_mention(query)
+    normalized = normalize_objects(normalize_mention(query))
     for group, _, _ in candidates:
         row = db.execute(
             "SELECT payload FROM automatic_facts WHERE group_id=?", (group["id"],)
@@ -191,7 +201,7 @@ def filter_targets(db, candidates, query):
     wanted = {}
     number = r"第[一二三四五六七八九十百零两0-9]+(?:只|支|个|本|张|台|辆|件)?"
     for kind, entities in objects.items():
-        direct = {e["id"] for e in entities if normalize_mention(e["mention"]) in normalized}
+        direct = {e["id"] for e in entities if anchor(e)[1] in normalized}
         numbered = False
         for entity in entities:
             noun = re.sub(number, "", normalize_mention(entity["mention"]))
@@ -224,3 +234,39 @@ def filter_targets(db, candidates, query):
         or entity["kind"] not in wanted
         or entity["id"] in wanted[entity["kind"]]
     ]
+
+
+def historical_title_groups(db, candidates, query):
+    """Link a quoted current/old title to sourced history of that same object/property."""
+    titles = re.findall(r'[“「《"]([^”」》"]+)[”」》"]', query)
+    if not titles or not history_query(query):
+        return set()
+    facts = {}
+    targets = set()
+    for group, _, _ in candidates:
+        row = db.execute(
+            "SELECT payload FROM automatic_facts WHERE group_id=?", (group["id"],)
+        ).fetchone()
+        fact = json.loads(row[0]) if row else None
+        if not fact or not fact.get("entity"):
+            continue
+        key = (fact["entity"]["id"], fact["key"])
+        facts[group["id"]] = key
+        if any(title in fact["value"] for title in titles):
+            targets.add(key)
+    return {group for group, key in facts.items() if key in targets}
+
+
+def historical_candidates(scope, query):
+    """Index hints for the same object's property; current authorization is checked later."""
+    titles = re.findall(r'[“「《"]([^”」》"]+)[”」》"]', query)
+    if not titles or not history_query(query):
+        return "", []
+    matches = " OR ".join("instr(json_extract(t.payload,'$.value'),?)>0" for _ in titles)
+    return (
+        "SELECT f.group_id FROM automatic_facts f WHERE f.scope=? AND "
+        "(json_extract(f.payload,'$.entity.id'),json_extract(f.payload,'$.key')) IN "
+        "(SELECT json_extract(t.payload,'$.entity.id'),json_extract(t.payload,'$.key') "
+        "FROM automatic_facts t WHERE t.scope=? AND (" + matches + "))",
+        [scope, scope, *titles],
+    )

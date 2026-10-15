@@ -13,7 +13,11 @@ from .recall_language import (
 )
 
 
-def admits(query, indexed_terms):
+def admits(query, indexed_terms, text=None):
+    return bool(matching_clauses(query, indexed_terms, text))
+
+
+def matching_clauses(query, indexed_terms, text=None):
     """Require a matching topic or sufficient content coverage, not any shared bigram.
 
     Clauses are independent so asking about several facts does not require each
@@ -29,10 +33,15 @@ def admits(query, indexed_terms):
             for clause in clauses
             if not re.match(r"^(?:按|照)(?:我|我的)?(?:平时|平常)?口味", clause)
         ]
-    return any(_clause_admits(clause, indexed_terms) for clause in clauses)
+    return [clause for clause in clauses if _clause_admits(clause, indexed_terms, text)]
 
 
-def _clause_admits(clause, indexed_terms):
+def _clause_admits(clause, indexed_terms, text=None):
+    from .recall_constraints import constraints
+
+    decision = constraints(clause, text or " ".join(indexed_terms))
+    if decision is not None:
+        return decision
     replacement = correction_target(clause)
     quoted = re.findall(r'[“「《"]([^”」》"]+)[”」》"]', clause)
     if quoted and replacement is None:

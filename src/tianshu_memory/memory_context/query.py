@@ -3,9 +3,25 @@
 import json
 from datetime import timedelta
 
-from ..domain import Fault, canonical, parse_time, query_terms, require, utc
+from ..domain import Fault, canonical, parse_time, query_terms, require, terms, utc
+from ..fact_migration import installed
+from ..recall_language import candidate_aliases, history_query
 from .migration import identity_version, ready
 from .times import filter_candidates, prepare
+
+
+def keyword_candidates(scope, query, search_terms):
+    """One indexed candidate pass; never a correlated FTS scan per group."""
+    hints = set(search_terms)
+    for alias in candidate_aliases(query):
+        hints.update(terms(alias))
+    expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in sorted(hints))
+    return (
+        "SELECT r.group_id FROM search_index i JOIN records r "
+        "ON r.id=i.record_id AND r.version=i.record_version "
+        "WHERE i.scope=? AND i.text MATCH ?",
+        [scope, expression],
+    )
 
 
 def authorized_scopes(service, db, scope, include_associated):
@@ -131,7 +147,6 @@ def execute(application, request, context):
             result["omissions"] = ["no_match"]
             return result
         candidates = []
-        expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in search_terms)
         for selected_scope, _, _ in scopes:
             parameters = [canonical(selected_scope), *request["selection"]]
             predicates = [
@@ -143,11 +158,26 @@ def execute(application, request, context):
                 predicates.append(f"g.{exact_kind}_key=?")
                 parameters.append(exact_value)
             elif settings is None or settings["mode"] == "keyword":
-                predicates.append(
-                    "EXISTS(SELECT 1 FROM records r JOIN search_index i ON i.record_id=r.id AND i.record_version=r.version WHERE r.group_id=g.id AND i.scope=g.scope AND i.text MATCH ?)"
+                query_sql, query_parameters = keyword_candidates(
+                    canonical(selected_scope), request["query_text"], search_terms
                 )
-                parameters.append(expression)
-            candidate_limit = request["limit"] if settings is None else 4096
+                if installed(db) and history_query(request["query_text"]):
+                    from ..fact_entities import historical_candidates
+
+                    history_sql, history_parameters = historical_candidates(
+                        canonical(selected_scope), request["query_text"]
+                    )
+                    if history_sql:
+                        query_sql += " UNION " + history_sql
+                        query_parameters += history_parameters
+                predicates.append("g.id IN (" + query_sql + ")")
+                parameters += query_parameters
+            # Rank a bounded surplus, preserving explicit incomplete coverage.
+            # Alias/history expansion happens before this bound, not afterwards.
+            keyword = settings is None or settings["mode"] == "keyword"
+            candidate_limit = (
+                request["limit"] if exact else min(4096, request["limit"] * 4) if keyword else 4096
+            )
             parameters.append(candidate_limit + 1)
             rows = db.execute(
                 "SELECT g.* FROM groups g WHERE "

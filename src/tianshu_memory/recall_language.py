@@ -3,6 +3,52 @@
 import re
 
 
+def normalize_objects(value):
+    """Normalize explicit cover descriptions, without inventing an object's identity."""
+    value = re.sub(
+        r"([红蓝绿黑白黄紫棕灰橙]{2,3})封面", lambda m: "和".join(c + "封面" for c in m[1]), value
+    )
+    value = re.sub(r"([红蓝绿黑白黄紫棕灰橙])色?(?:封面|皮)(?:的)?", r"\1封面", value)
+    return value
+
+
+def candidate_aliases(value):
+    """Broad index hints only; the authorized ranker still decides relevance."""
+    aliases = set(topic_aliases(value))
+    for color in re.findall(r"([红蓝绿黑白黄紫棕灰橙])封面", normalize_objects(value)):
+        aliases.update((color + "皮", color + "色封面", color + "封面"))
+    return aliases
+
+
+def history_query(value):
+    value = re.sub(r'[“「《"].*?[”」》"]', "", clean_query(value)).casefold()
+    return any(
+        token in value
+        for token in (
+            "以前",
+            "之前",
+            "过去",
+            "原来",
+            "原名",
+            "曾经",
+            "旧",
+            "去年",
+            "上个月",
+            "历史",
+            "那次",
+            "那时候",
+            "当时",
+            "经历",
+            "that trip",
+            "back then",
+            "previous",
+            "before",
+            "history",
+            "used to",
+        )
+    )
+
+
 def clean_query(value):
     """Remove operation wording outside quoted titles, retaining the requested content."""
     parts = re.split(r'([“「《"].*?[”」》"])', value)
@@ -80,7 +126,7 @@ def topic_family(tokens):
     result = set(tokens)
     if result.intersection({"topic11", "topic12"}):
         result.add("topic10")
-    if result.intersection({"topic5", "topic6"}):
+    if result.intersection({"topic5", "topic6", "topic20", "topic21"}):
         result.add("topic4")
     if result.intersection({"topic7", "topic8", "beverage", "drink", "饮料", "饮品"}):
         result.add("topic19")
@@ -93,9 +139,23 @@ TOPICS = (
     ("家乡", "老家", "出生地", "hometown", "birthplace"),
     ("工作", "职业", "做什么工作", "上班", "谋生", "occupation", "profession", "job", "work"),
     ("公司", "工作室", "单位", "雇主", "employer", "company", "studio"),
-    ("宠物", "毛孩子", "养的", "pet"),
+    ("宠物", "毛孩子", "小家伙", "pet"),
     ("猫", "猫咪", "小猫", "喵", "cat", "kitten"),
-    ("狗", "狗狗", "小狗", "汪", "dog", "puppy"),
+    (
+        "狗",
+        "狗狗",
+        "小狗",
+        "汪",
+        "柯基",
+        "金毛",
+        "柴犬",
+        "拉布拉多",
+        "哈士奇",
+        "腊肠犬",
+        "dog",
+        "puppy",
+        "corgi",
+    ),
     ("咖啡", "美式", "拿铁", "coffee", "espresso", "caffeine"),
     ("茶", "茶叶", "茶饮", "泡茶", "tea"),
     ("饮食", "口味", "忌口", "点菜", "配菜", "调料", "吃什么", "不吃", "food", "diet"),
@@ -131,29 +191,42 @@ TOPICS = (
         "beverage",
         "drink",
     ),
+    ("小鸟", "鸟儿", "鹦鹉", "文鸟", "bird", "parrot"),
+    ("蛇", "snake"),
+    ("植物", "盆栽", "百里香", "薄荷", "绿萝", "吊兰", "多肉", "仙人掌", "plant"),
+    ("音乐", "歌曲", "听歌", "爵士", "摇滚", "民谣", "music", "jazz"),
+    ("游泳", "泳池", "游泳馆", "swimming", "swim"),
+    ("通勤", "地铁", "公交", "几号线", "下车", "去公司", "commute", "metro"),
+)
+
+
+TOPIC_PATTERNS = tuple(
+    re.compile(
+        "|".join(
+            r"(?<![a-z])" + re.escape(alias) + r"(?![a-z])"
+            if alias.isascii()
+            else r"工作(?!室|坊|台|间|服|证|餐)"
+            if alias == "工作"
+            else re.escape(alias)
+            for alias in aliases
+        )
+    )
+    for aliases in TOPICS
 )
 
 
 def topic_tokens(value):
     lowered = value.casefold()
-    result = []
-    for index, aliases in enumerate(TOPICS):
-        if any(
-            (
-                re.search(r"(?<![a-z])" + re.escape(alias) + r"(?![a-z])", lowered)
-                if alias.isascii()
-                else (
-                    re.search(r"工作(?!室|坊|台|间|服|证|餐)", lowered)
-                    if alias == "工作"
-                    else alias in lowered
-                )
-            )
-            for alias in aliases
-        ):
-            result.append("topic" + str(index))
+    result = [
+        f"topic{index}" for index, pattern in enumerate(TOPIC_PATTERNS) if pattern.search(lowered)
+    ]
     # '喝什么咖啡/茶' asks for a specific drink family, not all beverages.
     if {"topic7", "topic8"}.intersection(result) and "topic19" in result:
         result.remove("topic19")
+    if {"topic5", "topic6", "topic20", "topic21"}.intersection(result) and "topic4" in result:
+        result.remove("topic4")
+    if re.search(r"点(?:份|碗)?(?:面|饭|餐)|吃的|别放|不要放", lowered):
+        result.append("topic9")
     return result
 
 

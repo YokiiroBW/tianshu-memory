@@ -490,41 +490,9 @@ class MemoryService:
             )
 
     def _rank_groups(self, db, eligible, search_terms, query):
-        from .recall_relevance import admits
+        from .recall_index import rank_groups
 
-        # One FTS document per complete authorized group: qualifiers/members contribute
-        # to relevance together. Neither private nor stale rows influence corpus scores.
-        if not search_terms:
-            return []
-        db.execute("CREATE VIRTUAL TABLE temp.allowed_search USING fts5(group_id UNINDEXED,text)")
-        for group, rows, _ in eligible:
-            texts = []
-            for row in rows:
-                index = db.execute(
-                    "SELECT text FROM search_index WHERE record_id=? AND record_version=? AND scope=?",
-                    (row["id"], row["version"], group["scope"]),
-                ).fetchone()
-                if index:
-                    texts.append(index[0])
-            db.execute(
-                "INSERT INTO temp.allowed_search VALUES (?,?)",
-                (group["id"], " ".join(texts)),
-            )
-        expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in search_terms)
-        matches = {}
-        for match in db.execute(
-            "SELECT group_id,text,bm25(allowed_search) AS relevance FROM temp.allowed_search WHERE allowed_search MATCH ?",
-            (expression,),
-        ):
-            if not admits(query, set(match["text"].split())):
-                continue
-            coverage = len(set(search_terms).intersection(match["text"].split()))
-            matches[match["group_id"]] = (-coverage, match["relevance"], match["group_id"])
-        eligible = sorted(
-            (entry for entry in eligible if entry[0]["id"] in matches),
-            key=lambda entry: matches[entry[0]["id"]],
-        )
-        return eligible
+        return rank_groups(db, eligible, search_terms, query)
 
     def _fit_groups(self, eligible, budget):
         units, dependencies, omissions = [], [], []

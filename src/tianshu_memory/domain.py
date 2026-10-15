@@ -93,9 +93,9 @@ CONTEXT_TERMS = frozenset(
 
 
 def query_terms(value: str) -> list[str]:
-    from .recall_language import clean_query, query_aliases, topic_tokens
+    from .recall_language import clean_query, normalize_objects, query_aliases, topic_tokens
 
-    value = clean_query(value)
+    value = normalize_objects(clean_query(value))
 
     scaffolding = {
         "我的",
@@ -147,7 +147,7 @@ def query_terms(value: str) -> list[str]:
     if "topic10" in topics and not {"topic11", "topic12"}.intersection(topics):
         topics += ["topic11", "topic12"]
     if "topic4" in topics and not {"topic5", "topic6"}.intersection(topics):
-        topics += ["topic5", "topic6"]
+        topics += ["topic5", "topic6", "topic20", "topic21"]
     if "topic19" in topics:
         # Query-side aliases also reach existing indexes without rewriting memory.
         topics += ["topic7", "topic8", "beverage", "drink", "饮料", "饮品"]

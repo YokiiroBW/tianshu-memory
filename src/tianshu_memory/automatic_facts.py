@@ -298,33 +298,9 @@ def index_text(db, unit):
 def filter_current(db, candidates, query, clock):
     if not installed(db):
         return candidates
-    from .recall_language import clean_query
+    from .recall_language import history_query
 
-    temporal_query = re.sub(r'[“「《"].*?[”」》"]', "", clean_query(query)).casefold()
-    history = any(
-        x in temporal_query
-        for x in (
-            "以前",
-            "之前",
-            "过去",
-            "原来",
-            "曾经",
-            "旧",
-            "去年",
-            "上个月",
-            "历史",
-            "那次",
-            "那时候",
-            "当时",
-            "经历",
-            "that trip",
-            "back then",
-            "previous",
-            "before",
-            "history",
-            "used to",
-        )
-    )
+    history = history_query(query)
     result = []
     for entry in candidates:
         row = db.execute(
