@@ -4,8 +4,8 @@ import json
 from datetime import timedelta
 
 from ..domain import canonical, fingerprint, parse_time, require, utc
-from .migration import identity_version, ready
-from .query import authorized_scopes, checks
+from .migration import identity_version
+from .query import checks, verified_scopes
 
 
 def metadata_key(scope):
@@ -37,20 +37,7 @@ def record_version(db, scope, content_version, retained_version):
 def execute(application, request, context):
     service = application.service
     scope = request["requested_scope"]
-    with service.operation(scope=scope, context=context) as db:
-        ready(db)
-        service._authorize(db, context, scope=scope)
-        scopes = authorized_scopes(service, db, scope, request["include_associated"])
-    for other, _, _ in scopes[1:]:
-        with service.operation(scope=other):
-            pass
-    with service.operation(scope=scope, context=context) as db:
-        service._authorize(db, context, scope=scope)
-        require(
-            scopes == authorized_scopes(service, db, scope, request["include_associated"]),
-            "scope_changed",
-            409,
-        )
+    with verified_scopes(service, request, context) as (db, scopes):
         version = service._scope_version(db, scope)
         association = identity_version(db, scope)
         expected = request["expected_snapshot"]

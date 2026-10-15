@@ -1,6 +1,7 @@
 """Authenticated owner snapshots joined with Memory's durable authority transaction."""
 
 import json
+import threading
 from contextlib import contextmanager
 
 from .domain import (
@@ -27,6 +28,9 @@ class SourceAuthority:
             contracts.load_source_batches()
         require(contracts.source_batch_version == "1.0.0", "dependency_unavailable", 503)
         self.transport, self.contracts, self.rules = transport, contracts, contracts.source_rules
+        # Serialize this owner's sync-and-business boundary, not SQLite across network I/O.
+        # Otherwise independent readers repeatedly invalidate each other's global CAS.
+        self._operation_lock = threading.RLock()
 
     @staticmethod
     def revision(db):
@@ -164,7 +168,9 @@ class SourceAuthority:
             final = self.transport.facts(final_request)
             self._relations("source_snapshot", final_request, final)
             if first["snapshot"]["head"] != final["head"]:
-                continue
+                if len(observations) != 1 or not self._refresh_unchanged(service, first, final):
+                    continue
+                final = first["snapshot"]
             for observation in observations:
                 observation["final_head"] = final["head"]
                 current = observation["access"]["viewer_context"]
@@ -215,6 +221,44 @@ class SourceAuthority:
                 self._relations("current_actor_sources", scope, sources, snapshot)
             return result, final_access.get("viewer_context")
         raise Fault("dependency_unavailable", 503)
+
+    def _refresh_unchanged(self, service, observation, final):
+        """Double-collect the requested facts when an unrelated Core write moves its head.
+
+        The Platform read sits between the two Core snapshots. Equal versioned facts
+        prove the relevant sources were stable across that authorization read. Keep the
+        actual later snapshot (including its request digest/head); never synthesize a
+        head or reuse this proof for multiple batches. Changed/withdrawn facts retry the
+        complete barrier so negatives and access are applied together.
+        """
+        before = observation["snapshot"]
+        head = before["head"]
+        with service.store.transaction() as db:
+            old = db.execute("SELECT * FROM owner_heads WHERE owner='core'").fetchone()
+            if old:
+                require(
+                    head["generation"] == old["generation"] and head["sequence"] >= old["sequence"],
+                    "dependency_unavailable",
+                    503,
+                )
+        require(
+            final["head"]["generation"] == head["generation"]
+            and final["head"]["sequence"] >= head["sequence"],
+            "dependency_unavailable",
+            503,
+        )
+        after = self.transport.facts(observation["request"])
+        self._relations("source_snapshot", observation["request"], after)
+        require(
+            after["head"]["generation"] == head["generation"]
+            and after["head"]["sequence"] >= final["head"]["sequence"],
+            "dependency_unavailable",
+            503,
+        )
+        if any(before[key] != after[key] for key in ("physicals", "admissions", "turns")):
+            return False
+        observation["snapshot"] = after
+        return True
 
     def sync(self, service, observation, *, m0, scope, sources=(), profile=False):
         """Trusted source-sync port. m0 and scope are local state, never wire authority."""
@@ -282,6 +326,12 @@ class SourceAuthority:
 
     @contextmanager
     def operation(self, service, scope, **kwargs):
+        with self._operation_lock:
+            with self._operation(service, scope, **kwargs) as db:
+                yield db
+
+    @contextmanager
+    def _operation(self, service, scope, **kwargs):
         for _ in range(3):
             result, viewer = self.barrier(service, scope, **kwargs)
             with service.store.transaction() as db:

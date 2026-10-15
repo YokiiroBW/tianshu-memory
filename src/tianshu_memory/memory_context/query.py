@@ -1,6 +1,7 @@
 """Bounded candidate retrieval preserving whole groups and their authorized scopes."""
 
 import json
+from contextlib import contextmanager
 from datetime import timedelta
 
 from ..domain import Fault, canonical, parse_time, query_terms, require, terms, utc
@@ -79,18 +80,17 @@ def checks(service, db, scopes):
     ]
 
 
-def execute(application, request, context):
-    service = application.service
-    settings = service.retrieval.settings_for(request) if service.retrieval else None
+@contextmanager
+def verified_scopes(service, request, context):
+    """Use one snapshot for a single scope; independently verify associated scopes."""
     scope = request["requested_scope"]
-    period = request["time_range"]
-    if period is not None:
-        require(parse_time(period["from"]) < parse_time(period["to"]), "invalid_input", 400)
-    # Establish the requester's source barrier before finding association-controlled scopes.
     with service.operation(scope=scope, context=context) as db:
         ready(db)
         service._authorize(db, context, scope=scope)
         scopes = authorized_scopes(service, db, scope, request["include_associated"])
+        if len(scopes) == 1:
+            yield db, scopes
+            return
     # Memory's persisted, purpose-bound consent supplies access to these exact other scopes.
     # The ordinary source-owner grants are still independently rechecked; no origin is forged.
     for other, _, _ in scopes[1:]:
@@ -101,6 +101,17 @@ def execute(application, request, context):
         service._authorize(db, context, scope=scope)
         current_scopes = authorized_scopes(service, db, scope, request["include_associated"])
         require(current_scopes == scopes, "scope_changed", 409)
+        yield db, scopes
+
+
+def execute(application, request, context):
+    service = application.service
+    settings = service.retrieval.settings_for(request) if service.retrieval else None
+    scope = request["requested_scope"]
+    period = request["time_range"]
+    if period is not None:
+        require(parse_time(period["from"]) < parse_time(period["to"]), "invalid_input", 400)
+    with verified_scopes(service, request, context) as (db, scopes):
         version = service._scope_version(db, scope)
         association_version = identity_version(db, scope)
         scope_checks = checks(service, db, scopes)

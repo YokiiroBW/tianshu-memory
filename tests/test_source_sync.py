@@ -82,19 +82,56 @@ def test_each_barrier_transport_failure_rejects_zero_budget_without_business_wri
         assert db.execute("SELECT COUNT(*) FROM write_ledger").fetchone()[0] == 1
 
 
-def test_moving_core_retries_complete_barrier_then_fails_without_publishing(sync):
+def test_unrelated_core_head_motion_uses_verified_unchanged_source_snapshot(sync):
     def move(kind, body, response):
         if kind == "head":
             sync.core_head["sequence"] += 1
             response["head"] = copy.deepcopy(sync.core_head)
 
     sync.mutate = move
-    rejected(sync.post("memory/turn-commits", sync.event()))
-    assert barrier_kinds(sync) == ["snapshot", "current", "head"] * 3
+    response = sync.post("memory/turn-commits", sync.event())
+    assert response.status_code == 200, response.text
+    assert barrier_kinds(sync) == ["snapshot", "current", "head", "snapshot"]
     with sync.store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM source_admissions").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM owner_heads").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM source_admissions").fetchone()[0] == 1
+        assert db.execute("SELECT sequence FROM owner_heads WHERE owner='core'").fetchone()[0] == 11
+
+
+def test_relevant_withdrawal_during_double_collect_invalidates_before_query(sync):
+    sync.seed()
+    before = sync.select()["scope_version"]
+    changed = False
+
+    def withdraw(kind, body, response):
+        nonlocal changed
+        if kind == "head" and not changed:
+            changed = True
+            sync.physicals[0].update(
+                state="withdrawn",
+                kind="retract",
+                revision=2,
+                physical_receipt_id="synthetic-withdrawal",
+                content_digest="b" * 64,
+            )
+            sync.core_head["sequence"] += 1
+            response["head"] = copy.deepcopy(sync.core_head)
+
+    sync.mutate = withdraw
+    rejected(sync.post("memory/select", sync.selection(known=before)), 409, "scope_changed")
+    assert not sync.select()["selected_units"]
+
+
+def test_core_generation_change_cannot_be_hidden_by_equal_payload(sync):
+    sync.seed()
+
+    def restored(kind, body, response):
+        if kind == "head":
+            sync.core_head["generation"] = "synthetic-restored"
+            response["head"] = copy.deepcopy(sync.core_head)
+
+    sync.mutate = restored
+    rejected(sync.post("memory/select", sync.selection()))
 
 
 @pytest.mark.parametrize(
