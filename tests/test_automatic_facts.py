@@ -47,6 +47,7 @@ def add(
     explicit=False,
     entity=None,
     expected_status=200,
+    expected_state="completed",
 ):
     physical, admission, grant = [
         copy.deepcopy(items[0]) for items in (h.physicals, h.admissions, h.grants)
@@ -172,7 +173,10 @@ def add(
     assert committed.status_code == expected_status, committed.text
     if expected_status != 200:
         return committed.json(), job
-    assert committed.json()["state"] == "completed", committed.text
+    assert committed.json()["state"] == expected_state, committed.text
+    if expected_state == "rejected":
+        assert committed.json()["result"] == {"error_code": "invalid_input"}
+        assert h.post(PATH, dict(job_id=job, output=None)).json()["state"] == "pending"
     return committed.json()["result"], job
 
 

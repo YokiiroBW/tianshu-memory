@@ -20,7 +20,16 @@ def admits(query, indexed_terms):
     fact to mention every requested topic. Semantic retrieval has its own scores;
     this gate applies to the keyword candidate lane only.
     """
-    return any(_clause_admits(clause, indexed_terms) for clause in query_clauses(query))
+    clauses = query_clauses(query)
+    # A dependent instruction like '按我的口味选' is not a second request about
+    # every food preference when the actual request has already named a drink.
+    if "topic19" in topic_tokens(query):
+        clauses = [
+            clause
+            for clause in clauses
+            if not re.match(r"^(?:按|照)(?:我|我的)?(?:平时|平常)?口味", clause)
+        ]
+    return any(_clause_admits(clause, indexed_terms) for clause in clauses)
 
 
 def _clause_admits(clause, indexed_terms):

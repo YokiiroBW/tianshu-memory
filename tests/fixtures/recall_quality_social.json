@@ -1,0 +1,326 @@
+{
+  "description": "Original 22 cases plus natural wording and irrelevant-topic controls; controlled fixture, not an independent blind benchmark.",
+  "facts": [
+    {
+      "id": "address",
+      "text": "我住在苏州金鸡湖，近期没有变化。"
+    },
+    {
+      "id": "japanese",
+      "text": "我正在学习日语，每天复习词汇。"
+    },
+    {
+      "id": "python",
+      "text": "我用Python编程，常用开发工具是PyCharm。"
+    },
+    {
+      "id": "notebook",
+      "text": "我的学习笔记标题是《海风记录》。"
+    },
+    {
+      "id": "card",
+      "text": "合成测试：会员卡放在绿色信封。"
+    },
+    {
+      "id": "keys",
+      "text": "合成测试：钥匙放在蓝色标签盒。"
+    },
+    {
+      "id": "pen",
+      "text": "写手账用钢笔，搭配蓝黑墨水。"
+    },
+    {
+      "id": "tea",
+      "text": "我爱喝乌龙茶，晚上不喝浓茶。"
+    },
+    {
+      "id": "occupation",
+      "text": "我的职业是后端工程师。"
+    },
+    {
+      "id": "dog",
+      "text": "我养的狗叫麦粒。"
+    },
+    {
+      "id": "title",
+      "text": "我的小说书名叫《调用记忆工具》。"
+    },
+    {
+      "id": "music",
+      "text": "我会弹吉他。"
+    },
+    {
+      "id": "wallet",
+      "text": "我的红色卡包平时放在玄关最上层的抽屉。"
+    },
+    {
+      "id": "food",
+      "text": "我吃面不放香菜，平时喜欢清淡口味。"
+    },
+    {
+      "id": "cup",
+      "text": "我的水杯通常放在书桌左边。"
+    }
+  ],
+  "queries": [
+    {
+      "id": "R01",
+      "split": "regression",
+      "query": "我的学习笔记叫什么？",
+      "expected": [
+        "notebook"
+      ]
+    },
+    {
+      "id": "R02",
+      "split": "regression",
+      "query": "请调用记忆工具，记住我的会员卡放在绿色信封。",
+      "expected": [
+        "card"
+      ]
+    },
+    {
+      "id": "R03",
+      "split": "regression",
+      "query": "我的钢笔和墨水没有变化。",
+      "expected": [
+        "pen"
+      ]
+    },
+    {
+      "id": "R04",
+      "split": "regression",
+      "query": "合成测试：我的纪念币放在哪里？",
+      "expected": []
+    },
+    {
+      "id": "R05",
+      "split": "regression",
+      "query": "合成测试：我的会员卡在哪里？",
+      "expected": [
+        "card"
+      ]
+    },
+    {
+      "id": "R06",
+      "split": "regression",
+      "query": "请用记忆工具忘掉会员卡的位置。",
+      "expected": [
+        "card"
+      ]
+    },
+    {
+      "id": "R07",
+      "split": "regression",
+      "query": "请使用记忆工具，更正我的钥匙位置。",
+      "expected": [
+        "keys"
+      ]
+    },
+    {
+      "id": "R08",
+      "split": "regression",
+      "query": "我以前提到的《调用记忆工具》是什么书名？",
+      "expected": [
+        "title"
+      ]
+    },
+    {
+      "id": "N01",
+      "split": "fresh",
+      "query": "我住在哪，做什么工作？",
+      "expected": [
+        "address",
+        "occupation"
+      ]
+    },
+    {
+      "id": "N02",
+      "split": "fresh",
+      "query": "我的宠物叫什么？",
+      "expected": [
+        "dog"
+      ]
+    },
+    {
+      "id": "N03",
+      "split": "fresh",
+      "query": "我学什么外语？",
+      "expected": [
+        "japanese"
+      ]
+    },
+    {
+      "id": "N04",
+      "split": "fresh",
+      "query": "我的编程工具是什么？",
+      "expected": [
+        "python"
+      ]
+    },
+    {
+      "id": "N05",
+      "split": "fresh",
+      "query": "我平时喝什么茶？",
+      "expected": [
+        "tea"
+      ]
+    },
+    {
+      "id": "N06",
+      "split": "fresh",
+      "query": "我写手账用什么笔？",
+      "expected": [
+        "pen"
+      ]
+    },
+    {
+      "id": "N07",
+      "split": "fresh",
+      "query": "我会弹什么乐器，吉他吗？",
+      "expected": [
+        "music"
+      ]
+    },
+    {
+      "id": "N08",
+      "split": "fresh",
+      "query": "我的银行卡密码是什么？",
+      "expected": []
+    },
+    {
+      "id": "N09",
+      "split": "fresh",
+      "query": "我的护照号码是什么？",
+      "expected": []
+    },
+    {
+      "id": "N10",
+      "split": "fresh",
+      "query": "今晚天气如何？",
+      "expected": []
+    },
+    {
+      "id": "N11",
+      "split": "fresh",
+      "query": "现在能聊聊吗？",
+      "expected": []
+    },
+    {
+      "id": "N12",
+      "split": "fresh",
+      "query": "记得《海风记录》吗？",
+      "expected": [
+        "notebook"
+      ]
+    },
+    {
+      "id": "N13",
+      "split": "fresh",
+      "query": "我的狗叫什么，我的会员卡在哪里？",
+      "expected": [
+        "dog",
+        "card"
+      ]
+    },
+    {
+      "id": "N14",
+      "split": "fresh",
+      "query": "《海风记录》叫什么，我的职业是什么？",
+      "expected": [
+        "notebook",
+        "occupation"
+      ]
+    },
+    {
+      "id": "S01",
+      "split": "social_wording",
+      "query": "出门找半天，我那个卡包一般搁哪儿？",
+      "expected": [
+        "wallet"
+      ]
+    },
+    {
+      "id": "S02",
+      "split": "social_wording",
+      "query": "我卡包平时放哪来着？",
+      "expected": [
+        "wallet"
+      ]
+    },
+    {
+      "id": "S03",
+      "split": "social_wording",
+      "query": "找不到卡包了，通常收在哪个地方？",
+      "expected": [
+        "wallet"
+      ]
+    },
+    {
+      "id": "S04",
+      "split": "social_wording",
+      "query": "我的钥匙一般搁哪儿？",
+      "expected": [
+        "keys"
+      ]
+    },
+    {
+      "id": "S05",
+      "split": "social_wording",
+      "query": "我的会员卡通常收在哪？",
+      "expected": [
+        "card"
+      ]
+    },
+    {
+      "id": "S06",
+      "split": "social_wording",
+      "query": "我的纪念币一般放哪？",
+      "expected": []
+    },
+    {
+      "id": "S07",
+      "split": "social_wording",
+      "query": "帮我点杯饮料，选我常喝的。",
+      "expected": [
+        "tea"
+      ]
+    },
+    {
+      "id": "S08",
+      "split": "social_wording",
+      "query": "给我带一杯喝的，按我平时口味选就行。",
+      "expected": [
+        "tea"
+      ]
+    },
+    {
+      "id": "S09",
+      "split": "social_wording",
+      "query": "我平时爱喝啥？",
+      "expected": [
+        "tea"
+      ]
+    },
+    {
+      "id": "S10",
+      "split": "social_wording",
+      "query": "我常喝什么咖啡？",
+      "expected": []
+    },
+    {
+      "id": "S11",
+      "split": "social_wording",
+      "query": "我的水杯一般放哪儿？",
+      "expected": [
+        "cup"
+      ]
+    },
+    {
+      "id": "S12",
+      "split": "social_wording",
+      "query": "我有没有宠物蛇？",
+      "expected": []
+    }
+  ]
+}

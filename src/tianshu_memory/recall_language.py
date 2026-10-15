@@ -15,6 +15,7 @@ def clean_query(value):
         )
         parts[index] = re.sub(
             r"(?:没有|并未|并没有|未曾)(?:再)?(?:变化|改变)|"
+            r"(?:还|仍)(?:是|用)(?:以前|之前|原来)(?:的|那个|那种)?|"
             r"(?:和|跟)(?:以前|之前|原来)一样|(?:请|帮我|替我)(?:记住|记下|更正|忘掉|忘记|查一下)",
             " ",
             text,
@@ -24,6 +25,21 @@ def clean_query(value):
 
 def query_focus(value):
     """An explicit possessive/object question supplies stronger anchors than its preamble."""
+    location = re.search(
+        r"(?:我的?|我那|我家的)?([\u3400-\u9fff]{2,12}?)(?:一般|平时|通常|平常)?"
+        r"(?:搁|放|收|存放|摆)(?:在)?哪(?:儿|里|个地方)?",
+        value,
+    )
+    if location:
+        target = re.sub(r"^(?:我的那个|我那个|那个|我的?|我那|帮我找找)", "", location[1])
+        if target:
+            return target
+    missing = re.search(r"(?:找不到|找不着)([^，,。；;！？!?]+?)(?:了|来着)?$", value)
+    if missing and len(missing[1]) >= 2:
+        return missing[1]
+    missing = re.search(r"^(.+?)(?:又|突然)?(?:找不到|找不着|不见|找不见)(?:了)?$", value)
+    if missing:
+        return re.sub(r"^(?:我的那个|我那个|那个|我的?|我那)", "", missing[1])
     ending = r"(?=(?:存放在|放在|放|在)?哪|叫什么|叫啥|用什么|使用什么|是什么|的(?:位置|名字|名称)|位置|[？?])"
     owned = re.search(r"(?:我的|我家(?:的)?|我那)(.+?)" + ending, value)
     if owned:
@@ -66,6 +82,8 @@ def topic_family(tokens):
         result.add("topic10")
     if result.intersection({"topic5", "topic6"}):
         result.add("topic4")
+    if result.intersection({"topic7", "topic8", "beverage", "drink", "饮料", "饮品"}):
+        result.add("topic19")
     return result
 
 
@@ -100,6 +118,19 @@ TOPICS = (
         "app",
         "programming language",
     ),
+    (
+        "饮料",
+        "饮品",
+        "喝什么",
+        "喝啥",
+        "爱喝",
+        "常喝",
+        "点一杯",
+        "点杯",
+        "带一杯喝的",
+        "beverage",
+        "drink",
+    ),
 )
 
 
@@ -120,6 +151,9 @@ def topic_tokens(value):
             for alias in aliases
         ):
             result.append("topic" + str(index))
+    # '喝什么咖啡/茶' asks for a specific drink family, not all beverages.
+    if {"topic7", "topic8"}.intersection(result) and "topic19" in result:
+        result.remove("topic19")
     return result
 
 

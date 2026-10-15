@@ -120,7 +120,7 @@ def test_entity_hints_cannot_override_source_identity(sync, wrong):
         "红色",
         second=2,
         entity=proposed,
-        expected_status=400,
+        expected_state="rejected",
     )
     with sync.store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM automatic_facts").fetchone()[0] == 1
@@ -164,7 +164,7 @@ def test_numbered_subtypes_do_not_share_an_identity(sync):
         "红色",
         second=3,
         entity=entity("第1支笔", saved_entity(sync, fountain)["id"]),
-        expected_status=400,
+        expected_state="rejected",
     )
 
 
@@ -175,7 +175,15 @@ def test_forgotten_object_reference_does_not_restore_its_fact(sync):
     response = sync.post("memory/revise", sync.revision(saved["record_ids"][0]))
     assert response.status_code == 200, response.text
     assert recall(sync, "第一支钢笔的墨水") == []
-    add(sync, "第一支钢笔用红墨水", "pen.ink", "红色", second=2, entity=one, expected_status=400)
+    add(
+        sync,
+        "第一支钢笔用红墨水",
+        "pen.ink",
+        "红色",
+        second=2,
+        entity=one,
+        expected_state="rejected",
+    )
     assert recall(sync, "第一支钢笔的墨水") == []
 
 
@@ -264,7 +272,7 @@ def test_ordinal_only_reference_requires_unique_existing_sourced_identity(sync):
         "夜航",
         second=4,
         entity=entity("第二本", kind="notebook"),
-        expected_status=400,
+        expected_state="rejected",
     )
     add(
         sync,
@@ -273,7 +281,7 @@ def test_ordinal_only_reference_requires_unique_existing_sourced_identity(sync):
         "夜航",
         second=5,
         entity=entity("第二本", one["id"], kind="notebook"),
-        expected_status=400,
+        expected_state="rejected",
     )
 
 
@@ -288,5 +296,5 @@ def test_ordinal_only_reference_cannot_choose_between_numbered_subtypes(sync):
         "红色",
         second=3,
         entity=entity("第一支", saved_entity(sync, one)["id"]),
-        expected_status=400,
+        expected_state="rejected",
     )

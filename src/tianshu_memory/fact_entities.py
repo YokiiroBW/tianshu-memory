@@ -11,6 +11,60 @@ import unicodedata
 from .domain import fingerprint, require
 from .recall_language import topic_aliases
 
+OBJECT_NOUNS = {
+    "notebook": ("本", ("笔记本", "笔记", "手账")),
+    "book": ("本", ("书", "书籍")),
+    "pen": ("支", ("钢笔", "圆珠笔", "铅笔", "笔")),
+    "cat": ("只", ("猫", "猫咪")),
+    "dog": ("只", ("狗", "狗狗")),
+}
+
+
+def grounded_ordinal(entity, quotes):
+    """Expand only a numbered object whose noun is explicitly in the same quote."""
+    classifier, nouns = OBJECT_NOUNS.get(entity["kind"], (None, ()))
+    if not classifier or not entity["mention"].endswith(classifier):
+        return None
+    found = set()
+    other_nouns = set()
+    for proof in quotes:
+        text = proof["quote"]
+        if entity["mention"] not in text:
+            continue
+        for other_kind, (other_classifier, aliases) in OBJECT_NOUNS.items():
+            if other_classifier == classifier and other_kind != entity["kind"]:
+                for noun in aliases:
+                    if re.search(
+                        r"[两二三四五六七八九十0-9]+"
+                        + classifier
+                        + re.escape(noun)
+                        + r"(?=[，,。；;：:\s]|$)",
+                        text,
+                    ):
+                        other_nouns.add(noun)
+        for noun in nouns:
+            if re.search(
+                r"[两二三四五六七八九十0-9]+"
+                + classifier
+                + re.escape(noun)
+                + r"(?=[，,。；;：:\s]|$)",
+                text,
+            ):
+                found.add(noun)
+            # In '第一本笔记本叫…，第二本叫…', the explicitly named
+            # sibling supplies the noun omitted from the later list item.
+            if re.search(
+                r"第[一二三四五六七八九十0-9]+"
+                + classifier
+                + re.escape(noun)
+                + r"(?=叫|名|标题|[，,。；;：:])",
+                text,
+            ):
+                found.add(noun)
+    if len(found) == 1 and not other_nouns:
+        return dict(entity, mention=entity["mention"] + next(iter(found)))
+    return None
+
 
 def normalize_mention(value):
     value = unicodedata.normalize("NFKC", value).casefold()
@@ -81,13 +135,10 @@ def resolve(service, db, scope, fact, quotes):
     if entity is None:
         return fact
     require(any(entity["mention"] in q["quote"] for q in quotes), "invalid_input", 400)
-    if re.fullmatch(
+    abbreviated = re.fullmatch(
         r"第[一二三四五六七八九十百零两0-9]+(?:只|支|个|本|张|台|辆|件)?",
         normalize_mention(entity["mention"]),
-    ):
-        # An ordinal-only reference may reuse a uniquely matching server identity;
-        # it cannot establish a new object without a sourced distinguishing noun.
-        require(entity["id"] is not None, "invalid_input", 400)
+    )
     objects = {}
     for row in db.execute("SELECT group_id,payload FROM automatic_facts WHERE scope=?", (scope,)):
         prior = json.loads(row["payload"]).get("entity")
@@ -111,6 +162,9 @@ def resolve(service, db, scope, fact, quotes):
         require(len(matches) <= 1, "invalid_input", 400)
         identity = next(iter(matches), None)
         if identity is None:
+            if abbreviated:
+                entity = grounded_ordinal(entity, quotes)
+                require(entity is not None, "invalid_input", 400)
             identity = "entity:" + fingerprint([scope, *anchor(entity)])
     return dict(fact, entity=dict(entity, id=identity))
 
@@ -143,8 +197,18 @@ def filter_targets(db, candidates, query):
             noun = re.sub(number, "", normalize_mention(entity["mention"]))
             label = noun or entity["kind"]
             aliases = {normalize_mention(alias) for alias in {label, *topic_aliases(label)}}
-            pattern = number + "(?:" + "|".join(re.escape(alias) for alias in sorted(aliases)) + ")"
-            positions = {ordinal(match[0]) for match in re.finditer(pattern, normalized)}
+            numbered_list = number + "(?:(?:和|与|及|跟|、|/)" + number + ")*"
+            pattern = (
+                numbered_list
+                + "(?:"
+                + "|".join(re.escape(alias) for alias in sorted(aliases))
+                + ")"
+            )
+            positions = {
+                ordinal(position[0])
+                for match in re.finditer(pattern, normalized)
+                for position in re.finditer(number, match[0])
+            }
             if positions:
                 numbered = True
                 if ordinal(entity["mention"]) in positions:

@@ -52,11 +52,16 @@ class CandidateExtraction:
             return result
         try:
             drafts = self._drafts(event, content, request["output"])
+            # The workflow rolls its entire transaction back before raising. An
+            # invalid entity/derived fact is therefore a definite rejection too,
+            # allowing a fresh extraction instead of replaying an invalid proposal.
+            result = TrustedWorkflow(service).commit_extracted(
+                dict(job_id=job["id"], drafts=drafts)
+            )
         except Fault as error:
             if error.code != "invalid_input":
                 raise
             return dict(state="rejected", result={"error_code": "invalid_input"}, content=[])
-        result = TrustedWorkflow(service).commit_extracted(dict(job_id=job["id"], drafts=drafts))
         return dict(state="completed", result=result, content=[])
 
     def _content(self, event):

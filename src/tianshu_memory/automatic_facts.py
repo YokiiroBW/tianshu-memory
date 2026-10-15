@@ -11,6 +11,7 @@ import unicodedata
 from . import fact_entities
 from .domain import canonical, fingerprint, parse_time, require
 from .fact_migration import installed
+from .fact_updates import may_replace
 
 FIELDS = {"key", "value", "state", "valid_from", "valid_to", "keywords"}
 
@@ -248,6 +249,12 @@ def commit(writer, db, draft, event, source_map):
                 or not service._group_current(db, old["group_id"])
             ):
                 continue
+            prior_record = db.execute(
+                "SELECT payload FROM records WHERE group_id=? AND state='active'",
+                (old["group_id"],),
+            ).fetchone()
+            if not prior_record or not may_replace(prior, json.loads(prior_record[0]), fact, unit):
+                continue
             db.execute(
                 "UPDATE automatic_facts SET superseded_by=? WHERE group_id=?",
                 (group_id, old["group_id"]),
@@ -291,8 +298,11 @@ def index_text(db, unit):
 def filter_current(db, candidates, query, clock):
     if not installed(db):
         return candidates
+    from .recall_language import clean_query
+
+    temporal_query = re.sub(r'[“「《"].*?[”」》"]', "", clean_query(query)).casefold()
     history = any(
-        x in query.casefold()
+        x in temporal_query
         for x in (
             "以前",
             "之前",
