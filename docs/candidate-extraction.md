@@ -6,6 +6,12 @@ TS-168：候选排队时，另一条独立事实落库可能推进内容版本�
 
 这些路径继续经过当前 SourceAuthority 屏障、精确 scope、来源 revision/epoch 快照和权限核验，并在提交事务内重读候选的 pending 状态。撤回或撤权后的候选不能借空提议通过。事件与原范围版本保持不可变，没有新增线协议、授权字段、生产权限或数据库迁移。
 
+TS-173 补齐登记阶段的竞争窗口，并将上述规则细分为原话和派生答案：回复已完成、turn-committed 尚未交给 Memory 时，另一个自动提议可能先新增或更正事实。登记和后续抽取共用原话有效版本，自动事实变更后仍可处理来源有效的原事件；显式修订/遗忘、撤权、来源失效、未来版本或未分类写入继续拒绝。事件版本不被改写，模型不重放，原事件及候选写入仍幂等。人工审阅提交仍严格匹配内容版本。
+
+自动事实更正推进答案历史版本，但保留原话历史版本。同属性、同对象的提议按来源时间和既有有效期规则比较；晚完成的旧提议保留为历史，不会盖过较新的当前事实。无关属性的候选不会仅因地点更正而被误拒。否定、条件、来源和身份检查仍由原规则处理，不猜测未建立的活动或对象关系。
+
+新增内部只读端口 `POST /internal/v1/memory/context/input-history`，复用已发布 `context-history` 请求/响应结构和既有 `context_query` 权限。原 `history` 端口继续核验包含助手回答的完整历史；新端口只供已剥离回答和派生依赖的人类输入核验。两个版本同存于现有 metadata，旧记录缺少原话版本时继承较严格的答案版本，未知写者仍使两者失效，无新增表或迁移。后续成对发布需先 Memory 后 Companion，不能让旧 Memory 配新客户端。
+
 新增内部端口 `POST /internal/v1/memory/candidates/process`，由 TS-117/118 成对消费。沿用 Companion 的 Bearer 服务认证、`consume` 操作与事件精确范围/运行角色授权；不增加生产权限。来源必须使用已配置的 SourceAuthority。此端口不是浏览器接口，不接受 Cookie/Origin。
 
 请求仅含 `job_id` 和 `output`。`output:null` 查询处理状态，未完成时读取来源权威当前允许的原文，返回 `{state:"pending",result:null,content:[{index,text,sent_at}]}`。已提交返回 `completed` 和原 `source-sync/v1 workflow#candidate_result` 回执；失效候选返回 `invalidated`。查询完成回执不会重新提炼。

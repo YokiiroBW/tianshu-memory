@@ -172,6 +172,12 @@ def execute(application, request, context):
                 query_sql, query_parameters = keyword_candidates(
                     canonical(selected_scope), request["query_text"], search_terms
                 )
+                if installed(db) and not history_query(request["query_text"]):
+                    from ..fact_references import expand_candidates
+
+                    query_sql, query_parameters = expand_candidates(
+                        query_sql, query_parameters, canonical(selected_scope)
+                    )
                 if installed(db) and history_query(request["query_text"]):
                     from ..fact_entities import historical_candidates
 

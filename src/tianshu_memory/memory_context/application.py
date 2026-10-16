@@ -21,6 +21,11 @@ class MemoryContext:
 
         return execute(self, request, context)
 
+    def input_history(self, request, context):
+        from .history import execute
+
+        return execute(self, request, context, input_only=True)
+
     def _old(self, db, request, context):
         row = db.execute(
             "SELECT digest,receipt FROM context_operations WHERE service=? AND scope=? AND operation_id=?",

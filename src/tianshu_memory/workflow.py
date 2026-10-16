@@ -63,19 +63,20 @@ class _WorkflowBase:
                 require(job["state"] == "pending", "scope_changed", 409)
             current_version = self.service._scope_version(db, event["scope"])
             if event["scope_version"] != current_version:
-                from .memory_context.history import history_version
+                from .memory_context.history import source_version_retained
 
-                # Independent sourced extraction survives additive facts committed
-                # while it was queued. Semantic revisions still reject a nonempty
-                # proposal; an empty proposal cannot restore any old fact. All
+                # Independent sourced extraction survives automatic fact updates
+                # while it was queued. Explicit revisions/withdrawals still reject
+                # a nonempty proposal; an empty proposal cannot restore a fact. All
                 # paths still recheck the current job, authority and exact sources.
                 require(
                     source_extraction
                     and event["scope_version"] < current_version
                     and (
                         not drafts
-                        or history_version(self.service, db, event["scope"])
-                        <= event["scope_version"]
+                        or source_version_retained(
+                            self.service, db, event["scope"], event["scope_version"]
+                        )
                     ),
                     "scope_changed",
                     409,

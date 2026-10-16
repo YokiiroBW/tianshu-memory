@@ -114,6 +114,38 @@ def test_queued_extraction_survives_additions_but_reviewed_snapshot_stays_strict
     assert sync.post(PATH, dict(job_id=job, output=output())).json() == response.json()
 
 
+@pytest.mark.parametrize("history_changed", [False, True])
+def test_delayed_turn_registration_only_survives_additive_version_changes(
+    sync, monkeypatch, history_changed
+):
+    original = sync.post
+    delayed = False
+
+    def after_other_commit(path, body):
+        nonlocal delayed
+        if path == "memory/turn-commits" and not delayed:
+            delayed = True
+            with sync.store.transaction() as db:
+                sync.service._bump(db, sync.scope(), history_changed=history_changed)
+        return original(path, body)
+
+    monkeypatch.setattr(sync, "post", after_other_commit)
+    job = prepare(sync)
+    if history_changed:
+        assert job is None
+        assert sync.post("memory/turn-commits", sync.event()).json()["state"] == "scope_changed"
+        return
+    assert job is not None
+    pending = sync.post(PATH, dict(job_id=job, output=None))
+    assert pending.status_code == 200 and pending.json()["content"][0]["text"] == TEXT
+    completed = sync.post(PATH, dict(job_id=job, output=output()))
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["result"]["state"] == "committed"
+    assert sync.post("memory/turn-commits", sync.event()).json()["candidate_job_ref"] == job
+    assert sync.post(PATH, dict(job_id=job, output=output())).json() == completed.json()
+    assert len(recall(sync)) == 1
+
+
 @pytest.mark.parametrize("empty", [False, True])
 def test_semantic_version_change_rejects_facts_but_empty_current_source_can_skip(sync, empty):
     job = prepare(sync)

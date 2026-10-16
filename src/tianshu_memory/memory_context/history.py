@@ -12,7 +12,7 @@ def metadata_key(scope):
     return "context_history:" + fingerprint(scope)
 
 
-def history_version(service, db, scope):
+def history_version(service, db, scope, *, input_only=False):
     current = service._scope_version(db, scope)
     row = db.execute("SELECT value FROM metadata WHERE key=?", (metadata_key(scope),)).fetchone()
     if row is None:
@@ -21,20 +21,37 @@ def history_version(service, db, scope):
     # An unclassified writer, or an old database, must not preserve stale history.
     if value["scope_version"] != current:
         return current
+    if input_only:
+        # Older databases inherit the stricter epoch; no prior withdrawal is undone.
+        return value.get("source_history_version", value["history_version"])
     return value["history_version"]
 
 
-def record_version(db, scope, content_version, retained_version):
+def record_version(db, scope, content_version, retained_version, source_version):
     db.execute(
         "INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (
             metadata_key(scope),
-            canonical(dict(scope_version=content_version, history_version=retained_version)),
+            canonical(
+                dict(
+                    scope_version=content_version,
+                    history_version=retained_version,
+                    source_history_version=source_version,
+                )
+            ),
         ),
     )
 
 
-def execute(application, request, context):
+def source_version_retained(service, db, scope, version):
+    """Sourced work survives fact updates, never a future or withdrawn source epoch."""
+    current = service._scope_version(db, scope)
+    return version == current or (
+        version < current and history_version(service, db, scope, input_only=True) <= version
+    )
+
+
+def execute(application, request, context, *, input_only=False):
     service = application.service
     scope = request["requested_scope"]
     with verified_scopes(service, request, context) as (db, scopes):
@@ -57,7 +74,7 @@ def execute(application, request, context):
             history_checks=[
                 dict(
                     scope=other,
-                    history_version=history_version(service, db, other),
+                    history_version=history_version(service, db, other, input_only=input_only),
                     association_id=link,
                     association_version=epoch,
                 )

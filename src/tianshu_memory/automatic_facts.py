@@ -121,6 +121,23 @@ def _replace_unit(writer, db, row, unit, scope, field, item):
     writer._index(db, unit, scope, field, item)
 
 
+def _supersede(writer, db, scope, group_id, successor, effective, fact):
+    db.execute(
+        "UPDATE automatic_facts SET superseded_by=? WHERE group_id=?",
+        (successor, group_id),
+    )
+    for record in db.execute(
+        "SELECT * FROM records WHERE group_id=? AND state='active'", (group_id,)
+    ).fetchall():
+        value = json.loads(record["payload"])
+        value["valid_time"] = (
+            f"历史记录；{effective} 起被后续陈述替代，不能作为当前事实。原时间：{value['valid_time']}"[
+                :1200
+            ]
+        )
+        _replace_unit(writer, db, record, value, scope, "automatic." + fact["key"], None)
+
+
 def commit(writer, db, draft, event, source_map):
     """Merge a semantic duplicate or append an auditable fact, never a bare DB injection."""
     require(installed(db), "dependency_unavailable", 503)
@@ -230,6 +247,9 @@ def commit(writer, db, draft, event, source_map):
                 draft["item_key"],
             )
     # A past report cannot supersede the current value. A future-effective fact waits for its date.
+    if duplicate:
+        fact, unit = merged, saved
+        observed = max(observed, duplicate["observed_at"], key=parse_time)
     effective = fact["valid_from"] or observed
     if (
         fact["state"] == "current"
@@ -241,11 +261,13 @@ def commit(writer, db, draft, event, source_map):
             "AND group_id!=? AND superseded_by IS NULL",
             (scope, identity_key, group_id),
         ).fetchall()
+        eligible = []
         for old in previous:
             prior = json.loads(old["payload"])
             if (
                 prior["state"] != "current"
-                or parse_time(prior["valid_from"] or old["observed_at"]) >= parse_time(effective)
+                or parse_time(prior["valid_from"] or old["observed_at"]) > service.clock()
+                or (prior["valid_to"] and parse_time(prior["valid_to"]) <= service.clock())
                 or not service._group_current(db, old["group_id"])
             ):
                 continue
@@ -253,26 +275,46 @@ def commit(writer, db, draft, event, source_map):
                 "SELECT payload FROM records WHERE group_id=? AND state='active'",
                 (old["group_id"],),
             ).fetchone()
-            if not prior_record or not may_replace(prior, json.loads(prior_record[0]), fact, unit):
-                continue
-            db.execute(
-                "UPDATE automatic_facts SET superseded_by=? WHERE group_id=?",
-                (group_id, old["group_id"]),
+            if prior_record:
+                eligible.append((old, prior, json.loads(prior_record[0])))
+        # A queued older proposal is evidence of the past, even if it finishes last.
+        # Decide this before retiring any previously current group.
+        newer = [
+            (old, prior, prior_unit)
+            for old, prior, prior_unit in eligible
+            if parse_time(prior["valid_from"] or old["observed_at"]) > parse_time(effective)
+            and may_replace(fact, unit, prior, prior_unit)
+        ]
+        if newer:
+            old, prior, _ = max(
+                newer, key=lambda item: parse_time(item[1]["valid_from"] or item[0]["observed_at"])
             )
-            # A changed current fact invalidates replies that relied on its old value.
-            service._bump(db, draft["scope"])
-            for record in db.execute(
-                "SELECT * FROM records WHERE group_id=? AND state='active'", (old["group_id"],)
-            ).fetchall():
-                value = json.loads(record["payload"])
-                value["valid_time"] = (
-                    f"历史记录；{effective} 起被后续陈述替代，不能作为当前事实。原时间：{value['valid_time']}"[
-                        :1200
-                    ]
-                )
-                _replace_unit(
-                    writer, db, record, value, draft["scope"], "automatic." + prior["key"], None
-                )
+            _supersede(
+                writer,
+                db,
+                draft["scope"],
+                group_id,
+                old["group_id"],
+                prior["valid_from"] or old["observed_at"],
+                fact,
+            )
+            return group_id, ids
+        for old, prior, prior_unit in eligible:
+            if parse_time(prior["valid_from"] or old["observed_at"]) >= parse_time(
+                effective
+            ) or not may_replace(prior, prior_unit, fact, unit):
+                continue
+            _supersede(
+                writer,
+                db,
+                draft["scope"],
+                old["group_id"],
+                group_id,
+                effective,
+                prior,
+            )
+            # Only derived answers become stale; the human source itself was not withdrawn.
+            service._bump(db, draft["scope"], source_history_changed=False)
     return group_id, ids
 
 

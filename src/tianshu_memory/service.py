@@ -65,7 +65,7 @@ class MemoryService:
         row = db.execute("SELECT version FROM scopes WHERE key=?", (canonical(scope),)).fetchone()
         return row[0] if row else 1
 
-    def _bump(self, db, scope, *, history_changed=True):
+    def _bump(self, db, scope, *, history_changed=True, source_history_changed=None):
         from .memory_context.history import history_version, record_version
 
         if self.retrieval is not None:
@@ -73,12 +73,21 @@ class MemoryService:
         if "profile_subject" in scope:
             scope = {k: v for k, v in scope.items() if k != "profile_subject"}
         previous_history = history_version(self, db, scope)
+        previous_source = history_version(self, db, scope, input_only=True)
+        if source_history_changed is None:
+            source_history_changed = history_changed
         db.execute(
             "INSERT INTO scopes VALUES (?,2) ON CONFLICT(key) DO UPDATE SET version=version+1",
             (canonical(scope),),
         )
         version = self._scope_version(db, scope)
-        record_version(db, scope, version, version if history_changed else previous_history)
+        record_version(
+            db,
+            scope,
+            version,
+            version if history_changed else previous_history,
+            version if source_history_changed else previous_source,
+        )
         return version
 
     def _authorize(self, db, context, scope=None, account=None):
@@ -492,7 +501,7 @@ class MemoryService:
     def _rank_groups(self, db, eligible, search_terms, query):
         from .recall_index import rank_groups
 
-        return rank_groups(db, eligible, search_terms, query)
+        return rank_groups(self, db, eligible, search_terms, query)
 
     def _fit_groups(self, eligible, budget):
         units, dependencies, omissions = [], [], []
@@ -558,6 +567,8 @@ class MemoryService:
         return profiles.select(self, request, context)
 
     def consume(self, event, publisher):
+        from .memory_context.history import source_version_retained
+
         require(publisher["authenticated_service"] == "companion")
         require(event["scope"]["actor_id"] not in publisher.get("blocked_role_actors", []))
         require(
@@ -640,7 +651,7 @@ class MemoryService:
                     latest is not None and event["aggregate_version"] < latest
                 ):
                     result["state"] = "stale_source"
-                elif event["scope_version"] != self._scope_version(db, event["scope"]):
+                elif not source_version_retained(self, db, event["scope"], event["scope_version"]):
                     result["state"] = "scope_changed"
                 else:
                     try:

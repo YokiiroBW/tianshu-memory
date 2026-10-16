@@ -7,7 +7,7 @@ from .recall_language import normalize_objects, topic_tokens
 from .recall_relevance import matching_clauses
 
 
-def rank_groups(db, eligible, search_terms, query):
+def rank_groups(service, db, eligible, search_terms, query):
     if not search_terms or not eligible:
         return []
     # FTS metadata columns are UNINDEXED. Looking up each record separately scans
@@ -20,8 +20,15 @@ def rank_groups(db, eligible, search_terms, query):
         ):
             indexed.setdefault((row["record_id"], row["record_version"]), row["text"])
     from .fact_entities import historical_title_groups
+    from .fact_references import reference_terms
+    from .recall_language import history_query
 
     historical = historical_title_groups(db, eligible, query) if installed(db) else set()
+    references = (
+        reference_terms(service, db, eligible, indexed)
+        if installed(db) and not history_query(query)
+        else {}
+    )
     raw_text = {
         group["id"]: " ".join(u["statement"] for u in units) for group, _, units in eligible
     }
@@ -30,6 +37,7 @@ def rank_groups(db, eligible, search_terms, query):
         if any((row["id"], row["version"]) not in indexed for row in rows):
             return group["id"], ""
         text = " ".join(indexed.get((row["id"], row["version"]), "") for row in rows)
+        text += " " + references.get(group["id"], "")
         normalized = normalize_objects(text)
         if normalized != text:
             text += " " + " ".join(terms(normalized))

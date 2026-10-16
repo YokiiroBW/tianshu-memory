@@ -14,6 +14,7 @@ from ..domain import Fault, require, strict_json
 DEFINITIONS = {
     "query": ("query_request", "query_response"),
     "history": ("request", "response"),
+    "input_history": ("request", "response"),
     "propose": ("proposal_request", "receipt"),
     "receipt": ("receipt_request", "receipt_response"),
     "batch": ("batch_request", "batch_response"),
@@ -49,7 +50,8 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                     caller_name, caller = await lease.run(
                         auth.authenticate, request.headers.get("authorization")
                     )
-                permission = "context_query" if operation == "history" else "context_" + operation
+                history = operation in {"history", "input_history"}
+                permission = "context_query" if history else "context_" + operation
                 require(permission in caller.get("operations", []))
                 require(await anote_authenticated(), "log_unavailable", 503)
                 require(not request.headers.get("origin") and not request.headers.get("cookie"))
@@ -66,7 +68,7 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                         body.extend(chunk)
                 payload = strict_json(body)
                 input_type, output_type = DEFINITIONS[operation]
-                package = "context-history" if operation == "history" else "memory-context"
+                package = "context-history" if history else "memory-context"
                 application.service.contracts.validate(package + "#" + input_type, payload)
                 header = payload["command" if mutation else "query"]
                 request_id = header["request_id"]
@@ -127,7 +129,7 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
 
     for operation in DEFINITIONS:
         app.add_api_route(
-            "/internal/v1/memory/context/" + operation,
+            "/internal/v1/memory/context/" + operation.replace("_", "-"),
             endpoint_for(operation),
             methods=["POST"],
             name="memory_context_" + operation,

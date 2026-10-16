@@ -198,6 +198,7 @@ def test_correction_recall_retains_auditable_past_without_old_current(sync):
     newer, _ = add(sync, "现在搬到杭州滨江区了", "residence", second=2)
     with sync.store.transaction() as db:
         assert history_version(sync.service, db, sync.scope()) > original
+        assert history_version(sync.service, db, sync.scope(), input_only=True) == original
     units = recall(sync, "我目前的住所在哪")
     assert {u["record_id"] for u in units} == set(newer["record_ids"])
     history = recall(sync, "我以前的住址")
@@ -217,6 +218,49 @@ def test_correction_recall_retains_auditable_past_without_old_current(sync):
             ).fetchone()[0]
             == 2
         )
+
+
+@pytest.mark.parametrize("unrelated", [False, True])
+def test_queued_fact_survives_automatic_correction_without_replacing_newer_source(
+    sync, monkeypatch, unrelated
+):
+    initialize(sync)
+    first, _ = add(sync, "周六公园南门碰头", "meeting.park", second=1)
+    original_post = sync.post
+    newer = None
+
+    def complete_newer_first(path, body):
+        nonlocal newer
+        if path == PATH and body.get("output") is not None and newer is None:
+            newer = {}  # Reentrant new work uses the same real HTTP admission and source checks.
+            newer, _ = add(sync, "周六公园改到西门碰头", "meeting.park", second=3)
+        return original_post(path, body)
+
+    monkeypatch.setattr(sync, "post", complete_newer_first)
+    late, _ = add(
+        sync,
+        "下次选不太甜的面包" if unrelated else "周六公园东门碰头",
+        "diet.bread" if unrelated else "meeting.park",
+        second=2,
+    )
+    assert late["state"] == "committed"
+    assert {u["record_id"] for u in recall(sync, "周六公园碰头")} == set(newer["record_ids"])
+    if unrelated:
+        assert {u["record_id"] for u in recall(sync, "下次面包")} == set(late["record_ids"])
+    else:
+        past = recall(sync, "周六公园以前碰头")
+        assert set(first["record_ids"] + late["record_ids"]) <= {u["record_id"] for u in past}
+        assert all(
+            "不能作为当前" in u["valid_time"] for u in past if u["record_id"] in late["record_ids"]
+        )
+        with sync.store.transaction() as db:
+            assert (
+                db.execute(
+                    "SELECT superseded_by FROM automatic_facts WHERE group_id=?",
+                    (late["group_ids"][0],),
+                ).fetchone()[0]
+                == newer["group_ids"][0]
+            )
 
 
 def test_paraphrase_deduplicates_and_preserves_both_sources_and_quotes(sync):
