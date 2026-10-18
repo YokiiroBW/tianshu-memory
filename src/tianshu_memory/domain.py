@@ -93,7 +93,13 @@ CONTEXT_TERMS = frozenset(
 
 
 def query_terms(value: str) -> list[str]:
-    from .recall_language import clean_query, normalize_objects, query_aliases, topic_tokens
+    from .recall_language import (
+        clean_query,
+        lexical_question_text,
+        normalize_objects,
+        query_aliases,
+        topic_tokens,
+    )
 
     value = normalize_objects(clean_query(value))
 
@@ -177,6 +183,7 @@ def query_terms(value: str) -> list[str]:
         " ",
         value,
     )
+    lexical_value = lexical_question_text(lexical_value)
     return list(
         dict.fromkeys(
             [term for term in terms(lexical_value) if term not in CONTEXT_TERMS | scaffolding]

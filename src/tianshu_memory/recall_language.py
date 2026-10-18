@@ -69,6 +69,24 @@ def clean_query(value):
     return "".join(parts)
 
 
+def lexical_question_text(value):
+    """Remove question scaffolding for lexical coverage, not subject parsing."""
+    parts = re.split(r"""([“「《"'‘].*?[”」》"'’])""", value)
+    for index in range(0, len(parts), 2):
+        parts[index] = re.sub(
+            r"的?(?:这|那)(?:一)?(?:句话|个说法)|刚才|那会儿|来着", " ", parts[index]
+        )
+        # "定哪边" creates unmatched bigrams which can outvote a named place.
+        # Quoted names stay literal, and query_focus still sees the original question.
+        parts[index] = re.sub(
+            r"(?:哪(?:边|儿|天|处|侧)|何(?:时|处))"
+            r"(?=\s*(?:来着|呢|呀|啊)?[？?。!！]*\s*$)",
+            " ",
+            parts[index],
+        )
+    return "".join(parts)
+
+
 def query_focus(value):
     """An explicit possessive/object question supplies stronger anchors than its preamble."""
     location = re.search(
