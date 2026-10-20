@@ -113,6 +113,50 @@ def test_pg_snapshot_reads_revision_seal_and_registration_again_in_each_phase():
         assert len(remote.statements) == 4
 
 
+def test_native_pg_snapshot_rechecks_current_state_and_keeps_fault_precedence():
+    import psycopg
+    from test_storage_backends import pg_options
+    from tianshu_storage import PostgresConnection
+
+    # Session-local synthetic tables disappear on close; no application authority
+    # or guard is bypassed to alter state in a real Store.
+    with psycopg.connect(pg_options()["postgresql_url"], autocommit=True) as raw:
+        with closing(PostgresConnection(raw)) as remote, knowledge_state() as (local, project):
+            remote.native("CREATE TEMP TABLE metadata(key TEXT PRIMARY KEY,value TEXT)")
+            remote.native(
+                "CREATE TEMP TABLE knowledge_projects("
+                "id TEXT PRIMARY KEY,registration TEXT,revision INTEGER)"
+            )
+            remote.executemany(
+                "INSERT INTO metadata VALUES (?,?)",
+                [("knowledge_schema", "1"), ("knowledge_seal_key", "synthetic-seal")],
+            )
+            remote.native(
+                "INSERT INTO knowledge_projects VALUES ('demo',?,7)", (canonical(project),)
+            )
+            before = snapshot(remote, project)
+            assert before == snapshot(local, project)
+            remote.native("UPDATE knowledge_projects SET revision=8")
+            remote.native("UPDATE metadata SET value='rotated-seal' WHERE key='knowledge_seal_key'")
+            after = snapshot(remote, project)
+            assert after[0] == 8 and after[1] != before[1]
+            remote.native("UPDATE knowledge_projects SET registration='changed'")
+            with pytest.raises(Fault, match="registration_changed"):
+                snapshot(remote, project)
+            remote.native("DELETE FROM metadata WHERE key='knowledge_seal_key'")
+            with pytest.raises(Fault, match="dependency_unavailable"):
+                snapshot(remote, project)
+            remote.native("INSERT INTO metadata VALUES ('knowledge_seal_key','rotated-seal')")
+            remote.native("DELETE FROM knowledge_projects")
+            with pytest.raises(Fault, match="project_uninitialized"):
+                snapshot(remote, project)
+            assert snapshot(remote, project, "import")[0] is None
+            assert snapshot(remote, project, "directory_scan")[0] is None
+            remote.native("DELETE FROM metadata WHERE key='knowledge_schema'")
+            with pytest.raises(Fault, match="dependency_unavailable"):
+                snapshot(remote, project, "import")
+
+
 class SetupConnection:
     """Setup queue double: metadata is unavailable until the lock is confirmed."""
 
