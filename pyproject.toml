@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Versioned, scoped person and memory service"
 requires-python = ">=3.12"
 dependencies = [
-    "tianshu-storage==0.1.0",
+    "tianshu-storage==0.1.1",
     "fastapi>=0.115,<1",
     "uvicorn>=0.34,<1",
     "httpx>=0.28,<1",
@@ -40,7 +40,7 @@ tianshu_memory = ["postgres_schema.sql"]
 testpaths = ["tests"]
 
 [tool.uv.sources]
-tianshu-storage = { path = "vendor/tianshu_storage-0.1.0-py3-none-any.whl" }
+tianshu-storage = { path = "vendor/tianshu_storage-0.1.1-py3-none-any.whl" }
 
 [tool.ruff]
 line-length = 100
