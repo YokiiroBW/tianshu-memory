@@ -1,7 +1,5 @@
 """Explicit relationship addon installation; only a reviewed local DB is accepted."""
 
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 from .relationships.legacy import import_legacy, migration_report
@@ -26,11 +24,7 @@ def migrate(store, backup_path, *, clock, policy=Policy()):
         backup.parent.mkdir(parents=True, exist_ok=True)
         with backup.open("xb"):
             pass
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as destination,
-        ):
-            reader.backup(destination)
+        store.backup(backup, db=db)
         # Save the pre-migration checkpoint as part of this exact backup set.
         guard = backup.with_name(backup.name + ".source-guard.json")
         with guard.open("xb") as file:

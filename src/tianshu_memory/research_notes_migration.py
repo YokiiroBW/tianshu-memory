@@ -7,8 +7,6 @@ overwrite the schema 3 source-guard checkpoint, and the pre-migration database i
 for rollback review.
 """
 
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 from .research_notes_schema import RESEARCH_NOTES_SCHEMA_VERSION, SCHEMA, TRACKED
@@ -62,11 +60,7 @@ def migrate(store, backup_path):
             raise ValueError("Research-note migration requires project knowledge schema 1")
         if "research_notes_schema" in metadata:
             raise ValueError("Research-note migration already applied")
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as destination,
-        ):
-            reader.backup(destination)
+        store.backup(backup, db=db)
         install(db)
     return {
         "schema": 3,

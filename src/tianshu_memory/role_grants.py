@@ -11,10 +11,11 @@ from .domain import require
 
 
 class RoleGrants:
-    def __init__(self, path):
+    def __init__(self, path, *, database=None):
         require(Path(path).is_absolute(), "invalid_input", 400)
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.database = database
         with closing(self._connect()) as db, db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS grants (actor_id TEXT PRIMARY KEY, version INTEGER NOT NULL, enabled INTEGER NOT NULL)"
@@ -24,10 +25,15 @@ class RoleGrants:
             )
 
     def _connect(self):
-        db = sqlite3.connect(self.path, timeout=5)
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
-        db.execute("PRAGMA busy_timeout=5000")
+        db = (
+            self.database.connect(timeout=5)
+            if self.database is not None
+            else sqlite3.connect(self.path, timeout=5)
+        )
+        if self.database is None or self.database.backend == "sqlite":
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("PRAGMA busy_timeout=5000")
         return db
 
     def active(self, actor_id):
@@ -40,9 +46,12 @@ class RoleGrants:
 
     def inactive_ids(self):
         with closing(self._connect()) as db:
-            return [row[0] for row in db.execute(
-                "SELECT actor_id FROM grants WHERE enabled=0 ORDER BY actor_id"
-            )]
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT actor_id FROM grants WHERE enabled=0 ORDER BY actor_id"
+                )
+            ]
 
     def status(self, actor_id):
         with closing(self._connect()) as db:

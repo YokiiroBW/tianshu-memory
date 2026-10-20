@@ -20,7 +20,7 @@ select 任一预算维度为零时，只核验当前账号/范围元数据和 kn
 
 运行配置由 TIANSHU_MEMORY_CONFIG 或 CLI --config 显式指向，属于服务端私有文件。支持字段：
 
-- `database_path`：明确本地 SQLite 文件；不支持 PostgreSQL DSN 或网络共享。
+- `database_path`：明确本地 SQLite 文件与状态路径锚点，不填写 PostgreSQL DSN 或网络共享；可选 PG 使用独立 `storage_backends.postgresql_url`。配置及文件/备份目录见 [业务存储](storage-backends.md)。
 - `contract_directory`：已发布 contracts/text-dialogue/v1，启动核验固定 manifest SHA256 与全部文件摘要。
 - `mode`：仅 `local_fixture` 提供合成来源 ledger；其他模式来源核验不可用。
 - `callers.<service>.token/operations/allowed_actors`：该服务的凭据、允许操作及角色，操作名为 resolve/register/link/select/revise/consume。新画像权限独立使用 select_profiles。

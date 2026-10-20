@@ -1,8 +1,6 @@
 """Add project knowledge without modifying historical chat authority."""
 
 import secrets
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 from .knowledge_catalog_migration import install as install_catalog
@@ -49,11 +47,7 @@ def migrate(store, backup_path):
         metadata = dict(db.execute("SELECT key,value FROM metadata"))
         if metadata.get("schema") != "3" or "knowledge_schema" in metadata:
             raise ValueError("Knowledge migration requires schema 3 without knowledge_schema")
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as dest,
-        ):
-            reader.backup(dest)
+        store.backup(backup, db=db)
         for statement in SCHEMA.split(";"):
             if statement.strip():
                 db.execute(statement)
@@ -65,6 +59,7 @@ def migrate(store, backup_path):
                     "WHERE key='source_revision'; END"
                 )
         db.execute("INSERT INTO metadata VALUES ('knowledge_schema','1')")
+        db.execute("INSERT OR IGNORE INTO metadata VALUES ('knowledge_files_schema','1')")
         db.execute("INSERT INTO metadata VALUES ('knowledge_seal_key',?)", (secrets.token_hex(32),))
         db.execute("UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'")
         # The same reviewed step installs the lesson book, the promoted experience book, the

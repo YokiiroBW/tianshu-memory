@@ -1,6 +1,6 @@
 # 项目资料、目录增量导入与短恢复包（TS-080/TS-082）
 
-这是独立项目知识域，使用同一 SQLite Store 和 schema 3 source-guard；不生成聊天 P/A、Core receipt、SourceAuthority 证明或人物画像。项目资料不依赖远端聊天来源核验；所有操作经 KnowledgeApplication 的配置授权与 Store 事务。没有模型调用、自动整理、全局踩坑晋升或项目文件写入。TS-082 增加登记目录的“扫描预览→显式确认→持久增量导入”，仍复用同一 UTF-8 格式、版本与 FTS5 索引，不新增解析器或嵌入后端。
+这是独立项目知识域，复用 Store 实现和 schema 3 source-guard；默认 SQLite，可选 PostgreSQL 与原件文件化见 [业务存储](storage-backends.md)。不生成聊天 P/A、Core receipt、SourceAuthority 证明或人物画像。项目资料不依赖远端聊天来源核验；所有操作经 KnowledgeApplication 的配置授权与 Store 事务。没有模型调用、自动整理、全局踩坑晋升或项目文件写入。TS-082 增加登记目录的“扫描预览→显式确认→持久增量导入”，复用 UTF-8 格式、版本与词法索引，不新增解析器或嵌入后端。
 
 ## 安装、迁移与配置
 

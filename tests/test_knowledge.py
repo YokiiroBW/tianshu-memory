@@ -16,6 +16,7 @@ import pytest
 
 from tianshu_memory.domain import Fault, canonical
 from tianshu_memory.knowledge import KnowledgeApplication, blocks
+from tianshu_memory.knowledge_files import read as read_file
 from tianshu_memory.knowledge_migration import TRACKED, migrate
 from tianshu_memory.knowledge_sources import MAX_BYTES, decode, fetch_url
 from tianshu_memory.store import Store
@@ -147,7 +148,7 @@ def test_import_exact_blocks_versions_and_idempotency(knowledge):
     assert query(run, budget=256)["omissions"] == ["budget"]
     with store.transaction() as db:
         assert (
-            db.execute("SELECT raw FROM knowledge_versions").fetchone()[0]
+            read_file(db, db.execute("SELECT raw FROM knowledge_versions").fetchone()[0])
             == (root / "design.md").read_bytes()
         )
         assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0
@@ -252,7 +253,7 @@ def test_html_no_script_and_unsupported_url(knowledge, monkeypatch):
     assert "steal" not in hit["text"] and "Never resend" in hit["text"]
     assert hit["provenance"]["citation_space"] == "visible_text_lines"
     with store.transaction() as db:
-        assert db.execute("SELECT raw FROM knowledge_versions").fetchone()[0] == raw
+        assert read_file(db, db.execute("SELECT raw FROM knowledge_versions").fetchone()[0]) == raw
     with pytest.raises(Fault):
         fetch_url("https://unregistered.example/", [])
     for url in ["file:///etc/passwd", "http://example.com/", "https://user:pass@example.com/"]:

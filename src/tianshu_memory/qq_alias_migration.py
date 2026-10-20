@@ -1,7 +1,5 @@
 """Explicit guarded QQ display-name migration; never runs during normal startup."""
 
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 
@@ -16,11 +14,7 @@ def migrate(store, backup_path):
         metadata = dict(db.execute("SELECT key,value FROM metadata"))
         if metadata.get("schema") != "3" or "qq_alias_schema" in metadata:
             raise ValueError("QQ alias migration requires guarded schema 3 without qq_alias_schema")
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as dest,
-        ):
-            reader.backup(dest)
+        store.backup(backup, db=db)
         db.execute(
             "CREATE TABLE qq_aliases (account_key TEXT NOT NULL REFERENCES accounts(account_key), kind TEXT NOT NULL, bot_id TEXT NOT NULL, group_id TEXT NOT NULL, value TEXT NOT NULL, observed_at TEXT NOT NULL, event_ref TEXT NOT NULL, PRIMARY KEY(account_key,kind,bot_id,group_id))"
         )

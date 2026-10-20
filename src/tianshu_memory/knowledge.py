@@ -5,6 +5,7 @@ import hmac
 import http.client
 import json
 import re
+from contextvars import ContextVar
 from pathlib import Path
 
 from . import knowledge_continuation as continuation
@@ -21,6 +22,7 @@ from .domain import (
     terms,
 )
 from .knowledge_evidence import blocks
+from .knowledge_files import block as read_block
 from .knowledge_ports import ContinuationReader, DirectoryWriter, EvidenceLookup
 from .knowledge_sources import FileReader, content_hash, decode, fetch_url, read_file
 from .store import Store
@@ -389,6 +391,7 @@ class Plan:
 class KnowledgeApplication:
     def __init__(self, config_path):
         self.config_path = Path(config_path).resolve()
+        self._storage = ContextVar("knowledge_dispatch_storage", default=None)
         self.project_id = None
         self.client = None
         self.projects = {}
@@ -489,9 +492,25 @@ class KnowledgeApplication:
         config, knowledge, principal, project, secret, scan, worktrees = self._authorize(
             client, credential, project_id, operation, evidence_projects
         )
-        store = Store(
-            config["database_path"],
-            recovery_path=config.get("source_sync", {}).get("recovery_path"),
+        storage_config = {
+            key: config.get(key)
+            for key in (
+                "database_path",
+                "source_sync",
+                "knowledge_files_directory",
+                "storage_backends",
+                "role_grants_database_path",
+            )
+        }
+        storage = self._storage.get()
+        if storage["config"] is not None:
+            require(storage_config == storage["config"], "registration_changed", 409)
+        storage["config"] = storage_config
+        if storage["store"] is None:
+            storage["store"] = Store.from_config(config, service="knowledge")
+        store = storage["store"]
+        require(
+            store.path == str(Path(config["database_path"]).resolve()), "registration_changed", 409
         )
         # Bound to this dispatch only: the lesson and experience modules read exactly the
         # projects, permissions and registered roots that were just authorized.
@@ -504,6 +523,18 @@ class KnowledgeApplication:
         return store, project, secret, scan, worktrees
 
     def execute(self, request, *, client, credential):
+        # Separate invocations may share this application (CLI/MCP and directory
+        # import retries). Only this dispatch owns and closes its storage runtime.
+        storage = {"store": None, "config": None}
+        token = self._storage.set(storage)
+        try:
+            return self._execute(request, client=client, credential=credential)
+        finally:
+            if storage["store"] is not None:
+                storage["store"].close()
+            self._storage.reset(token)
+
+    def _execute(self, request, *, client, credential):
         exact(request, "operation project_id arguments")
         require(len(canonical(request).encode()) <= 262144, "request_too_large", 413)
         request = strict_json(canonical(request))
@@ -1069,7 +1100,7 @@ class KnowledgeApplication:
                 (document_id, version),
             ).fetchone()
             previous_units = [
-                json.loads(r[0])
+                read_block(db, r[0])
                 for r in db.execute(
                     "SELECT payload FROM knowledge_blocks WHERE document_id=? AND version=? ORDER BY id",
                     (document_id, version),
@@ -1166,7 +1197,7 @@ class KnowledgeApplication:
         require(row is not None and row["hash"] == reference["hash"], "stale_evidence", 409)
         return {
             "reference": reference,
-            **json.loads(row["payload"]),
+            **read_block(db, row["payload"]),
             "source_id": document["source_id"],
             "provenance": json.loads(row["provenance"]),
         }

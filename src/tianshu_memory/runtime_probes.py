@@ -3,7 +3,8 @@
 Every check here observes; none of them changes anything. That is a property of the code, not a
 promise in a document, and it is what the tests assert byte for byte:
 
-- the database is opened with SQLite's own `mode=ro` URI and only `SELECT` is issued. `Store` is
+- the selected database is opened read-only (SQLite `mode=ro`, or PG read-only) and only `SELECT`
+  is issued. `Store` is
   never constructed, no `Store.transaction` is started (so no `BEGIN IMMEDIATE`, no WAL switch and
   no checkpoint persist), no migration runs, no directory and no database file is created, and an
   absent database stays absent;
@@ -167,10 +168,36 @@ def probe_contract(directory):
 
 def _connect(database):
     """A read-only connection that cannot create anything, not even an empty database."""
+    if hasattr(database, "readonly"):
+        return database.readonly()
     uri = "file:" + Path(database).as_uri()[len("file:") :] + "?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=CHECK_DEADLINE_SECONDS)
     connection.row_factory = sqlite3.Row
     return connection
+
+
+class SelectedDatabase:
+    """Read the persisted backend binding without starting or migrating a runtime."""
+
+    def __init__(self, raw, service):
+        self.path = raw["database_path"]
+        self.raw = raw
+        self.service = "memory" if service == CHAT_SERVICE else "knowledge"
+
+    def readonly(self):
+        from tianshu_storage import StorageOptions, StorageRuntime
+
+        from .postgres import dialect
+
+        return StorageRuntime.open_existing(
+            StorageOptions.from_settings(self.raw),
+            service=self.service,
+            state_directory=str(self.path) + ".storage",
+            name="main",
+            path=self.path,
+            dialect=dialect,
+            timeout=CHECK_DEADLINE_SECONDS,
+        )
 
 
 def _select(database, statements):
@@ -179,7 +206,7 @@ def _select(database, statements):
         with closing(_connect(database)) as connection:
             return [connection.execute(statement).fetchone() for statement in statements], None
     except sqlite3.Error as error:
-        return None, failed(retryable=error.sqlite_errorcode in RETRYABLE_SQLITE)
+        return None, failed(retryable=getattr(error, "sqlite_errorcode", None) in RETRYABLE_SQLITE)
     except (OSError, ValueError):
         return None, failed()
 
@@ -191,11 +218,12 @@ def probe_database(database):
     of creating an empty database. `immutable=1` is deliberately *not* used, because it would hide
     a WAL that still holds committed data this build must see.
     """
-    path = Path(str(database))
-    if not path.exists():
-        return NOT_CONFIGURED
-    if not path.is_file():
-        return failed()
+    path = database if hasattr(database, "readonly") else Path(str(database))
+    if not hasattr(database, "readonly"):
+        if not path.exists():
+            return NOT_CONFIGURED
+        if not path.is_file():
+            return failed()
     rows, verdict = _select(
         path,
         (
@@ -263,7 +291,7 @@ def probe_guard(database, guard_path):
         with closing(_connect(database)) as connection:
             expected = source_recovery.checkpoint(connection)
     except sqlite3.Error as error:
-        return failed(retryable=error.sqlite_errorcode in RETRYABLE_SQLITE)
+        return failed(retryable=getattr(error, "sqlite_errorcode", None) in RETRYABLE_SQLITE)
     except (OSError, ValueError):
         return failed()
     if expected is None:
@@ -297,7 +325,7 @@ def _recovery_path(raw, database):
     configured = (raw.get("source_sync") or {}).get("recovery_path")
     if isinstance(configured, str) and configured.strip():
         return configured
-    return str(database) + ".source-guard.json"
+    return str(getattr(database, "path", database)) + ".source-guard.json"
 
 
 def probe_mode(raw):
@@ -479,10 +507,34 @@ def assess(settings, diagnostics, runtime=None):
             checks.setdefault(key, failed())
         return checks
     database = raw.get("database_path") or ""
+    if runtime is not None:
+        app = getattr(runtime, "app", None)
+        if app is not None:
+            database = getattr(app.state, "storage_store", None) or database
+    if isinstance(database, str) and database:
+        # A stopped/unassembled probe must not mistake the retained SQLite copy
+        # for the live authority after PG activation. open_existing reads only;
+        # unlike Store construction it cannot initialize a missing binding.
+        from tianshu_storage import StorageOptions, StorageRuntime
+
+        selected = SelectedDatabase(raw, settings.service)
+        try:
+            status = StorageRuntime.inspect(
+                StorageOptions.from_settings(raw),
+                service=selected.service,
+                state_directory=database + ".storage",
+            )
+        except (sqlite3.Error, OSError, ValueError):
+            database = selected
+        else:
+            if status["backend"] == "postgresql":
+                database = selected
     if settings.service == CHAT_SERVICE:
         guard = (raw.get("source_sync") or {}).get("recovery_path")
         checks["database"] = probe_database(database)
-        checks["guard"] = probe_guard(database, guard or str(database) + ".source-guard.json")
+        checks["guard"] = probe_guard(
+            database, guard or (str(getattr(database, "path", database)) + ".source-guard.json")
+        )
         checks["mode"] = probe_mode(raw)
     else:
         # The knowledge entry's own service protection is the same checkpoint the chat entry uses,

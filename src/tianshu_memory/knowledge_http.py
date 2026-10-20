@@ -14,7 +14,8 @@ The legacy action transport below adds no domain rule of its own:
   entrypoints pass their credential, so `knowledge.clients` stays the only authority for a
   digest, a project list and a permission list. No server-side secret is configured here, and no
   environment variable is read;
-- no database, source context, project adapter or other product client is held here, and the
+- each project call owns its database lifetime, source context and project adapter. The process
+  storage owner supports readiness and the separately mounted original-content transport; the
   domain never imports this module.
 
 The legacy route surface is fixed: one health route and one action route, with a sixteen-operation
@@ -530,7 +531,11 @@ def create_app(
     from .knowledge_content_runtime import mount as mount_content_runtime
 
     mount_content_runtime(
-        app, config_path, config, body_timeout=read_deadline, execute_timeout=execute_deadline
+        app,
+        config_path,
+        config,
+        body_timeout=read_deadline,
+        execute_timeout=execute_deadline,
     )
 
     if getattr(app.state, "content_auth", None) is not None:
@@ -609,6 +614,8 @@ def create_app(
         instance per request makes that impossible by construction, and only the public
         `execute` of that instance is ever called.
         """
+        # A call can outlive the response or this ASGI lifespan. Its own owner keeps
+        # that admitted work alive and re-reads the current storage registration.
         return KnowledgeApplication(config_path)
 
     def call(body, presented):

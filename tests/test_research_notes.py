@@ -179,7 +179,9 @@ def source_text(notes, reference):
             "SELECT text FROM knowledge_versions WHERE document_id=? AND version=?",
             (reference["document_id"], reference["version"]),
         ).fetchone()
-    return row["text"] if row else None
+        from tianshu_memory.knowledge_files import read
+
+        return read(db, row["text"], text=True) if row else None
 
 
 def statements(references, kind="claim"):

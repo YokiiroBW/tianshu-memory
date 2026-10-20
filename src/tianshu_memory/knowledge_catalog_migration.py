@@ -20,8 +20,6 @@ exactly the way the existing recovery review describes.
 """
 
 import re
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 VERSION = "1"
@@ -69,6 +67,36 @@ def _statement(sql):
 
 def _indexed(db, name):
     """The full shape of one index as it really exists, or None when it is not there at all."""
+    from .postgres import is_postgres
+
+    if is_postgres(db):
+        found = db.native(
+            "SELECT t.relname,i.indisunique,i.indpred IS NOT NULL,i.indnkeyatts,i.indnatts,"
+            "i.indexprs IS NULL,i.indisvalid AND i.indisready,pg_get_indexdef(i.indexrelid) "
+            "FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
+            "JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname=current_schema() AND c.relname=?",
+            (name,),
+        ).fetchone()
+        if found is None:
+            return None
+        columns = tuple(
+            db.native(
+                "SELECT pg_get_indexdef(to_regclass(?),n,true) FROM generate_series(1,?) AS n ORDER BY n",
+                (name, found[3]),
+            )
+        )
+        columns = tuple(r[0] for r in columns)
+        exact = (
+            found[3] == found[4] and found[5] and found[6] and columns == EXPECTED[name]["columns"]
+        )
+        return {
+            "table": found[0],
+            "columns": columns,
+            "statement": _statement(STATEMENT[name] if exact else found[7]),
+            "unique": found[1],
+            "partial": found[2],
+        }
     found = db.execute(
         "SELECT tbl_name,sql FROM sqlite_master WHERE type='index' AND name=?", (name,)
     ).fetchone()
@@ -183,11 +211,7 @@ def migrate(store, backup_path):
             raise ValueError(
                 "Catalog index already exists with a different definition: " + ", ".join(conflicted)
             )
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as destination,
-        ):
-            reader.backup(destination)
+        store.backup(backup, db=db)
         install(db)
     return {
         "schema": 3,

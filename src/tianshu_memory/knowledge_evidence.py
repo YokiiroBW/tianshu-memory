@@ -3,6 +3,7 @@
 import json
 
 from .domain import canonical, require
+from .knowledge_files import block
 from .validate import exact, integer
 
 
@@ -83,7 +84,7 @@ class Evidence:
         require(row is not None and row["hash"] == reference["hash"], "stale_evidence", 409)
         return {
             "reference": reference,
-            **json.loads(row["payload"]),
+            **block(self.db, row["payload"]),
             "source_id": document["source_id"],
             "provenance": json.loads(row["provenance"]),
         }

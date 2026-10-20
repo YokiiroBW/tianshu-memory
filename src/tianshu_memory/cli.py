@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from jsonschema.exceptions import ValidationError
@@ -118,30 +119,27 @@ def run_local_operation(args, parser):
         "migrate-facts",
     }:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
-        store = Store(
-            config["database_path"],
-            recovery_path=config.get("source_sync", {}).get("recovery_path"),
-        )
-        if args.operation == "migrate-sources":
-            from .contracts import Contracts
+        with closing(Store.from_config(config)) as store:
+            if args.operation == "migrate-sources":
+                from .contracts import Contracts
 
-            contracts = Contracts(config["contract_directory"])
-            contracts.load_sources()
-            result = store.migrate_sources(args.backup, contracts)
-        elif args.operation == "migrate-observations":
-            result = store.migrate_observations(args.backup)
-        elif args.operation == "migrate-source-lookup":
-            result = store.migrate_source_lookup(args.backup)
-        elif args.operation == "migrate-users":
-            result = store.migrate_users(args.backup)
-        elif args.operation == "migrate-facts":
-            result = store.migrate_facts(args.backup)
-        elif args.operation == "migrate-context":
-            result = store.migrate_context(args.backup)
-        elif args.operation == "migrate-qq-aliases":
-            result = store.migrate_qq_aliases(args.backup)
-        else:
-            result = store.migrate_profiles(args.backup)
+                contracts = Contracts(config["contract_directory"])
+                contracts.load_sources()
+                result = store.migrate_sources(args.backup, contracts)
+            elif args.operation == "migrate-observations":
+                result = store.migrate_observations(args.backup)
+            elif args.operation == "migrate-source-lookup":
+                result = store.migrate_source_lookup(args.backup)
+            elif args.operation == "migrate-users":
+                result = store.migrate_users(args.backup)
+            elif args.operation == "migrate-facts":
+                result = store.migrate_facts(args.backup)
+            elif args.operation == "migrate-context":
+                result = store.migrate_context(args.backup)
+            elif args.operation == "migrate-qq-aliases":
+                result = store.migrate_qq_aliases(args.backup)
+            else:
+                result = store.migrate_profiles(args.backup)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     os.environ["TIANSHU_MEMORY_CONFIG"] = args.config

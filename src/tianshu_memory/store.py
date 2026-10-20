@@ -1,7 +1,14 @@
 import logging
+import os
 import sqlite3
 from contextlib import closing, contextmanager
 from pathlib import Path
+from uuid import uuid4
+
+
+class LocalConnection(sqlite3.Connection):
+    """SQLite connection with this operation's explicit Knowledge file owner."""
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -80,9 +87,13 @@ CREATE TABLE profile_approvals (
 
 
 class Store:
-    """Local-file SQLite only. Each operation uses one atomic authority snapshot."""
+    """One selected SQL backend and one atomic, independently checkpointed authority."""
 
-    def __init__(self, path: str | Path, *, recovery_path=None):
+    def __init__(self, path: str | Path, *, recovery_path=None, settings=None, service="memory"):
+        from tianshu_storage import FileStore, StorageOptions, StorageRuntime
+
+        from .postgres import dialect, prepare, prepare_grants
+
         path = Path(path).resolve()
         if str(path).startswith("\\\\"):
             raise ValueError("SQLite requires a local file, not a network share")
@@ -91,6 +102,84 @@ class Store:
         self.recovery_path = Path(recovery_path or (str(path) + ".source-guard.json")).resolve()
         if self.recovery_path == path or str(self.recovery_path).startswith("\\\\"):
             raise ValueError("Recovery checkpoint must be a distinct local file")
+        settings = settings or {}
+        state_directory = Path(str(path) + ".storage")
+
+        def check_authority():
+            # SQLite historically allowed both entrypoints to share a file. PG
+            # must not clone that one authority into two service schemas.
+            if service not in {"memory", "knowledge"}:
+                return
+            from .domain import strict_json
+
+            other = "knowledge" if service == "memory" else "memory"
+            marker = state_directory / f".tianshu-storage-{other}.json"
+            if marker.exists():
+                state = strict_json(marker.read_bytes())
+                if not isinstance(state, dict):
+                    raise ValueError("Shared storage authority state is invalid")
+                if state.get("backend") == "postgresql" and state.get("state") in {
+                    "pending",
+                    "active",
+                }:
+                    raise ValueError(
+                        "Shared Memory/Knowledge database path already has another PostgreSQL "
+                        "authority; use distinct database_path/state directories"
+                    )
+
+        check_authority()
+        self.files = FileStore(settings.get("knowledge_files_directory") or (str(path) + ".files"))
+        self.runtime = StorageRuntime(
+            StorageOptions.from_settings(settings),
+            service=service,
+            state_directory=state_directory,
+        )
+        self.role_database = None
+        try:
+            self.runtime.start()
+            check_authority()
+            self.database = self.runtime.database(
+                "main",
+                path,
+                prepare=lambda db, source: prepare(
+                    db,
+                    source,
+                    files=self.files,
+                    recovery_path=self.recovery_path,
+                    state_directory=self.runtime.state_directory,
+                    epoch=self.runtime.epoch,
+                ),
+                dialect=dialect,
+            )
+            grant_path = settings.get("role_grants_database_path")
+            if grant_path:
+                if not Path(grant_path).is_absolute():
+                    raise ValueError("role_grants_database_path must be absolute")
+                self.role_database = self.runtime.database(
+                    "role_grants",
+                    grant_path,
+                    prepare=prepare_grants,
+                    dialect=dialect,
+                )
+            self.backend = self.database.backend
+            self._initialize()
+            if self.backend == "sqlite":
+                self._migrate_files()
+            self.runtime.finalize()
+        except BaseException:
+            self.runtime.close()
+            raise
+
+    @classmethod
+    def from_config(cls, config, *, service="memory"):
+        return cls(
+            config["database_path"],
+            recovery_path=config.get("source_sync", {}).get("recovery_path"),
+            settings=config,
+            service=service,
+        )
+
+    def _initialize(self):
         with self.transaction() as db:
             existing = db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='metadata'"
@@ -100,10 +189,84 @@ class Store:
                 if not version or version[0] not in {"1", "2", "3"}:
                     raise ValueError("Database schema mismatch; explicit migration required")
             # Statements are fixed, no user SQL and no executescript implicit transaction commit.
-            for statement in SCHEMA.split(";"):
-                if statement.strip():
-                    db.execute(statement)
-            db.execute("INSERT OR IGNORE INTO metadata VALUES ('schema','1')")
+            if self.backend == "sqlite":
+                for statement in SCHEMA.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
+                db.execute("INSERT OR IGNORE INTO metadata VALUES ('schema','1')")
+
+    def _connect(self):
+        options = {"isolation_level": None, "timeout": 5}
+        if self.backend == "sqlite":
+            options["factory"] = LocalConnection
+        db = self.database.connect(**options)
+        db.row_factory = sqlite3.Row
+        db.knowledge_files = self.files
+        return db
+
+    def readonly(self):
+        if self.backend == "sqlite":
+            db = sqlite3.connect(Path(self.path).as_uri() + "?mode=ro", uri=True, timeout=2)
+            db.row_factory = sqlite3.Row
+            return db
+        db = self.database.connect(timeout=2, isolation_level=None, read_only=True)
+        db.execute("BEGIN READ ONLY")
+        return db
+
+    def close(self):
+        self.runtime.close()
+
+    def backup(self, path, *, db=None):
+        """Consistent migration restore evidence, never connect old SQLite after PG activation."""
+        if self.backend == "sqlite":
+            with (
+                closing(sqlite3.connect(self.path)) as reader,
+                closing(sqlite3.connect(path)) as target,
+            ):
+                reader.backup(target)
+            return
+        from .domain import canonical
+        from .postgres import TABLES
+
+        if db is None:
+            with self.transaction() as connection:
+                return self.backup(path, db=connection)
+        snapshot = {"format": "tianshu-memory-postgresql-backup/v1", "tables": {}}
+        for table in TABLES:
+            cursor = db.execute(f"SELECT * FROM {table}")
+            names = [c[0] for c in cursor.description]
+            snapshot["tables"][table] = {"columns": names, "rows": [list(r) for r in cursor]}
+        from .source_recovery import checkpoint
+
+        snapshot["guard"] = checkpoint(db)
+        with Path(path).open("wb") as output:
+            output.write(canonical(snapshot).encode())
+            output.flush()
+            os.fsync(output.fileno())
+
+    def _migrate_files(self):
+        from .knowledge_files import externalize
+        from .source_recovery import checkpoint, persist
+
+        with self.transaction() as db:
+            installed = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='knowledge_versions' AND type='table'"
+            ).fetchone()
+            if (
+                not installed
+                or db.execute(
+                    "SELECT 1 FROM metadata WHERE key='knowledge_files_schema'"
+                ).fetchone()
+            ):
+                return
+            backup = Path(self.path + ".pre-knowledge-files-" + uuid4().hex + ".bak")
+            with backup.open("xb"):
+                pass
+            self.backup(backup, db=db)
+            expected = checkpoint(db)
+            if expected is not None:
+                persist(Path(str(backup) + ".source-guard.json"), expected, initialize=True)
+            externalize(db)
 
     def migrate_profiles(self, backup_path):
         """Explicit additive migration. Stop writers; retain the complete pre-migration DB.
@@ -122,11 +285,7 @@ class Store:
             if db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0] != "1":
                 raise ValueError("Profile migration requires schema 1")
             # A separate reader sees the committed snapshot while BEGIN IMMEDIATE blocks writers.
-            with (
-                closing(sqlite3.connect(self.path)) as reader,
-                closing(sqlite3.connect(backup)) as destination,
-            ):
-                reader.backup(destination)
+            self.backup(backup, db=db)
             for statement in PROFILE_SCHEMA.split(";"):
                 if statement.strip():
                     db.execute(statement)
@@ -163,11 +322,7 @@ class Store:
                 raise ValueError("Observations require guarded schema 3")
             if db.execute("SELECT 1 FROM metadata WHERE key='observation_schema'").fetchone():
                 raise ValueError("Observation ledger already migrated")
-            with (
-                closing(sqlite3.connect(self.path)) as reader,
-                closing(sqlite3.connect(backup)) as destination,
-            ):
-                reader.backup(destination)
+            self.backup(backup, db=db)
             db.execute("""CREATE TABLE observation_sources (
                 source_ref TEXT PRIMARY KEY, digest TEXT NOT NULL,
                 instance_id TEXT NOT NULL, self_id TEXT NOT NULL,
@@ -246,16 +401,30 @@ class Store:
     def transaction(self):
         from . import source_recovery
 
-        db = sqlite3.connect(self.path, isolation_level=None, timeout=5)
-        db.row_factory = sqlite3.Row
+        db = self._connect()
         prepared = False
         try:
-            db.execute("PRAGMA foreign_keys=ON")
-            if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
-                raise RuntimeError("SQLite WAL unavailable")
-            db.execute("PRAGMA synchronous=FULL")
+            if self.backend == "sqlite":
+                db.execute("PRAGMA foreign_keys=ON")
+                if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
+                    raise RuntimeError("SQLite WAL unavailable")
+                db.execute("PRAGMA synchronous=FULL")
+            else:
+                db.native("SET synchronous_commit=on")
             db.execute("BEGIN IMMEDIATE")
+            if self.backend == "postgresql":
+                from .domain import Fault
+
+                marker = db.native(
+                    "SELECT value FROM metadata WHERE key='postgres_memory_schema'"
+                ).fetchone()
+                if marker is None or marker[0] != "1":
+                    raise Fault("dependency_unavailable", 503)
             before = source_recovery.checkpoint(db)
+            if self.backend == "postgresql" and before is None and self.recovery_path.exists():
+                # Restoring a pre-guard schema cannot bypass an independently
+                # retained checkpoint, even while this process is still alive.
+                raise Fault("dependency_unavailable", 503)
             if before is not None:
                 source_recovery.verify(self.recovery_path, before)
             yield db

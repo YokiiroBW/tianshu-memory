@@ -12,6 +12,7 @@
 # The two inputs of the locked resolution, plus the source that gets installed.
 !pyproject.toml
 !uv.lock
+!vendor/tianshu_storage-0.1.0-py3-none-any.whl
 !src/**
 
 # The source is narrowed too: only modules are installed, so a stray scratch file under `src/` is
@@ -21,6 +22,7 @@ src/**
 src/tianshu_memory/**
 !src/tianshu_memory/*.py
 !src/tianshu_memory/**/*.py
+!src/tianshu_memory/postgres_schema.sql
 
 # The probe script is copied in its own layer.
 !scripts/container_healthcheck.py

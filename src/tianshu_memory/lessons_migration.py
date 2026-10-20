@@ -7,8 +7,6 @@ only after a reviewed backup. A fresh database receives both in one step from
 overwrite the schema 3 source-guard checkpoint.
 """
 
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 from .lessons_schema import LESSONS_SCHEMA_VERSION, SCHEMA, TRACKED
@@ -60,10 +58,6 @@ def migrate(store, backup_path):
             raise ValueError("Lessons migration requires project knowledge schema 1")
         if "lessons_schema" in metadata:
             raise ValueError("Lessons migration already applied")
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as destination,
-        ):
-            reader.backup(destination)
+        store.backup(backup, db=db)
         install(db)
     return {"schema": 3, "knowledge_schema": 1, "lessons_schema": 1, "backup": str(backup)}

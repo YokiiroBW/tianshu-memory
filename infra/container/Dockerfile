@@ -35,6 +35,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 WORKDIR /build
 
 COPY pyproject.toml uv.lock ./
+COPY vendor ./vendor
 COPY infra/container/build-requirements.txt infra/container/build_install.py ./infra/container/
 COPY src ./src
 

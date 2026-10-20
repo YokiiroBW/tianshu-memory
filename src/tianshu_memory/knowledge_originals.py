@@ -1,6 +1,7 @@
 """The single Knowledge original/version writer, shared by project and life content."""
 
 from .domain import canonical, now, utc
+from .knowledge_files import pack_block, put
 
 
 def store_version(db, project_id, document_id, source_id, kind, locator, prepared, old, version):
@@ -31,8 +32,8 @@ def store_version(db, project_id, document_id, source_id, kind, locator, prepare
             document_id,
             version,
             prepared["digest"],
-            prepared["raw"],
-            prepared["text"],
+            put(db, prepared["raw"], media_type=prepared["media"]),
+            put(db, prepared["text"], text=True),
             prepared["media"],
             canonical(provenance),
         ),
@@ -45,7 +46,7 @@ def store_version(db, project_id, document_id, source_id, kind, locator, prepare
         block_id = f"{document_id}:{version}:{index:03d}"
         db.execute(
             "INSERT INTO knowledge_blocks VALUES (?,?,?,?)",
-            (block_id, document_id, version, canonical(unit)),
+            (block_id, document_id, version, pack_block(db, unit)),
         )
         db.execute(
             "INSERT INTO knowledge_index VALUES (?,?,?)",

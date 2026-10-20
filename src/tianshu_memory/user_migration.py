@@ -1,7 +1,5 @@
 """Explicit additive local user approval migration on guarded source schema 3."""
 
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 
@@ -18,11 +16,7 @@ def migrate(store, backup_path):
             raise ValueError(
                 "User approval migration requires source schema 3 without local_users_schema"
             )
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as dest,
-        ):
-            reader.backup(dest)
+        store.backup(backup, db=db)
         db.execute(
             "CREATE TABLE profile_approval_authorities ("
             "ref TEXT PRIMARY KEY REFERENCES profile_approvals(ref), authority TEXT NOT NULL, "

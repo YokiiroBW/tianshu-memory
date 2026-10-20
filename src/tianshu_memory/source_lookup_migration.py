@@ -1,7 +1,5 @@
 """Explicit indexes for source coverage and receipt identity, without rewriting authority."""
 
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 from .domain import require
@@ -44,10 +42,6 @@ def migrate(store, backup_path):
             raise ValueError(
                 "Source lookup migration requires schema 3 without source_lookup_schema"
             )
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as destination,
-        ):
-            reader.backup(destination)
+        store.backup(backup, db=db)
         install(db)
     return {"schema": 3, "source_lookup_schema": 1, "backup": str(backup)}

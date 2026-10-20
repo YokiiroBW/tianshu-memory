@@ -1,7 +1,5 @@
 """Explicit guarded migration: Knowledge originals gain real actor/person owners."""
 
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 from .source_recovery import checkpoint, persist
@@ -46,15 +44,28 @@ def migrate(store, backup_path):
             or "knowledge_content_schema" in metadata
         ):
             raise ValueError("Content migration requires schema 3 project Knowledge")
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as dest,
-        ):
-            reader.backup(dest)
+        store.backup(backup, db=db)
         guard_backup = Path(str(backup) + ".source-guard.json")
         # The writer lock and Store's verified checkpoint bind both copies to exactly the
         # same pre-upgrade state. Never derive a new guard from an unverified restored DB.
         persist(guard_backup, checkpoint(db), initialize=True)
+        from .postgres import is_postgres
+
+        if is_postgres(db):
+            db.native("ALTER TABLE knowledge_documents ALTER COLUMN project_id DROP NOT NULL")
+            for statement in SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            db.execute("INSERT INTO metadata VALUES ('knowledge_content_schema','1')")
+            db.execute(
+                "UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'"
+            )
+            return {
+                "schema": 3,
+                "knowledge_content_schema": 1,
+                "backup": str(backup),
+                "guard_backup": str(guard_backup),
+            }
         # NULL project is a real non-project original, not a fabricated project registration.
         # Rebuild the three-table original graph child-first with foreign keys always enabled.
         # Merely dropping/recreating a populated parent leaves SQLite's deferred FK counter

@@ -20,7 +20,9 @@ class LocalUserApproval:
 
     def __init__(self, service, config_path, principal, credential, action):
         self.service = service
-        self.auth = Authenticator(config_path, service.contracts, service.clock)
+        self.auth = Authenticator(
+            config_path, service.contracts, service.clock, role_database=service.store.role_database
+        )
         self.principal, self.credential = principal, credential
         self.action = strict_json(canonical(action))
         action = self.action

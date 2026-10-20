@@ -238,9 +238,17 @@ def create_app(
                 else "local_fixture"
                 if ready and isinstance(service.source_authority, LocalFixtureSources)
                 else "unconfigured",
-                "retrieval": "sqlite_fts5_and_exact" if ready else "unavailable",
+                "retrieval": (
+                    "postgresql_fts_and_exact"
+                    if service.store.backend == "postgresql"
+                    else "sqlite_fts5_and_exact"
+                )
+                if ready
+                else "unavailable",
                 "embedding": "not_configured",
-                "postgresql": "not_implemented",
+                "postgresql": service.store.runtime.status()["postgresql"]
+                if service
+                else "not_configured",
                 "raw_source_read": "unavailable",
                 "token_accounting": "utf8_bytes_conservative_estimate",
             },
@@ -617,9 +625,7 @@ def configured_app():
         for caller in config.get("callers", {}).values()
     ) or bool(config.get("browser_readers")):
         contracts.load_profiles()
-    store = Store(
-        config["database_path"], recovery_path=config.get("source_sync", {}).get("recovery_path")
-    )
+    store = Store.from_config(config)
     sources = LocalFixtureSources() if config.get("mode") == "local_fixture" else None
     if config.get("mode") == "source_sync":
         from .source_authority import SourceAuthority
@@ -645,7 +651,7 @@ def configured_app():
         from .observations import ObservationLedger, PlatformVerifier
 
         service.observations = ObservationLedger(store, PlatformVerifier(config_path))
-    auth = Authenticator(config_path, contracts, now)
+    auth = Authenticator(config_path, contracts, now, role_database=store.role_database)
     from .relationships import Policy, Relationships
 
     policy_config = dict(config.get("relationships_policy", {}))
@@ -655,4 +661,7 @@ def configured_app():
     relationships = Relationships(service, auth=auth, policy=Policy(**policy_config))
     app = create_app(service=service, auth=auth, relationships=relationships)
     app.state.auth = auth
+    from .storage_lifecycle import attach
+
+    attach(app, store)
     return app

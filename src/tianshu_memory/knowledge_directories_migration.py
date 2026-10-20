@@ -7,8 +7,6 @@ which shares this installer. Neither path can rebuild or overwrite the schema 3 
 checkpoint.
 """
 
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 from .knowledge_directories_schema import SCHEMA, TRACKED, VERSION
@@ -60,11 +58,7 @@ def migrate(store, backup_path):
             raise ValueError("Directory migration requires project knowledge schema 1")
         if "knowledge_directories_schema" in metadata:
             raise ValueError("Directory migration already applied")
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as destination,
-        ):
-            reader.backup(destination)
+        store.backup(backup, db=db)
         install(db)
     return {
         "schema": 3,

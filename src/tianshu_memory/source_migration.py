@@ -1,8 +1,6 @@
 """Explicit schema 2 -> 3 migration; no inferred owner attestations."""
 
 import json
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
@@ -45,11 +43,7 @@ def migrate(store, backup_path, contracts):
     with store.transaction() as db:
         if db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()[0] != "2":
             raise ValueError("Source migration requires schema 2; migrate profiles first")
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as dest,
-        ):
-            reader.backup(dest)
+        store.backup(backup, db=db)
         # Validate every historical ownership edge before changing a key. Fail atomically on
         # mixed legacy ownership; the caller can retain/quarantine that DB for manual review.
         mapping = {}

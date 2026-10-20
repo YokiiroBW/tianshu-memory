@@ -1,8 +1,6 @@
 """Add guarded continuity state without replacing existing people or source lineage."""
 
 import json
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 from ..domain import fingerprint, require
@@ -67,11 +65,7 @@ def migrate(store, backup_path):
         backup.parent.mkdir(parents=True, exist_ok=True)
         with backup.open("xb"):
             pass
-        with (
-            closing(sqlite3.connect(store.path)) as reader,
-            closing(sqlite3.connect(backup)) as destination,
-        ):
-            reader.backup(destination)
+        store.backup(backup, db=db)
         guard = backup.with_name(backup.name + ".source-guard.json")
         with guard.open("xb") as output:
             output.write(store.recovery_path.read_bytes())

@@ -21,6 +21,7 @@ SPEC.loader.exec_module(BUILD)
 def project(tmp_path):
     for name in ("pyproject.toml", "uv.lock"):
         shutil.copyfile(ROOT / name, tmp_path / name)
+    shutil.copytree(ROOT / "vendor", tmp_path / "vendor")
     return tmp_path
 
 
@@ -60,6 +61,8 @@ def test_current_lock_exports_without_mutating_inputs(project):
     assert before == {name: BUILD.digest(project / name) for name in before}
     requirements = (project / "requirements.txt").read_text(encoding="utf-8")
     assert "fastapi==" in requirements and "--hash=sha256:" in requirements
+    wheel = project / "vendor/tianshu_storage-0.1.0-py3-none-any.whl"
+    assert wheel.name in requirements and "sha256:" + BUILD.digest(wheel) in requirements
     assert "pytest==" not in requirements and "mcp==" not in requirements
 
 

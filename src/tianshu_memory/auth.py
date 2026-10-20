@@ -13,7 +13,7 @@ from .domain import Fault, parse_time, require
 class Authenticator:
     """Per-caller credentials, fixed issuer configuration, and live origin re-resolution."""
 
-    def __init__(self, config_path, contracts, clock):
+    def __init__(self, config_path, contracts, clock, *, role_database=None):
         self.path, self.contracts, self.clock = Path(config_path), contracts, clock
         config = self.config()
         grant_path = config.get("role_grants_database_path")
@@ -22,7 +22,7 @@ class Authenticator:
                 raise ValueError("role_grants_database_path must be absolute")
             from .role_grants import RoleGrants
 
-            self.role_grants = RoleGrants(grant_path)
+            self.role_grants = RoleGrants(grant_path, database=role_database)
         else:
             self.role_grants = None
 
@@ -120,9 +120,11 @@ class Authenticator:
         decision = self.role_grants.decision(actor_id) if self.role_grants is not None else None
         require(
             decision is not False
-            and (actor_id in allowed
-            or caller.get("allow_runtime_roles") is True
-            and self.role_grants is not None
-            and decision is True)
+            and (
+                actor_id in allowed
+                or caller.get("allow_runtime_roles") is True
+                and self.role_grants is not None
+                and decision is True
+            )
         )
         return context

@@ -6,6 +6,8 @@ from datetime import timedelta
 from . import knowledge_media as media
 from .domain import canonical, fingerprint, new_id, parse_time, require, utc
 from .knowledge_content_migration import ready
+from .knowledge_files import put as put_file
+from .knowledge_files import read as read_file
 from .knowledge_originals import store_version
 from .knowledge_sources import content_hash, fetch_url
 
@@ -241,7 +243,7 @@ class KnowledgeContent:
             if row["state"] == "pending":
                 db.execute(
                     "UPDATE knowledge_content_uploads SET raw=?,state='complete' WHERE id=?",
-                    (raw, upload_id),
+                    (put_file(db, raw, media_type=descriptor["media_type"]), upload_id),
                 )
             return self._upload_response(
                 self._upload(db, upload_id, authority), authority["request_id"]
@@ -270,7 +272,11 @@ class KnowledgeContent:
                     return self._save(db, "acquire", request, authority, result)
                 require(upload["state"] == "complete", "invalid_input", 409)
                 descriptor = json.loads(upload["descriptor"])
-                raw, content_type, resolved = upload["raw"], descriptor["media_type"], None
+                raw, content_type, resolved = (
+                    read_file(db, upload["raw"]),
+                    descriptor["media_type"],
+                    None,
+                )
         if source["kind"] == "url":
             raw, content_type, resolved, source_time = fetch_url(
                 source["url"],
@@ -343,6 +349,8 @@ class KnowledgeContent:
         with self.service.store.transaction() as db:
             self._check(db, authority)
             row = dict(self._document(db, request["content_ref"], authority))
+            row["raw"] = read_file(db, row["raw"])
+            row["text"] = read_file(db, row["text"], text=True)
         decoded = media.read(row, request["range"], request["budget_bytes"])
         authority = refresh()
         with self.service.store.transaction() as db:
@@ -355,7 +363,7 @@ class KnowledgeContent:
         with self.service.store.transaction() as db:
             self._check(db, authority)
             row = self._document(db, request["content_ref"], authority)
-            raw, selected = row["raw"], request["range"]
+            raw, selected = read_file(db, row["raw"]), request["range"]
             coverage = {"unit": "bytes", "start": 0, "end": len(raw)}
             if selected is not None:
                 require(

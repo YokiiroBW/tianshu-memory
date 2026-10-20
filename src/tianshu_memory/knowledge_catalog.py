@@ -250,7 +250,7 @@ def block(row, unit):
     }
 
 
-def unit_of(row, evidence):
+def unit_of(row, evidence, db=None):
     """The stored unit of one block row, verified as current evidence when a port is wired.
 
     The knowledge domain owns what a block reference proves, so when an evidence port is present
@@ -268,7 +268,9 @@ def unit_of(row, evidence):
                 "hash": row["hash"],
             }
         )
-    return json.loads(row["payload"])
+    from .knowledge_files import block as read_block
+
+    return read_block(db, row["payload"])
 
 
 def envelope(base, payload, next_cursor, omissions):
@@ -678,7 +680,7 @@ class Catalog:
             (document_id, document["version"], last_id or "", shape["limit"] + 1),
         ).fetchall()
         more = len(rows) > shape["limit"]
-        units = [block(row, unit_of(row, self.evidence)) for row in rows[: shape["limit"]]]
+        units = [block(row, unit_of(row, self.evidence, self.db)) for row in rows[: shape["limit"]]]
         body = {
             **self.base,
             "limit": shape["limit"],

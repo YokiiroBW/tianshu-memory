@@ -12,7 +12,11 @@ from .service import MemoryService
 from .store import Store
 
 
-def mount(app, config_path, config, *, body_timeout, execute_timeout):
+def mount(app, config_path, config, *, body_timeout, execute_timeout, store=None):
+    from .storage_lifecycle import attach
+
+    store = store or Store.from_config(config, service="knowledge")
+    attach(app, store)
     callers = config.get("callers", {})
     enabled = any(
         any(op.startswith("content_") for op in caller.get("operations", []))
@@ -23,10 +27,7 @@ def mount(app, config_path, config, *, body_timeout, execute_timeout):
     contracts = Contracts(config["contract_directory"])
     if enabled:
         contracts.load_content()
-    auth = Authenticator(config_path, contracts, now)
-    store = Store(
-        config["database_path"], recovery_path=config.get("source_sync", {}).get("recovery_path")
-    )
+    auth = Authenticator(config_path, contracts, now, role_database=store.role_database)
     service = MemoryService(store, contracts)
 
     def authorize_scope(db, context, *, scope):

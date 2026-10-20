@@ -59,7 +59,8 @@ def build(source, output):
     output.mkdir(parents=True, exist_ok=False)
     env = environment()
     env["UV_CACHE_DIR"] = str(output / "uv-cache")
-    inputs = [source / "pyproject.toml", source / "uv.lock"]
+    storage_wheel = source / "vendor/tianshu_storage-0.1.0-py3-none-any.whl"
+    inputs = [source / "pyproject.toml", source / "uv.lock", storage_wheel]
     inputs_before = {path.name: digest(path) for path in inputs}
     tools_dir, runtime = output / "tools", output / "venv"
     venv.EnvBuilder(with_pip=True).create(tools_dir)
@@ -105,13 +106,24 @@ def build(source, output):
     )
     if inputs_before != {path.name: digest(path) for path in inputs}:
         raise ValueError("Build changed pyproject.toml or uv.lock.")
+    # uv exports local wheels relative to the source root. pip runs from the isolated
+    # output directory, so bind this one pinned artifact to a file URI, retaining its
+    # exported SHA256 line and the normal --require-hashes verification.
+    exported = requirements.read_text(encoding="utf-8")
+    exported = exported.replace(
+        "./vendor/" + storage_wheel.name,
+        "tianshu-storage @ " + storage_wheel.as_uri(),
+    )
+    requirements.write_text(exported, encoding="utf-8")
     print("Building the application wheel with the explicit setuptools backend", flush=True)
     wheels = output / "wheels"
     project = output / "project"
     project.mkdir()
     shutil.copyfile(source / "pyproject.toml", project / "pyproject.toml")
     source_hashes = {}
-    for module in sorted((source / "src/tianshu_memory").rglob("*.py")):
+    for module in sorted((source / "src/tianshu_memory").rglob("*")):
+        if not module.is_file() or module.suffix not in {".py", ".sql"}:
+            continue
         relative = module.relative_to(source)
         target = project / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -172,10 +184,15 @@ def build(source, output):
                 tool_python,
                 "-I",
                 "-c",
-                "import json,sys; from pip._vendor.packaging.requirements import Requirement; "
+                "import json,sys; from pathlib import PurePosixPath; "
+                "from urllib.parse import urlparse,unquote; "
+                "from pip._vendor.packaging.utils import parse_wheel_filename; "
+                "from pip._vendor.packaging.requirements import Requirement; "
                 "rows=[Requirement(line.strip().removesuffix(chr(92))) for line in "
                 "open(sys.argv[1],encoding='utf-8') if line and line[0].isalnum()]; "
-                "print(json.dumps({r.name.lower().replace('_','-'):next(iter(r.specifier)).version "
+                "print(json.dumps({r.name.lower().replace('_','-'):"
+                "str(parse_wheel_filename(unquote(PurePosixPath(urlparse(r.url).path).name))[1]) "
+                "if r.url else next(iter(r.specifier)).version "
                 "for r in rows if r.marker is None or r.marker.evaluate()}))",
                 requirements,
             ],
@@ -216,6 +233,16 @@ def build(source, output):
     ).strip()
     if not Path(location).resolve().is_relative_to(runtime):
         raise ValueError("Import resolved outside the installed runtime environment.")
+    run(
+        [
+            runtime_python,
+            "-I",
+            "-c",
+            "from tianshu_memory.postgres import SCHEMA; assert 'CREATE TABLE' in SCHEMA",
+        ],
+        output,
+        env,
+    )
     evidence = {
         "python": sys.version,
         "platform": sys.platform,

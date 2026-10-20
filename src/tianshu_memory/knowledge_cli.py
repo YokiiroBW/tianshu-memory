@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 
 from .diagnostics import KNOWLEDGE_SERVICE
@@ -63,18 +64,15 @@ def main():
             "migrate-content",
         }:
             config = strict_json(Path(args.config).read_bytes())
-            store = Store(
-                config["database_path"],
-                recovery_path=config.get("source_sync", {}).get("recovery_path"),
-            )
-            result = {
-                "migrate": migrate,
-                "migrate-lessons": migrate_lessons,
-                "migrate-directories": migrate_directories,
-                "migrate-research-notes": migrate_research_notes,
-                "migrate-catalog": migrate_catalog,
-                "migrate-content": migrate_content,
-            }[args.command](store, args.backup)
+            with closing(Store.from_config(config, service="knowledge")) as store:
+                result = {
+                    "migrate": migrate,
+                    "migrate-lessons": migrate_lessons,
+                    "migrate-directories": migrate_directories,
+                    "migrate-research-notes": migrate_research_notes,
+                    "migrate-catalog": migrate_catalog,
+                    "migrate-content": migrate_content,
+                }[args.command](store, args.backup)
         elif args.command == "mcp":
             from .knowledge_mcp import create_server
 

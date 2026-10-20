@@ -1,5 +1,7 @@
 # 天枢记忆
 
+TS-232 保留默认 SQLite，支持可选 PostgreSQL 和 Redis 客户端识别；Knowledge 原件、全文、完整块与上传内容改为文件引用。配置、首迁、独立检查点和备份边界见 [业务存储](docs/storage-backends.md)。
+
 C5 URL/真实上传、Knowledge 唯一原件、角色自主和精确读者授权、实际图片/视频帧/音频及文档范围读取见 [生活内容原件](docs/knowledge-content.md)。沿现有 Memory HTTP 服务与 Knowledge 版本库，无 Companion 正文副本；`migrate-content --backup` 是停写后的显式步骤。
 
 C1 连续上下文的正式 query/propose/receipt/batch/association 路由、真实用户证明消费、原始发送时间筛选和显式升级见 [连续上下文服务](docs/memory-context.md)。复用本服务既有事实与来源权威，当前外部证明签发与跨产品联合由协调者接续。
@@ -16,7 +18,7 @@ TS-086 追加项目资料目录与完整语义块分页阅读：`document_list` 
 
 Python 人物与记忆服务，绑定已发布 text-dialogue/v1、profile-memory/v1 与 source-sync/v1 **1.0.0**。提供 SQLite/WAL、完整语义组预算检索、画像查询、修订/遗忘与候选幂等账本。TS-033 增加角色来源账本、物理否定传播、双 owner 读取屏障与真实 HTTPS 来源客户端。
 
-`source_sync` 模式经配置的 Core/Platform HTTPS 接口核验来源；`local_fixture` 保留隔离合成演示。实际测试包含合成 owner 经真实 HTTPS、Memory HTTP 与 SQLite 重启，不代表真实 Core/Platform 产品联合通过。TS-034 提供独立部署凭据认证的本地用户确认、画像批准/发布/撤销入口；未配置时仍不可用。Chat Audit、跨平台账号证明、PostgreSQL 与嵌入检索仍未接入。候选受理不自动生成记忆。
+`source_sync` 模式经配置的 Core/Platform HTTPS 接口核验来源；`local_fixture` 保留隔离合成演示。实际测试包含合成 owner 经真实 HTTPS、Memory HTTP 与数据库重启，不代表真实 Core/Platform 产品联合通过。TS-034 提供独立部署凭据认证的本地用户确认、画像批准/发布/撤销入口；未配置时仍不可用。Chat Audit、跨平台账号证明仍未接入；现有嵌入接口没有因存储切换扩大缓存范围。候选受理不自动生成记忆。
 
 本地用户入口、精确权限登记与批准迁移见 [本地用户操作](docs/local-user-actions.md)。
 
