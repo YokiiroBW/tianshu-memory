@@ -201,14 +201,15 @@ class MemoryService:
             rows.append(row)
         return rows
 
-    def _group_current(self, db, group_id):
+    def _group_current(self, db, group_id, *, rows=None):
         if self.source_authority is None:
             raise Fault("dependency_unavailable", 503)
-        rows = db.execute(
-            "SELECT l.revision AS required_revision,l.epoch AS required_epoch,s.* "
-            "FROM lineage l JOIN sources s ON s.key=l.source_key WHERE l.group_id=?",
-            (group_id,),
-        ).fetchall()
+        if rows is None:
+            rows = db.execute(
+                "SELECT l.revision AS required_revision,l.epoch AS required_epoch,s.* "
+                "FROM lineage l JOIN sources s ON s.key=l.source_key WHERE l.group_id=?",
+                (group_id,),
+            ).fetchall()
         return self.source_authority.current(db, rows)
 
     def _invalidate_jobs(self, db, *, source_keys=(), scopes=()):
@@ -425,29 +426,9 @@ class MemoryService:
                 f"SELECT * FROM groups WHERE scope=? AND state='active' AND category IN ({placeholders}){exact_filter} ORDER BY id",
                 parameters,
             ).fetchall()
-            eligible = []
-            for group in groups:
-                if not self._group_current(db, group["id"]):
-                    continue
-                rows = db.execute(
-                    "SELECT * FROM records WHERE group_id=? ORDER BY id", (group["id"],)
-                ).fetchall()
-                if set(json.loads(group["members"])) != {r["id"] for r in rows}:
-                    continue
-                if any(r["state"] != "active" for r in rows):
-                    continue
-                units = [json.loads(r["payload"]) for r in rows]
-                if any(u["subject_person_id"] != scope["person_id"] for u in units):
-                    continue
-                if scope["audience"] == "group" and any(
-                    u["visibility"] != "shared_projection"
-                    or any(s["kind"] != "shareable_projection" for s in u["sources"])
-                    for u in units
-                ):
-                    continue
-                if not self._projections_current(db, units):
-                    continue
-                eligible.append((group, rows, units))
+            from .recall_index import eligible_groups
+
+            eligible = eligible_groups(self, db, groups, scope)
             from .automatic_facts import filter_current
 
             eligible = filter_current(db, eligible, request["query_text"], self.clock)
@@ -543,13 +524,17 @@ class MemoryService:
             "omissions": list(dict.fromkeys(omissions)),
         }
 
-    def _projections_current(self, db, units):
+    def _projections_current(self, db, units, *, projections=None):
         for unit in units:
             for source in unit["sources"]:
                 if source["kind"] == "shareable_projection":
-                    row = db.execute(
-                        "SELECT * FROM projections WHERE ref=?", (source["projection_ref"],)
-                    ).fetchone()
+                    row = (
+                        db.execute(
+                            "SELECT * FROM projections WHERE ref=?", (source["projection_ref"],)
+                        ).fetchone()
+                        if projections is None
+                        else projections.get(source["projection_ref"])
+                    )
                     if (
                         not row
                         or row["state"] != "active"

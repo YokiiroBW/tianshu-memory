@@ -1,9 +1,81 @@
-"""Keyword ranking over one complete, currently authorized scope snapshot."""
+"""Whole-group validation and ranking over the current authorized snapshot."""
 
-from .domain import terms
+import json
+from collections import defaultdict
+
+from .domain import Fault, canonical, terms
 from .fact_migration import installed
 from .recall_language import normalize_objects, topic_tokens
 from .recall_relevance import LexicalQuery
+
+
+def eligible_groups(service, db, groups, scope):
+    """Batch existing authoritative reads, preserving group order and all checks."""
+    if service.source_authority is None:
+        raise Fault("dependency_unavailable", 503)
+    result = []
+    for offset in range(0, len(groups), 128):
+        batch = groups[offset : offset + 128]
+        keys = [group["id"] for group in batch]
+        placeholders = ",".join("?" for _ in keys)
+        records, lineage = defaultdict(list), defaultdict(list)
+        for row in db.execute(
+            f"SELECT * FROM records WHERE group_id IN ({placeholders}) ORDER BY group_id,id",
+            keys,
+        ):
+            records[row["group_id"]].append(row)
+        for row in db.execute(
+            "SELECT l.group_id,l.revision AS required_revision,l.epoch AS required_epoch,s.* "
+            f"FROM lineage l JOIN sources s ON s.key=l.source_key WHERE l.group_id IN ({placeholders})",
+            keys,
+        ):
+            lineage[row["group_id"]].append(row)
+        units = {key: [json.loads(row["payload"]) for row in rows] for key, rows in records.items()}
+        refs = list(
+            {
+                source["projection_ref"]
+                for group_units in units.values()
+                for unit in group_units
+                for source in unit["sources"]
+                if source["kind"] == "shareable_projection"
+            }
+        )
+        projections = {}
+        for start in range(0, len(refs), 256):
+            selected = refs[start : start + 256]
+            for row in db.execute(
+                "SELECT * FROM projections WHERE ref IN (" + ",".join("?" for _ in selected) + ")",
+                selected,
+            ):
+                projections[row["ref"]] = row
+        for group in batch:
+            rows, group_units = records[group["id"]], units.get(group["id"], [])
+            if (
+                group["state"] != "active"
+                or group["scope"] != canonical(scope)
+                or not rows
+                or set(json.loads(group["members"])) != {row["id"] for row in rows}
+                or any(
+                    row["state"] != "active"
+                    or unit["record_id"] != row["id"]
+                    or unit["record_version"] != row["version"]
+                    or unit["semantic_group_id"] != group["id"]
+                    or unit["subject_person_id"] != scope["person_id"]
+                    for row, unit in zip(rows, group_units, strict=True)
+                )
+            ):
+                continue
+            if scope["audience"] == "group" and any(
+                unit["visibility"] != "shared_projection"
+                or any(source["kind"] != "shareable_projection" for source in unit["sources"])
+                for unit in group_units
+            ):
+                continue
+            if service._group_current(
+                db, group["id"], rows=lineage[group["id"]]
+            ) and service._projections_current(db, group_units, projections=projections):
+                result.append((group, rows, group_units))
+    return result
 
 
 def rank_groups(service, db, eligible, search_terms, query):
