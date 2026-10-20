@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 import venv
 from pathlib import Path
 
@@ -59,7 +60,8 @@ def build(source, output):
     output.mkdir(parents=True, exist_ok=False)
     env = environment()
     env["UV_CACHE_DIR"] = str(output / "uv-cache")
-    storage_wheel = source / "vendor/tianshu_storage-0.1.0-py3-none-any.whl"
+    metadata = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8"))
+    storage_wheel = source / metadata["tool"]["uv"]["sources"]["tianshu-storage"]["path"]
     inputs = [source / "pyproject.toml", source / "uv.lock", storage_wheel]
     inputs_before = {path.name: digest(path) for path in inputs}
     tools_dir, runtime = output / "tools", output / "venv"

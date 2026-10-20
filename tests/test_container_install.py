@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -61,7 +62,8 @@ def test_current_lock_exports_without_mutating_inputs(project):
     assert before == {name: BUILD.digest(project / name) for name in before}
     requirements = (project / "requirements.txt").read_text(encoding="utf-8")
     assert "fastapi==" in requirements and "--hash=sha256:" in requirements
-    wheel = project / "vendor/tianshu_storage-0.1.0-py3-none-any.whl"
+    metadata = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
+    wheel = project / metadata["tool"]["uv"]["sources"]["tianshu-storage"]["path"]
     assert wheel.name in requirements and "sha256:" + BUILD.digest(wheel) in requirements
     assert "pytest==" not in requirements and "mcp==" not in requirements
 

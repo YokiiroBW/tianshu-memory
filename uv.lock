@@ -1069,7 +1069,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "pypdf", specifier = ">=6.19.0" },
     { name = "python-docx", specifier = ">=1.2.0" },
-    { name = "tianshu-storage", path = "vendor/tianshu_storage-0.1.1-py3-none-any.whl" },
+    { name = "tianshu-storage", path = "vendor/tianshu_storage-0.1.2-py3-none-any.whl" },
     { name = "uvicorn", specifier = ">=0.34,<1" },
 ]
 provides-extras = ["mcp"]
@@ -1082,14 +1082,14 @@ dev = [
 
 [[package]]
 name = "tianshu-storage"
-version = "0.1.1"
-source = { path = "vendor/tianshu_storage-0.1.1-py3-none-any.whl" }
+version = "0.1.2"
+source = { path = "vendor/tianshu_storage-0.1.2-py3-none-any.whl" }
 dependencies = [
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "redis" },
 ]
 wheels = [
-    { filename = "tianshu_storage-0.1.1-py3-none-any.whl", hash = "sha256:9c3ea08057ec95180833dc97f002a3f0d9da871e7d77a5acdbd5756d11261e4c" },
+    { filename = "tianshu_storage-0.1.2-py3-none-any.whl", hash = "sha256:936236aa9be50cb63197ed2ccc16fcb70413637bb38e808fa0029f5782ecf4ed" },
 ]
 
 [package.metadata]
