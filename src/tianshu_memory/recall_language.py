@@ -107,6 +107,20 @@ def lexical_question_text(value):
     return "".join(parts)
 
 
+def _object_focus(value):
+    # These words ask for current/past state or a collection of objects; they
+    # are not part of an object's distinguishing name. Quoted titles are
+    # matched as literals by the caller, and ordinal labels keep their 第.
+    value = re.sub(r"(?:现在|目前|如今|以前|原来|之前)$", "", value).strip()
+    value = re.sub(
+        r"^(?:(?:这|那)(?:[一两二三四五六七八九十百\d]+)?|[一两二三四五六七八九十百\d]+)"
+        r"(?:只|支|个|本|张|台|辆|件)",
+        "",
+        value,
+    )
+    return value or None
+
+
 def query_focus(value):
     """An explicit possessive/object question supplies stronger anchors than its preamble."""
     location = re.search(
@@ -117,17 +131,20 @@ def query_focus(value):
     if location:
         target = re.sub(r"^(?:我的那个|我那个|那个|我的?|我那|帮我找找)", "", location[1])
         if target:
-            return target
+            return _object_focus(target)
     missing = re.search(r"(?:找不到|找不着)([^，,。；;！？!?]+?)(?:了|来着)?$", value)
     if missing and len(missing[1]) >= 2:
-        return missing[1]
+        return _object_focus(missing[1])
     missing = re.search(r"^(.+?)(?:又|突然)?(?:找不到|找不着|不见|找不见)(?:了)?$", value)
     if missing:
-        return re.sub(r"^(?:我的那个|我那个|那个|我的?|我那)", "", missing[1])
+        return _object_focus(re.sub(r"^(?:我的那个|我那个|那个|我的?|我那)", "", missing[1]))
     ending = r"(?=(?:存放在|放在|放|在)?哪|叫什么|叫啥|用什么|使用什么|是什么|的(?:位置|名字|名称)|位置|[？?])"
-    owned = re.search(r"(?:我的|我家(?:的)?|我那)(.+?)" + ending, value)
+    owned = re.search(
+        r"(?:我的|我家(?:的)?|我(?:的)?(?:这|那)(?:只|支|个|本|张|台|辆|件)?)(.+?)" + ending,
+        value,
+    )
     if owned:
-        return owned[1].strip()
+        return _object_focus(owned[1].strip())
     body = re.split(r"[：:，,]", value)[-1].strip()
     body = re.sub(r"^(?:(?:请|帮我|替我|记住|记下|更正|忘掉|忘记|查一下|查询)\s*)+", "", body)
     # An activity such as "我写手账" is not the name of the requested instrument.
@@ -135,7 +152,7 @@ def query_focus(value):
     if body.startswith(("我", "你", "他", "她")):
         return None
     target = re.match(r"(.+?)(?:的位置|位置|在哪里|在哪|用什么|叫什么|叫啥)", body)
-    return re.sub(r"^(?:我|你|他|她)", "", target[1].strip()) if target else None
+    return _object_focus(re.sub(r"^(?:我|你|他|她)", "", target[1].strip())) if target else None
 
 
 def correction_target(value):

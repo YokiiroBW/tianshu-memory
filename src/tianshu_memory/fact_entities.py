@@ -94,6 +94,22 @@ def anchor(entity):
     return entity["kind"], mention
 
 
+def self_reference(entity, quotes):
+    """A leading, explicit self-reference may abbreviate an existing object.
+
+    The returned label is only a matching cue. Exact source evidence, current
+    owner scope, unique entity and supplied-ID checks still decide the binding.
+    """
+    if not any(q["quote"].lstrip().startswith(entity["mention"]) for q in quotes):
+        return None
+    value = re.sub(r"\s+", "", unicodedata.normalize("NFKC", entity["mention"]))
+    match = re.fullmatch(
+        r"(?:我(?:的)?|我家(?:的)?|本人(?:的)?)(?:这|那)(?:只|支|个|本|张|台|辆|件)?(.+)",
+        value,
+    )
+    return anchor(dict(entity, mention=match[1])) if match else None
+
+
 def compatible(left, right):
     if left == right:
         return True
@@ -149,20 +165,19 @@ def resolve(service, db, scope, fact, quotes):
         r"第[一二三四五六七八九十百零两0-9]+(?:只|支|个|本|张|台|辆|件)?",
         normalize_mention(entity["mention"]),
     )
-    objects = {}
+    requested = anchor(entity)
+    reference = self_reference(entity, quotes)
+
+    def matches_label(label):
+        return compatible(requested, label) or bool(
+            reference and reference[0] == label[0] and label[1].endswith(reference[1])
+        )
+
+    matches = set()
     for row in db.execute("SELECT group_id,payload FROM automatic_facts WHERE scope=?", (scope,)):
         prior = json.loads(row["payload"]).get("entity")
-        if (
-            prior
-            and compatible(anchor(entity), anchor(prior))
-            and service._group_current(db, row["group_id"])
-        ):
-            objects.setdefault(prior["id"], set()).add(anchor(prior))
-    matches = {
-        identity
-        for identity, labels in objects.items()
-        if any(compatible(anchor(entity), label) for label in labels)
-    }
+        if prior and matches_label(anchor(prior)) and service._group_current(db, row["group_id"]):
+            matches.add(prior["id"])
     # A reference cannot silently rename another object or bind a foreign/revoked object.
     # The model must quote a distinguishing source mention, including for corrections.
     if entity["id"] is not None:
