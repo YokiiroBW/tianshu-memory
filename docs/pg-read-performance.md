@@ -1,8 +1,9 @@
 # PostgreSQL recall and Knowledge reads
 
 TS-248 starts from production Memory/Knowledge `e1da946ae534c1b2ce4365a97ee38b2260b96c65`.
-It changes product read paths, with no schema migration, shared-driver change, Redis
-result cache or production operation. SQLite remains the default backend.
+It changes product read paths, with no schema migration, Redis result cache or
+production operation. Shared-driver packaging remains coordinator-owned; SQLite
+remains the default backend.
 
 ## Memory
 
@@ -14,6 +15,10 @@ projections only for currently authorized groups. It preserves candidate order, 
 scope/person, active state, exact members, payload record ID/version/group, shared
 projection ownership/version and complete-group budgets. Missing or inconsistent
 members omit the whole group.
+Both backends serialize the requested scope once per nonempty validation call and
+pass that exact value to the private unit validator; every group's scope equality,
+record identity/version/group/person and shared projection check still runs. Empty
+candidate lists do not serialize a scope or read content.
 
 `SourceAuthority.current_many` applies the existing `current` rule to rows belonging
 only to the current transaction. It does not retain a positive grant or replace the
@@ -31,6 +36,9 @@ negative updates prefetched current source state/epoch before the admission loop
 matching the database update. No observation or grant survives this transaction.
 
 PG transaction setup still acquires the authority advisory lock in its own statement.
+The SET/BEGIN/advisory-lock statements are queued in the shared 0.1.2 connection's
+explicit `pipeline()` context, whose successful exit confirms all setup commands
+and the lock. No setup result is consumed within it. SQLite does not enter a pipeline.
 The following **new statement** reads metadata to validate the PG marker and derive
 the before-checkpoint together. After the body, a fresh metadata read derives the
 after-checkpoint. This replaces five reads with two; it never uses a snapshot from
@@ -100,6 +108,14 @@ freshness, project revision, seal-key or result cache across dispatches. SQLite 
 its existing lazy reference SQL. Imports, deletions, grant withdrawal, changed roots,
 replaced files and derived-file corruption therefore remain current authority events.
 
+PG's project snapshot reads only `knowledge_schema` and `knowledge_seal_key`, joined
+to the current project registration/revision in one statement. The aggregate keeps
+a row when either metadata key or the project is absent, so the existing dependency,
+initialization and registration fault checks retain their order. Each capture and
+serve phase issues this query again and derives the client-bound seal key again;
+there is no snapshot cache. SQLite keeps its original metadata/project statements
+and metadata-fault short circuit.
+
 ## Validation and comparison
 
 `tests/test_pg_read_performance.py` checks SQLite stale-source short circuits,
@@ -116,6 +132,11 @@ ID-only score results recover current input text. SQLite-backed branch doubles
 check single-read/single-decode fact preparation, fresh subsequent captures and
 both reduced-lineage authority paths. These tests do not execute native PG FTS,
 driver adaptation or authority transactions and do not replace the native suite.
+`tests/test_read_setup.py` likewise uses only local SQLite SQL doubles and a fake
+pipeline: it checks snapshot result/fault equivalence, repeated revision/seal/
+registration reads, setup-error rollback and fresh metadata strictly after pipeline
+exit, with checkpoint persistence before commit. Native lock/wait/error behavior
+and the fixed shared 0.1.2 package still need coordinator-run PostgreSQL validation.
 
 `tests/test_postgres_source_snapshot.py` adds real PG stable-probe/no-op and source
 negative cases, owner rollback/generation, local CAS retry, an unrequested-physical

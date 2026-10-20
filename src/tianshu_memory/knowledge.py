@@ -693,16 +693,30 @@ class KnowledgeApplication:
 
     @staticmethod
     def _snapshot(db, project_id, project, client, secret, operation):
-        metadata = dict(db.execute("SELECT key,value FROM metadata"))
+        postgres = is_postgres(db)
+        if postgres:
+            state = db.native(
+                "SELECT m.knowledge_schema,m.knowledge_seal_key,p.id,p.registration,p.revision "
+                "FROM (SELECT max(value) FILTER (WHERE key='knowledge_schema') AS knowledge_schema,"
+                "max(value) FILTER (WHERE key='knowledge_seal_key') AS knowledge_seal_key "
+                "FROM metadata WHERE key IN ('knowledge_schema','knowledge_seal_key')) AS m "
+                "LEFT JOIN knowledge_projects p ON p.id=?",
+                (project_id,),
+            ).fetchone()
+            metadata = {key: state[key] for key in ("knowledge_schema", "knowledge_seal_key")}
+            registered = state if state["id"] is not None else None
+        else:
+            metadata = dict(db.execute("SELECT key,value FROM metadata"))
         require(
             metadata.get("knowledge_schema") == "1" and bool(metadata.get("knowledge_seal_key")),
             "dependency_unavailable",
             503,
         )
         seal_key = KnowledgeApplication._seal_key(metadata, client, secret)
-        registered = db.execute(
-            "SELECT * FROM knowledge_projects WHERE id=?", (project_id,)
-        ).fetchone()
+        if not postgres:
+            registered = db.execute(
+                "SELECT * FROM knowledge_projects WHERE id=?", (project_id,)
+            ).fetchone()
         if registered:
             require(registered["registration"] == canonical(project), "registration_changed", 409)
         else:

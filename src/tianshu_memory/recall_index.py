@@ -15,6 +15,9 @@ def eligible_groups(service, db, groups, scope):
     """Validate whole groups, batching remote reads without prefetching stale content."""
     if service.source_authority is None:
         raise Fault("dependency_unavailable", 503)
+    if not groups:
+        return []
+    scope_key = canonical(scope)
     if not is_postgres(db):
         # Local SQLite keeps its inexpensive, lazy reads. In particular, a revoked
         # source must short-circuit before any record payload/projection is read.
@@ -25,7 +28,7 @@ def eligible_groups(service, db, groups, scope):
             rows = db.execute(
                 "SELECT * FROM records WHERE group_id=? ORDER BY id", (group["id"],)
             ).fetchall()
-            units = _units(group, rows, scope)
+            units = _units(group, rows, scope, scope_key)
             if units is not None and service._projections_current(db, units):
                 result.append((group, rows, units))
         return result
@@ -58,7 +61,7 @@ def eligible_groups(service, db, groups, scope):
         ):
             records[row["group_id"]].append(row)
         units = {
-            group["id"]: _units(group, records[group["id"]], scope)
+            group["id"]: _units(group, records[group["id"]], scope, scope_key)
             for group in batch
             if group["id"] in current
         }
@@ -89,11 +92,11 @@ def eligible_groups(service, db, groups, scope):
     return result
 
 
-def _units(group, rows, scope):
+def _units(group, rows, scope, scope_key):
     """One integrity rule for local and batched reads; an incomplete group is omitted."""
     if (
         group["state"] != "active"
-        or group["scope"] != canonical(scope)
+        or group["scope"] != scope_key
         or not rows
         or set(json.loads(group["members"])) != {row["id"] for row in rows}
         or any(row["state"] != "active" for row in rows)

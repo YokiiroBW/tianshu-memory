@@ -409,9 +409,13 @@ class Store:
                 if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
                     raise RuntimeError("SQLite WAL unavailable")
                 db.execute("PRAGMA synchronous=FULL")
+                db.execute("BEGIN IMMEDIATE")
             else:
-                db.native("SET synchronous_commit=on")
-            db.execute("BEGIN IMMEDIATE")
+                # Queue setup only. Exiting confirms BEGIN and the dialect's
+                # authority lock before any metadata snapshot can be acquired.
+                with db.pipeline():
+                    db.native("SET synchronous_commit=on")
+                    db.execute("BEGIN IMMEDIATE")
             if self.backend == "postgresql":
                 from .domain import Fault
 

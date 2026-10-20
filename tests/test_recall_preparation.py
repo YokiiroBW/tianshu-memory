@@ -244,3 +244,33 @@ def test_reduced_lineage_projection_retains_both_authority_paths(h, batch_admiss
         db.execute("UPDATE sources SET epoch=epoch+1")
         assert eligible_groups(h.service, remote, groups, h.private) == []
         assert not any("FROM records" in sql for sql in remote.statements)
+
+
+@pytest.mark.parametrize("remote", [False, True], ids=["sqlite", "pg-branch-double"])
+@pytest.mark.parametrize("count", [0, 1, 32])
+def test_whole_group_scope_is_encoded_once_and_a_different_scope_still_fails(
+    h, monkeypatch, remote, count
+):
+    from tianshu_memory import recall_index
+
+    if count:
+        h.seed([h.draft(field_key=f"coffee-{i}") for i in range(count)])
+    encoded = []
+
+    def encode(scope):
+        encoded.append(scope)
+        return canonical(scope)
+
+    monkeypatch.setattr(recall_index, "canonical", encode)
+    with h.store.transaction() as db:
+        groups = list(db.execute("SELECT * FROM groups ORDER BY id"))
+        connection = RelationalPostgres(db) if remote else db
+        result = eligible_groups(h.service, connection, groups, h.private)
+        assert [entry[0]["id"] for entry in result] == [group["id"] for group in groups]
+        assert encoded == ([h.private] if count else [])
+        if count:
+            encoded.clear()
+            groups[0] = dict(groups[0], scope=canonical(h.group))
+            result = eligible_groups(h.service, connection, groups, h.private)
+            assert [entry[0]["id"] for entry in result] == [group["id"] for group in groups[1:]]
+            assert encoded == [h.private]
