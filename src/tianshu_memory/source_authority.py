@@ -14,6 +14,7 @@ from .domain import (
     source_selector,
     utc,
 )
+from .postgres import is_postgres
 from .source_lookup_migration import require_ready
 
 
@@ -344,9 +345,18 @@ class SourceAuthority:
         raise Fault("dependency_unavailable", 503)
 
     def _apply(self, service, db, snapshot, access):
+        batch = None
+        if is_postgres(db):
+            from .postgres_source_snapshot import SourceSnapshot
+
+            batch = SourceSnapshot(db, snapshot, access)
         heads = {"core": snapshot["head"], "platform": access["head"]}
         for owner, head in heads.items():
-            old = db.execute("SELECT * FROM owner_heads WHERE owner=?", (owner,)).fetchone()
+            old = (
+                db.execute("SELECT * FROM owner_heads WHERE owner=?", (owner,)).fetchone()
+                if batch is None
+                else batch.heads.get(owner)
+            )
             if old:
                 require(
                     head["generation"] == old["generation"] and head["sequence"] >= old["sequence"],
@@ -364,9 +374,13 @@ class SourceAuthority:
             ("access", "platform", grants),
         ):
             for key, value in values.items():
-                old = db.execute(
-                    "SELECT * FROM source_observations WHERE kind=? AND key=?", (kind, key)
-                ).fetchone()
+                old = (
+                    db.execute(
+                        "SELECT * FROM source_observations WHERE kind=? AND key=?", (kind, key)
+                    ).fetchone()
+                    if batch is None
+                    else batch.observations.get((kind, key))
+                )
                 if old and old["sequence"] == heads[owner]["sequence"]:
                     retained = json.loads(old["payload"])
                     observed = value
@@ -377,16 +391,27 @@ class SourceAuthority:
                         retained = {k: v for k, v in retained.items() if k != "admission_digest"}
                         observed = {k: v for k, v in value.items() if k != "admission_digest"}
                     require(retained == observed, "dependency_unavailable", 503)
-                db.execute(
-                    "INSERT INTO source_observations VALUES (?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET "
-                    "sequence=excluded.sequence,payload=excluded.payload "
-                    "WHERE source_observations.sequence != excluded.sequence OR source_observations.payload != excluded.payload",
-                    (kind, key, heads[owner]["sequence"], canonical(value)),
-                )
+                payload = canonical(value)
+                if (
+                    batch is None
+                    or old is None
+                    or old["sequence"] != heads[owner]["sequence"]
+                    or old["payload"] != payload
+                ):
+                    db.execute(
+                        "INSERT INTO source_observations VALUES (?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET "
+                        "sequence=excluded.sequence,payload=excluded.payload "
+                        "WHERE source_observations.sequence != excluded.sequence OR source_observations.payload != excluded.payload",
+                        (kind, key, heads[owner]["sequence"], payload),
+                    )
         # Local binding is an independent authority. A remote allowed bit cannot mint a person.
         for admission in snapshot["admissions"]:
             physical = physicals[fingerprint(admission["selector"]["key"])]
-            binding = service._binding(db, physical["author"])
+            binding = (
+                service._binding(db, physical["author"])
+                if batch is None
+                else batch.bindings.get(canonical(physical["author"]))
+            )
             require(
                 binding is not None
                 and binding["person_id"] == admission["scope"]["person_id"]
@@ -395,18 +420,29 @@ class SourceAuthority:
                 503,
             )
             require(
-                db.execute(
-                    "SELECT 1 FROM source_admissions WHERE payload IS NOT NULL "
-                    "AND json_extract(payload,'$.source.receipt_id')=? AND key!=? LIMIT 1",
-                    (admission["source"]["receipt_id"], fingerprint(admission["selector"])),
-                ).fetchone()
-                is None,
+                (
+                    db.execute(
+                        "SELECT 1 FROM source_admissions WHERE payload IS NOT NULL "
+                        "AND json_extract(payload,'$.source.receipt_id')=? AND key!=? LIMIT 1",
+                        (admission["source"]["receipt_id"], fingerprint(admission["selector"])),
+                    ).fetchone()
+                    is None
+                    if batch is None
+                    else not (
+                        batch.receipts.get(admission["source"]["receipt_id"], set())
+                        - {fingerprint(admission["selector"])}
+                    )
+                ),
                 "dependency_unavailable",
                 503,
             )
         invalid_keys = set()
         for key, physical in physicals.items():
-            old = db.execute("SELECT * FROM physical_sources WHERE key=?", (key,)).fetchone()
+            old = (
+                db.execute("SELECT * FROM physical_sources WHERE key=?", (key,)).fetchone()
+                if batch is None
+                else batch.physicals.get(key)
+            )
             if old:
                 require(physical["revision"] >= old["revision"], "dependency_unavailable", 503)
                 require(
@@ -435,30 +471,50 @@ class SourceAuthority:
                         )
                     if saved != physical:
                         invalid_keys.update(
-                            r[0]
-                            for r in db.execute(
-                                "SELECT key FROM source_admissions WHERE physical_key=?", (key,)
+                            (
+                                r[0]
+                                for r in db.execute(
+                                    "SELECT key FROM source_admissions WHERE physical_key=?", (key,)
+                                )
                             )
+                            if batch is None
+                            else batch.aliases.get(key, ())
                         )
-            db.execute(
-                "INSERT INTO physical_sources VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
-                "payload=excluded.payload,revision=excluded.revision,state=excluded.state "
-                "WHERE physical_sources.payload IS NOT excluded.payload OR physical_sources.revision != excluded.revision "
-                "OR physical_sources.state != excluded.state",
-                (key, canonical(physical), physical["revision"], physical["state"]),
-            )
+            payload = canonical(physical)
+            if (
+                batch is None
+                or old is None
+                or old["payload"] != payload
+                or old["revision"] != physical["revision"]
+                or old["state"] != physical["state"]
+            ):
+                db.execute(
+                    "INSERT INTO physical_sources VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
+                    "payload=excluded.payload,revision=excluded.revision,state=excluded.state "
+                    "WHERE physical_sources.payload IS NOT excluded.payload OR physical_sources.revision != excluded.revision "
+                    "OR physical_sources.state != excluded.state",
+                    (key, payload, physical["revision"], physical["state"]),
+                )
         # The physical negative broadcast includes all locally known actors, without obtaining
         # their positive grants or exposing their lineage in this actor's response.
         for key in invalid_keys:
             db.execute("UPDATE sources SET state='withdrawn',epoch=epoch+1 WHERE key=?", (key,))
+            if batch is not None:
+                batch.withdraw(key)
         for admission in snapshot["admissions"]:
             key, pk = fingerprint(admission["selector"]), fingerprint(admission["selector"]["key"])
             physical, grant = physicals[pk], grants[key]
             source, scope = admission["source"], admission["scope"]
-            old = db.execute("SELECT * FROM sources WHERE key=?", (key,)).fetchone()
-            suppression = db.execute(
-                "SELECT 1 FROM suppression WHERE source_key=?", (key,)
-            ).fetchone()
+            old = (
+                db.execute("SELECT * FROM sources WHERE key=?", (key,)).fetchone()
+                if batch is None
+                else batch.sources.get(key)
+            )
+            suppression = (
+                db.execute("SELECT 1 FROM suppression WHERE source_key=?", (key,)).fetchone()
+                if batch is None
+                else key in batch.suppressed
+            )
             active = (
                 grant["state"] == "allowed"
                 and physical["state"] == "active"
@@ -476,9 +532,15 @@ class SourceAuthority:
                     "dependency_unavailable",
                     503,
                 )
-                stored_admission = db.execute(
-                    "SELECT payload FROM source_admissions WHERE key=?", (key,)
-                ).fetchone()
+                stored_admission = (
+                    db.execute(
+                        "SELECT payload FROM source_admissions WHERE key=?", (key,)
+                    ).fetchone()
+                    if batch is None
+                    else (batch.admissions[key]["payload"],)
+                    if key in batch.admissions
+                    else None
+                )
                 if (
                     stored_admission
                     and stored_admission[0]
@@ -523,17 +585,19 @@ class SourceAuthority:
                         canonical(source),
                     ),
                 )
-            db.execute(
-                "INSERT INTO source_admissions VALUES (?,?,?,?,?,1) ON CONFLICT(key) DO UPDATE SET "
-                "payload=excluded.payload,verified=1 WHERE source_admissions.payload IS NOT excluded.payload OR source_admissions.verified != 1",
-                (
-                    key,
-                    pk,
-                    scope["actor_id"],
-                    canonical(admission["selector"]),
-                    canonical(admission),
-                ),
-            )
+            previous = batch.admissions.get(key) if batch is not None else None
+            payload = canonical(admission)
+            if (
+                batch is None
+                or previous is None
+                or previous["payload"] != payload
+                or previous["verified"] != 1
+            ):
+                db.execute(
+                    "INSERT INTO source_admissions VALUES (?,?,?,?,?,1) ON CONFLICT(key) DO UPDATE SET "
+                    "payload=excluded.payload,verified=1 WHERE source_admissions.payload IS NOT excluded.payload OR source_admissions.verified != 1",
+                    (key, pk, scope["actor_id"], canonical(admission["selector"]), payload),
+                )
         groups = set()
         for key in invalid_keys:
             groups.update(
@@ -542,12 +606,19 @@ class SourceAuthority:
         service._invalidate(db, groups)
         service._invalidate_jobs(db, source_keys=invalid_keys)
         for owner, head in heads.items():
-            db.execute(
-                "INSERT INTO owner_heads VALUES (?,?,?) ON CONFLICT(owner) DO UPDATE SET "
-                "generation=excluded.generation,sequence=excluded.sequence "
-                "WHERE owner_heads.generation != excluded.generation OR owner_heads.sequence != excluded.sequence",
-                (owner, head["generation"], head["sequence"]),
-            )
+            old = batch.heads.get(owner) if batch is not None else None
+            if (
+                batch is None
+                or old is None
+                or old["generation"] != head["generation"]
+                or old["sequence"] != head["sequence"]
+            ):
+                db.execute(
+                    "INSERT INTO owner_heads VALUES (?,?,?) ON CONFLICT(owner) DO UPDATE SET "
+                    "generation=excluded.generation,sequence=excluded.sequence "
+                    "WHERE owner_heads.generation != excluded.generation OR owner_heads.sequence != excluded.sequence",
+                    (owner, head["generation"], head["sequence"]),
+                )
         return {
             "local_revision": self.revision(db),
             "core_head": heads["core"],

@@ -415,12 +415,15 @@ class Store:
             if self.backend == "postgresql":
                 from .domain import Fault
 
-                marker = db.native(
-                    "SELECT value FROM metadata WHERE key='postgres_memory_schema'"
-                ).fetchone()
-                if marker is None or marker[0] != "1":
+                # A separate statement AFTER the advisory lock has returned is
+                # essential under READ COMMITTED: its snapshot must see the last
+                # writer's commit, including the independently persisted guard.
+                metadata = dict(db.native("SELECT key,value FROM metadata"))
+                if metadata.get("postgres_memory_schema") != "1":
                     raise Fault("dependency_unavailable", 503)
-            before = source_recovery.checkpoint(db)
+                before = source_recovery.from_metadata(metadata)
+            else:
+                before = source_recovery.checkpoint(db)
             if self.backend == "postgresql" and before is None and self.recovery_path.exists():
                 # Restoring a pre-guard schema cannot bypass an independently
                 # retained checkpoint, even while this process is still alive.
@@ -428,7 +431,11 @@ class Store:
             if before is not None:
                 source_recovery.verify(self.recovery_path, before)
             yield db
-            after = source_recovery.checkpoint(db)
+            after = (
+                source_recovery.from_metadata(dict(db.native("SELECT key,value FROM metadata")))
+                if self.backend == "postgresql"
+                else source_recovery.checkpoint(db)
+            )
             if after is not None and after != before:
                 prepared = True
                 source_recovery.persist(self.recovery_path, after, initialize=before is None)

@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from conftest import contract_directory
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -92,9 +93,7 @@ def binding_arguments(**overrides):
 def contracts():
     from tianshu_memory.contracts import Contracts
 
-    root = Path(__file__).resolve().parents[1]
-    context = json.loads((root / ".runtime/workspace-context.json").read_text(encoding="utf-8"))
-    return Contracts(Path(context["workspace"]) / "contracts/text-dialogue/v1")
+    return Contracts(contract_directory())
 
 
 def log_bytes(directory):
@@ -958,21 +957,12 @@ def test_a_real_tls_socket_serves_the_knowledge_business_and_refuses_the_rest(
     client_name = "deployed-connector"
     credential = "synthetic-deployment-credential"
     port = 8443
-    contract_directory = (
-        Path(
-            json.loads(
-                (Path(__file__).resolve().parents[1] / ".runtime/workspace-context.json").read_text(
-                    encoding="utf-8"
-                )
-            )["workspace"]
-        )
-        / "contracts/text-dialogue/v1"
-    )
+    directory = contract_directory()
     from tianshu_memory.contracts import Contracts
 
     store = KnowledgeStore(tmp_path / "notes.sqlite")
     store.migrate_profiles(tmp_path / "before-profiles.sqlite")
-    store.migrate_sources(tmp_path / "before-sources.sqlite", Contracts(contract_directory))
+    store.migrate_sources(tmp_path / "before-sources.sqlite", Contracts(directory))
     migrate_knowledge(store, tmp_path / "before-knowledge.sqlite")
     root = tmp_path / "alpha"
     root.mkdir()

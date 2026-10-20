@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from conftest import contract_directory
 from starlette.requests import Request
 
 from tianshu_memory import source_recovery
@@ -53,9 +54,8 @@ DIGEST = hashlib.sha256(b"synthetic-credential").hexdigest()
 
 
 def workspace_contracts():
-    root = Path(__file__).resolve().parents[1]
-    context = json.loads((root / ".runtime/workspace-context.json").read_text(encoding="utf-8"))
-    return Path(context["workspace"]) / "contracts/text-dialogue/v1"
+    # Honor the same explicit isolated contract input as the rest of the suite.
+    return contract_directory()
 
 
 @pytest.fixture(scope="module")

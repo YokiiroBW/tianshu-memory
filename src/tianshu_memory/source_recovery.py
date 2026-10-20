@@ -14,6 +14,11 @@ def checkpoint(db):
     ).fetchone():
         return None
     metadata = dict(db.execute("SELECT key,value FROM metadata"))
+    return from_metadata(metadata)
+
+
+def from_metadata(metadata):
+    """Derive the same checkpoint from metadata freshly read under the writer lock."""
     if metadata.get("schema") != "3":
         return None
     try:
