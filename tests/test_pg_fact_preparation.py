@@ -4,6 +4,9 @@ import pytest
 from test_automatic_facts import add, initialize
 from test_fact_entities import entity, saved_entity
 from test_memory_context import query_request
+from test_source_sync import certificates as certificates
+from test_source_sync import source_contracts as source_contracts
+from test_source_sync import source_examples as source_examples
 from test_storage_backends import pg_sync as pg_sync
 from tianshu_storage.postgres import PostgresConnection
 
