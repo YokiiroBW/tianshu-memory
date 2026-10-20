@@ -43,6 +43,15 @@ def constraints(query, text):
     owner, stored_owner = subject(query), subject(text)
     if owner != stored_owner and (owner or stored_owner):
         return False
+    if (
+        "水杯" in query
+        and re.search(r"(?:买|挑|选)(?:个|一个|只|一只)", query)
+        and not re.search(r"我的|我那|之前|原来|同款|一样|旧|名字|叫啥|叫什么|放哪|在哪", query)
+        and not re.search(r"喜欢|偏好|习惯|偏爱|不爱|倾向", text)
+    ):
+        # Choosing a new vessel does not ask for an existing cup's name/location.
+        # Actual cup preferences remain useful for this prospective request.
+        return False
     kinds = {kind for kind, pattern in SPECIES.items() if re.search(pattern, query, re.I)}
     actual = {kind for kind, pattern in SPECIES.items() if re.search(pattern, text, re.I)}
     # A coordinated request such as '工作和狗' asks for two independent topics.

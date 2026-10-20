@@ -4,17 +4,37 @@ import re
 
 
 def normalize_objects(value):
-    """Normalize explicit cover descriptions, without inventing an object's identity."""
+    """Normalize literal object descriptions, retaining their distinguishing qualifiers."""
     value = re.sub(
         r"([红蓝绿黑白黄紫棕灰橙]{2,3})封面", lambda m: "和".join(c + "封面" for c in m[1]), value
     )
     value = re.sub(r"([红蓝绿黑白黄紫棕灰橙])色?(?:封面|皮)(?:的)?", r"\1封面", value)
-    return value
+    return normalize_cups(value)
+
+
+def normalize_cups(value):
+    """Cup surface aliases do not apply the separate book-cover identity rules."""
+    parts = re.split(r"""([“「《"'‘].*?[”」》"'’])""", value)
+    for index in range(0, len(parts), 2):
+        parts[index] = re.sub(
+            r"([红蓝绿黑白黄紫棕灰橙])(?:色)?(?:的)?"
+            r"(?=(?:玻璃|陶瓷|不锈钢|塑料)?(?:水杯|杯子))",
+            r"\1",
+            parts[index],
+        )
+        parts[index] = re.sub(r"水杯|杯子", "水杯", parts[index])
+    return "".join(parts)
+
+
+def object_aliases(value):
+    """Literal candidate hints for older indexes; quoted titles stay literal."""
+    unquoted = " ".join(re.split(r"""([“「《"'‘].*?[”」》"'’])""", value)[::2])
+    return {"水杯", "杯子"} if re.search(r"水杯|杯子", unquoted) else set()
 
 
 def candidate_aliases(value):
     """Broad index hints only; the authorized ranker still decides relevance."""
-    aliases = set(topic_aliases(value))
+    aliases = set(topic_aliases(value)) | object_aliases(value)
     for color in re.findall(r"([红蓝绿黑白黄紫棕灰橙])封面", normalize_objects(value)):
         aliases.update((color + "皮", color + "色封面", color + "封面"))
     return aliases
@@ -269,7 +289,7 @@ QUERY_ALIASES = (
 
 def query_aliases(value):
     lowered = value.casefold()
-    return [
+    return sorted(object_aliases(value)) + [
         alias
         for group in QUERY_ALIASES
         if any(

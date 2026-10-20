@@ -9,7 +9,7 @@ import re
 import unicodedata
 
 from .domain import fingerprint, require
-from .recall_language import history_query, normalize_objects, topic_aliases
+from .recall_language import history_query, normalize_cups, normalize_objects, topic_aliases
 
 OBJECT_NOUNS = {
     "notebook": ("本", ("笔记本", "笔记", "手账")),
@@ -82,7 +82,7 @@ def ordinal(value):
 
 
 def anchor(entity):
-    mention = normalize_mention(entity["mention"])
+    mention = normalize_cups(normalize_mention(entity["mention"]))
     if entity["kind"] in {"notebook", "book", "journal", "diary"}:
         mention = normalize_objects(mention)
         if "封面" in mention:
