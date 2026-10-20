@@ -1,6 +1,7 @@
 """Regression traces from native candidate proposals; no model or seeded memory."""
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 from test_automatic_facts import add, initialize, recall
@@ -36,7 +37,7 @@ def test_source_observation_timestamp_does_not_split_unchanged_fact(sync, specie
     assert len(recall(sync, "我的宠物名字是什么")) == 1
 
 
-def test_explicit_dates_are_not_discarded_or_merged(sync):
+def test_explicit_dates_are_not_discarded_or_merged(sync, monkeypatch):
     initialize(sync)
     first, _ = add(
         sync,
@@ -59,7 +60,12 @@ def test_explicit_dates_are_not_discarded_or_merged(sync):
     with sync.store.transaction() as db:
         values = [json.loads(r[0]) for r in db.execute("SELECT payload FROM automatic_facts")]
         assert {x["valid_from"] for x in values} == {"2026-09-01T00:00:00Z", "2026-10-20T00:00:00Z"}
+    # The two dated facts are fixed fixtures. Wall-clock time eventually crosses
+    # the planned start; check both sides explicitly instead of aging this test.
+    monkeypatch.setattr(sync.service, "clock", lambda: datetime(2026, 10, 11, tzinfo=UTC))
     assert not recall(sync, "我现在的住所")
+    monkeypatch.setattr(sync.service, "clock", lambda: datetime(2026, 10, 21, tzinfo=UTC))
+    assert {u["record_id"] for u in recall(sync, "我现在的住所")} == set(second["record_ids"])
 
 
 @pytest.mark.parametrize(

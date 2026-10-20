@@ -2,9 +2,8 @@
 
 from .domain import terms
 from .fact_migration import installed
-from .recall_constraints import time_specificity
 from .recall_language import normalize_objects, topic_tokens
-from .recall_relevance import matching_clauses
+from .recall_relevance import LexicalQuery
 
 
 def rank_groups(service, db, eligible, search_terms, query):
@@ -53,6 +52,7 @@ def rank_groups(service, db, eligible, search_terms, query):
         (document(group, rows) for group, rows, _ in eligible),
     )
     expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in search_terms)
+    query_plan = LexicalQuery(query)
     matches = {}
     clauses_by_group = {}
     best_time = {}
@@ -62,16 +62,12 @@ def rank_groups(service, db, eligible, search_terms, query):
         (expression,),
     ):
         identity = match["group_id"]
-        clauses = matching_clauses(
-            normalize_objects(query), set(match["text"].split()), raw_text[identity]
-        )
+        clauses = query_plan.match(set(match["text"].split()), raw_text[identity])
         if identity not in historical and not clauses:
             continue
         clauses_by_group[identity] = clauses
-        for clause in clauses:
-            best_time[clause] = max(
-                best_time.get(clause, 0), time_specificity(clause, raw_text[identity])
-            )
+        for clause, specificity in clauses.items():
+            best_time[clause] = max(best_time.get(clause, 0), specificity)
         coverage = len(set(search_terms).intersection(match["text"].split()))
         matches[match["group_id"]] = (-coverage, match["relevance"], match["group_id"])
     return sorted(
@@ -82,8 +78,8 @@ def rank_groups(service, db, eligible, search_terms, query):
             and (
                 identity in historical
                 or any(
-                    time_specificity(clause, raw_text[identity]) == best_time[clause]
-                    for clause in clauses_by_group[identity]
+                    specificity == best_time[clause]
+                    for clause, specificity in clauses_by_group[identity].items()
                 )
             )
         ),

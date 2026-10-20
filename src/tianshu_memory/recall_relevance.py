@@ -1,10 +1,12 @@
-"""Lexical candidate admission, separate from ranking and prompt size limits."""
+"""One parsed lexical query, reused across its authorized candidate groups."""
 
 import re
 
 from .domain import query_terms, terms
+from .recall_constraints import Constraints
 from .recall_language import (
     correction_target,
+    normalize_objects,
     query_aliases,
     query_clauses,
     query_focus,
@@ -13,66 +15,63 @@ from .recall_language import (
 )
 
 
-def admits(query, indexed_terms, text=None):
-    return bool(matching_clauses(query, indexed_terms, text))
+def anchors(value):
+    return {term for term in value if not re.fullmatch(r"[\u3400-\u9fff]{3,}", term)}
 
 
-def matching_clauses(query, indexed_terms, text=None):
-    """Require a matching topic or sufficient content coverage, not any shared bigram.
-
-    Clauses are independent so asking about several facts does not require each
-    fact to mention every requested topic. Semantic retrieval has its own scores;
-    this gate applies to the keyword candidate lane only.
-    """
-    clauses = query_clauses(query)
-    # A dependent instruction like '按我的口味选' is not a second request about
-    # every food preference when the actual request has already named a drink.
-    if "topic19" in topic_tokens(query):
-        clauses = [
-            clause
-            for clause in clauses
-            if not re.match(r"^(?:按|照)(?:我|我的)?(?:平时|平常)?口味", clause)
+class Clause:
+    def __init__(self, text):
+        self.text = text
+        self.constraints = Constraints(text)
+        replacement = correction_target(text)
+        quoted = re.findall(r'[“「《"]([^”」》"]+)[”」》"]', text)
+        self.quoted = [set(terms(title)) for title in quoted] if replacement is None else []
+        focus = replacement or query_focus(text)
+        self.positions = [
+            set(terms(p)) for p in re.findall(r"第[一二三四五六七八九十百零两0-9]+", focus or "")
         ]
-    return [clause for clause in clauses if _clause_admits(clause, indexed_terms, text)]
+        self.focus_topics = set(topic_tokens(focus)) if focus else set()
+        self.focus_anchors = anchors(terms(focus)) if focus else set()
+        self.topics = set(topic_tokens(text))
+        self.aliases = set(terms(" ".join(query_aliases(text))))
+        self.content = anchors(query_terms(text))
 
-
-def _clause_admits(clause, indexed_terms, text=None):
-    from .recall_constraints import constraints
-
-    decision = constraints(clause, text or " ".join(indexed_terms))
-    if decision is not None:
-        return decision
-    replacement = correction_target(clause)
-    quoted = re.findall(r'[“「《"]([^”」》"]+)[”」》"]', clause)
-    if quoted and replacement is None:
-        return any(
-            bool(terms(title)) and set(terms(title)).issubset(indexed_terms) for title in quoted
+    def admits(self, indexed, text):
+        decision = self.constraints.admit(text)
+        if decision is not None:
+            return decision
+        if self.quoted:
+            return any(title and title.issubset(indexed) for title in self.quoted)
+        if self.positions and not any(p.issubset(indexed) for p in self.positions):
+            return False
+        if self.focus_topics:
+            return self.focus_topics.issubset(topic_family(indexed))
+        if self.focus_anchors:
+            return self.focus_anchors.issubset(indexed)
+        if self.topics:
+            return bool(self.topics.intersection(topic_family(indexed)))
+        if self.aliases.intersection(indexed):
+            return True
+        return (
+            bool(self.content)
+            and len(self.content.intersection(indexed)) / len(self.content) >= 0.5
         )
-    focus = replacement or query_focus(clause)
-    if focus:
-        positions = re.findall(r"第[一二三四五六七八九十百零两0-9]+", focus)
-        if positions and not any(
-            set(terms(position)).issubset(indexed_terms) for position in positions
-        ):
-            return False
-        topics = set(topic_tokens(focus))
-        if topics:
-            return topics.issubset(topic_family(indexed_terms))
-        anchors = {term for term in terms(focus) if not re.fullmatch(r"[\u3400-\u9fff]{3,}", term)}
-        if anchors:
-            return anchors.issubset(indexed_terms)
-    if clause:
-        topics = set(topic_tokens(clause))
-        if topics:
-            if topics.intersection(topic_family(indexed_terms)):
-                return True
-            return False
-        expanded = query_aliases(clause)
-        if expanded and set(terms(" ".join(expanded))).intersection(indexed_terms):
-            return True
-        content = {
-            term for term in query_terms(clause) if not re.fullmatch(r"[\u3400-\u9fff]{3,}", term)
+
+
+class LexicalQuery:
+    """Request-local only: no remembered text or permission results survive a query."""
+
+    def __init__(self, query):
+        query = normalize_objects(query)
+        clauses = query_clauses(query)
+        # A dependent '按我的口味选' does not request every food preference.
+        if "topic19" in topic_tokens(query):
+            clauses = [
+                c for c in clauses if not re.match(r"^(?:按|照)(?:我|我的)?(?:平时|平常)?口味", c)
+            ]
+        self.clauses = [Clause(c) for c in clauses]
+
+    def match(self, indexed, text):
+        return {
+            c.text: c.constraints.specificity(text) for c in self.clauses if c.admits(indexed, text)
         }
-        if content and len(content.intersection(indexed_terms)) / len(content) >= 0.5:
-            return True
-    return False
