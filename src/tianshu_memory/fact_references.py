@@ -2,6 +2,7 @@
 
 import json
 
+from .fact_queries import families as read_families
 from .recall_language import topic_tokens
 
 MAX_DEPTH = 16
@@ -26,13 +27,28 @@ def expand_candidates(query_sql, parameters, scope):
     )
 
 
-def reference_terms(service, db, eligible, indexed):
+def reference_terms(service, db, eligible, indexed, *, facts=None):
     """Validate old groups before any of their tokens affect current ranking.
 
     The caller has already verified the current scope and eligible output units.
     Nothing here changes statements, indexes, history validity or permissions.
     """
     families, checked, result = {}, {}, {}
+    family_rows = (
+        read_families(
+            db,
+            {
+                (fact["scope"], fact["fact_key"])
+                for group, _, _ in eligible
+                if (fact := facts.get(group["id"])) is not None
+                and fact["superseded_by"] is None
+                and fact["scope"] == group["scope"]
+            },
+            MAX_FAMILY,
+        )
+        if facts is not None
+        else None
+    )
 
     def valid_terms(group_id, scope):
         key = group_id, scope
@@ -70,17 +86,23 @@ def reference_terms(service, db, eligible, indexed):
         return value
 
     for group, _, _ in eligible:
-        fact = db.execute(
-            "SELECT * FROM automatic_facts WHERE group_id=?", (group["id"],)
-        ).fetchone()
+        fact = (
+            db.execute("SELECT * FROM automatic_facts WHERE group_id=?", (group["id"],)).fetchone()
+            if facts is None
+            else facts.get(group["id"])
+        )
         if fact is None or fact["superseded_by"] is not None or fact["scope"] != group["scope"]:
             continue
         key = fact["scope"], fact["fact_key"]
         if key not in families:
-            rows = db.execute(
-                "SELECT group_id,superseded_by FROM automatic_facts WHERE scope=? AND fact_key=? LIMIT ?",
-                (*key, MAX_FAMILY + 1),
-            ).fetchall()
+            rows = (
+                db.execute(
+                    "SELECT group_id,superseded_by FROM automatic_facts WHERE scope=? AND fact_key=? LIMIT ?",
+                    (*key, MAX_FAMILY + 1),
+                ).fetchall()
+                if family_rows is None
+                else family_rows.get(key, [])
+            )
             reverse = {}
             if len(rows) <= MAX_FAMILY:
                 for row in rows:

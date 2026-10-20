@@ -1550,7 +1550,8 @@ def test_http_module_calls_only_the_public_execute_and_holds_no_domain_state():
     # Two standard-library additions are allowed for the authority rule: `ipaddress` and `re` are
     # what let a presented `Host` be judged by the interface it names rather than by its spelling,
     # with the same parser the binding validates its configured names with. Nothing else about this
-    # list changes: no diagnostics, no runtime, no domain state.
+    # Resource leasing/lifespan belong to server assembly; neither carries
+    # authorized project/client/domain state or executes SQL in the transport.
     assert imported <= {
         "asyncio",
         "ipaddress",
@@ -1562,6 +1563,8 @@ def test_http_module_calls_only_the_public_execute_and_holds_no_domain_state():
         "domain",
         "knowledge",
         "knowledge_content_runtime",
+        "knowledge_storage",
+        "storage_lifecycle",
     }, imported
     attributes = {
         node.attr

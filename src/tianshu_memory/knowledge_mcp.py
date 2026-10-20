@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+from contextlib import asynccontextmanager
 
 from .domain import Fault
 from .knowledge import KnowledgeApplication
@@ -12,7 +13,15 @@ def create_server(config_path, client, credential_env):
     from mcp.types import ToolAnnotations
 
     application = KnowledgeApplication(config_path)
-    server = FastMCP("Tianshu project knowledge")
+
+    @asynccontextmanager
+    async def lifespan(server):
+        try:
+            yield
+        finally:
+            application.close()
+
+    server = FastMCP("Tianshu project knowledge", lifespan=lifespan)
 
     def execute(operation, project_id, arguments):
         try:

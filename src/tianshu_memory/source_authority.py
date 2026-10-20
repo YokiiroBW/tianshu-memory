@@ -574,3 +574,39 @@ class SourceAuthority:
             ).fetchone()
             for row in rows
         )
+
+    def current_many(self, db, groups):
+        """The same admission/suppression rule over this transaction's lineage batch.
+
+        Nothing survives the operation or changes synchronization/revision handling.
+        Inactive/old source rows are excluded before reading record payloads.
+        """
+        candidates = {
+            identity: rows
+            for identity, rows in groups.items()
+            if rows
+            and all(
+                row["state"] == "active"
+                and row["revision"] == row["required_revision"]
+                and row["epoch"] == row["required_epoch"]
+                for row in rows
+            )
+        }
+        keys = list({row["key"] for rows in candidates.values() for row in rows})
+        admitted = set()
+        for offset in range(0, len(keys), 256):
+            batch = keys[offset : offset + 256]
+            admitted.update(
+                row[0]
+                for row in db.execute(
+                    "SELECT a.key FROM source_admissions a WHERE a.verified=1 "
+                    "AND a.key IN (" + ",".join("?" for _ in batch) + ") "
+                    "AND NOT EXISTS (SELECT 1 FROM suppression s WHERE s.source_key=a.key)",
+                    batch,
+                )
+            )
+        return {
+            identity
+            for identity, rows in candidates.items()
+            if all(row["key"] in admitted for row in rows)
+        }

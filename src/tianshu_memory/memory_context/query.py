@@ -205,27 +205,9 @@ def execute(application, request, context):
             if len(rows) > candidate_limit:
                 result["coverage"]["complete"] = False
                 rows = rows[:candidate_limit]
-            for group in rows:
-                if not service._group_current(db, group["id"]):
-                    continue
-                records = db.execute(
-                    "SELECT * FROM records WHERE group_id=? ORDER BY id", (group["id"],)
-                ).fetchall()
-                if set(json.loads(group["members"])) != {r["id"] for r in records} or any(
-                    r["state"] != "active" for r in records
-                ):
-                    continue
-                units = [json.loads(r["payload"]) for r in records]
-                if any(u["subject_person_id"] != selected_scope["person_id"] for u in units):
-                    continue
-                if selected_scope["audience"] == "group" and any(
-                    u["visibility"] != "shared_projection"
-                    or any(s["kind"] != "shareable_projection" for s in u["sources"])
-                    for u in units
-                ):
-                    continue
-                if service._projections_current(db, units):
-                    candidates.append((group, records, units))
+            from ..recall_index import eligible_groups
+
+            candidates.extend(eligible_groups(service, db, rows, selected_scope))
         from ..automatic_facts import filter_current
 
         candidates = filter_current(db, candidates, request["query_text"], service.clock)

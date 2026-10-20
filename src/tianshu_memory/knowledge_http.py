@@ -7,7 +7,7 @@ service grants; they do not use project IDs or create a second identity authorit
 
 The legacy action transport below adds no domain rule of its own:
 
-- every request builds a fresh `KnowledgeApplication` and calls only its public `execute`;
+- every request builds a fresh `KnowledgeApplication` over leased storage resources;
 - the identity is the fixed knowledge client the operator named when the process started, so no
   field of a request body, query string or header can choose who the caller is;
 - the credential is whatever `Authorization: Bearer` carried, exactly as the CLI and MCP
@@ -528,6 +528,11 @@ def create_app(
     app.state.active = 0
     app.state.observer = None
     app.state.settle = None
+    from .knowledge_storage import KnowledgeStorage
+    from .storage_lifecycle import attach
+
+    storage = KnowledgeStorage()
+    attach(app, storage)
     from .knowledge_content_runtime import mount as mount_content_runtime
 
     mount_content_runtime(
@@ -614,9 +619,9 @@ def create_app(
         instance per request makes that impossible by construction, and only the public
         `execute` of that instance is ever called.
         """
-        # A call can outlive the response or this ASGI lifespan. Its own owner keeps
-        # that admitted work alive and re-reads the current storage registration.
-        return KnowledgeApplication(config_path)
+        # A call can outlive the response or ASGI lifespan: its storage lease stays
+        # alive until execute returns. Config/auth are still re-read by the domain.
+        return KnowledgeApplication(config_path, storage=storage)
 
     def call(body, presented):
         """Run one operation through this request's own application, marking a domain refusal.

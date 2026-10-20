@@ -5,7 +5,7 @@ import hmac
 import http.client
 import json
 import re
-from contextvars import ContextVar
+from copy import copy
 from pathlib import Path
 
 from . import knowledge_continuation as continuation
@@ -25,7 +25,8 @@ from .knowledge_evidence import blocks
 from .knowledge_files import block as read_block
 from .knowledge_ports import ContinuationReader, DirectoryWriter, EvidenceLookup
 from .knowledge_sources import FileReader, content_hash, decode, fetch_url, read_file
-from .store import Store
+from .knowledge_storage import KnowledgeStorage, registration
+from .postgres import is_postgres
 
 READ = {
     "query",
@@ -389,9 +390,10 @@ class Plan:
 
 
 class KnowledgeApplication:
-    def __init__(self, config_path):
+    def __init__(self, config_path, *, storage=None):
         self.config_path = Path(config_path).resolve()
-        self._storage = ContextVar("knowledge_dispatch_storage", default=None)
+        self._store_owner = storage if storage is not None else KnowledgeStorage()
+        self._owns_storage = storage is None
         self.project_id = None
         self.client = None
         self.projects = {}
@@ -492,22 +494,14 @@ class KnowledgeApplication:
         config, knowledge, principal, project, secret, scan, worktrees = self._authorize(
             client, credential, project_id, operation, evidence_projects
         )
-        storage_config = {
-            key: config.get(key)
-            for key in (
-                "database_path",
-                "source_sync",
-                "knowledge_files_directory",
-                "storage_backends",
-                "role_grants_database_path",
-            )
-        }
-        storage = self._storage.get()
-        if storage["config"] is not None:
-            require(storage_config == storage["config"], "registration_changed", 409)
-        storage["config"] = storage_config
+        storage_key = registration(config)
+        storage = self._storage
+        if storage["key"] is not None:
+            require(storage_key == storage["key"], "registration_changed", 409)
+        storage["key"] = storage_key
         if storage["store"] is None:
-            storage["store"] = Store.from_config(config, service="knowledge")
+            storage["lease"] = self._store_owner.lease(config, storage_key)
+            storage["store"] = storage["lease"].__enter__()
         store = storage["store"]
         require(
             store.path == str(Path(config["database_path"]).resolve()), "registration_changed", 409
@@ -523,16 +517,19 @@ class KnowledgeApplication:
         return store, project, secret, scan, worktrees
 
     def execute(self, request, *, client, credential):
-        # Separate invocations may share this application (CLI/MCP and directory
-        # import retries). Only this dispatch owns and closes its storage runtime.
-        storage = {"store": None, "config": None}
-        token = self._storage.set(storage)
+        # MCP/direct callers may invoke one application concurrently. Only the
+        # resource owner is shared; project/client/domain fields belong to this copy.
+        invocation = copy(self)
+        storage = invocation._storage = {"store": None, "key": None, "lease": None}
         try:
-            return self._execute(request, client=client, credential=credential)
+            return invocation._execute(request, client=client, credential=credential)
         finally:
             if storage["store"] is not None:
-                storage["store"].close()
-            self._storage.reset(token)
+                storage["lease"].__exit__(None, None, None)
+
+    def close(self):
+        if self._owns_storage:
+            self._store_owner.close()
 
     def _execute(self, request, *, client, credential):
         exact(request, "operation project_id arguments")
@@ -1168,16 +1165,18 @@ class KnowledgeApplication:
         }
 
     @staticmethod
-    def _current(db, project, document, read):
+    def _current(db, project, document, read, *, expected_hash=None):
         if document["state"] != "ready":
             return False
         if document["kind"] == "url":
             return document["locator"] in project["urls"]
-        version = db.execute(
-            "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
-            (document["id"], document["version"]),
-        ).fetchone()
-        return read(document, version["hash"])
+        if expected_hash is None:
+            version = db.execute(
+                "SELECT hash FROM knowledge_versions WHERE document_id=? AND version=?",
+                (document["id"], document["version"]),
+            ).fetchone()
+            expected_hash = version["hash"]
+        return read(document, expected_hash)
 
     def _reference(self, db, project_id, project, reference, read):
         exact(reference, "block_id document_id version hash")
@@ -1195,6 +1194,10 @@ class KnowledgeApplication:
             (reference["block_id"], document["id"], document["version"]),
         ).fetchone()
         require(row is not None and row["hash"] == reference["hash"], "stale_evidence", 409)
+        return self._evidence(db, document, reference, row)
+
+    @staticmethod
+    def _evidence(db, document, reference, row):
         return {
             "reference": reference,
             **read_block(db, row["payload"]),
@@ -1222,8 +1225,18 @@ class KnowledgeApplication:
         if not search:
             return result
         expression = " OR ".join('"' + t.replace('"', '""') + '"' for t in search)
+        postgres = is_postgres(db)
+        # On PG, the same current document/version/block proof can travel with the
+        # ranked row. It belongs only to this transaction, never a cross-request
+        # cache. SQLite retains its existing lazy reference reads.
+        extra = (
+            ",d.project_id,d.version AS document_version,d.state,d.kind,d.locator,"
+            "d.source_id,b.payload,v.provenance "
+            if postgres
+            else " "
+        )
         rows = db.execute(
-            "SELECT b.id,b.document_id,b.version,v.hash FROM knowledge_index "
+            "SELECT b.id,b.document_id,b.version,v.hash" + extra + "FROM knowledge_index "
             "JOIN knowledge_blocks b ON b.id=knowledge_index.block_id "
             "JOIN knowledge_documents d ON d.id=b.document_id "
             "JOIN knowledge_versions v ON v.document_id=b.document_id "
@@ -1241,7 +1254,18 @@ class KnowledgeApplication:
                 "hash": row["hash"],
             }
             try:
-                unit = self._reference(db, project_id, project, reference, read)
+                if postgres:
+                    document = dict(row, id=row["document_id"], version=row["document_version"])
+                    require(
+                        row["project_id"] == project_id
+                        and document["version"] == reference["version"]
+                        and self._current(db, project, document, read, expected_hash=row["hash"]),
+                        "stale_evidence",
+                        409,
+                    )
+                    unit = self._evidence(db, document, reference, row)
+                else:
+                    unit = self._reference(db, project_id, project, reference, read)
             except Fault:
                 omitted.add("stale_source")
                 continue

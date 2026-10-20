@@ -199,17 +199,21 @@ def fact_key(fact):
     return fact["key"] if entity is None else fact["key"] + "@" + entity["id"]
 
 
-def filter_targets(db, candidates, query):
+def filter_targets(db, candidates, query, *, facts=None):
     """Constrain explicitly named/numbered objects before ranking, within authorized rows."""
     if query.partition(":")[0] in {"field", "item"}:
         return candidates
     objects, by_group = {}, {}
     normalized = normalize_objects(normalize_mention(query))
     for group, _, _ in candidates:
-        row = db.execute(
-            "SELECT payload FROM automatic_facts WHERE group_id=?", (group["id"],)
-        ).fetchone()
-        entity = json.loads(row[0]).get("entity") if row else None
+        row = (
+            db.execute(
+                "SELECT payload FROM automatic_facts WHERE group_id=?", (group["id"],)
+            ).fetchone()
+            if facts is None
+            else facts.get(group["id"])
+        )
+        entity = json.loads(row["payload"]).get("entity") if row else None
         if entity:
             by_group[group["id"]] = entity
             objects.setdefault(entity["kind"], []).append(entity)
@@ -251,25 +255,29 @@ def filter_targets(db, candidates, query):
     ]
 
 
-def historical_title_groups(db, candidates, query):
+def historical_title_groups(db, candidates, query, *, facts=None):
     """Link a quoted current/old title to sourced history of that same object/property."""
     titles = re.findall(r'[“「《"]([^”」》"]+)[”」》"]', query)
     if not titles or not history_query(query):
         return set()
-    facts = {}
+    identities = {}
     targets = set()
     for group, _, _ in candidates:
-        row = db.execute(
-            "SELECT payload FROM automatic_facts WHERE group_id=?", (group["id"],)
-        ).fetchone()
-        fact = json.loads(row[0]) if row else None
+        row = (
+            db.execute(
+                "SELECT payload FROM automatic_facts WHERE group_id=?", (group["id"],)
+            ).fetchone()
+            if facts is None
+            else facts.get(group["id"])
+        )
+        fact = json.loads(row["payload"]) if row else None
         if not fact or not fact.get("entity"):
             continue
         key = (fact["entity"]["id"], fact["key"])
-        facts[group["id"]] = key
+        identities[group["id"]] = key
         if any(title in fact["value"] for title in titles):
             targets.add(key)
-    return {group for group, key in facts.items() if key in targets}
+    return {group for group, key in identities.items() if key in targets}
 
 
 def historical_candidates(scope, query):

@@ -11,6 +11,7 @@ import unicodedata
 from . import fact_entities
 from .domain import canonical, fingerprint, parse_time, require
 from .fact_migration import installed
+from .fact_queries import for_groups
 from .fact_updates import may_replace
 
 FIELDS = {"key", "value", "state", "valid_from", "valid_to", "keywords"}
@@ -343,11 +344,17 @@ def filter_current(db, candidates, query, clock):
     from .recall_language import history_query
 
     history = history_query(query)
+    facts = for_groups(db, candidates)
     result = []
     for entry in candidates:
-        row = db.execute(
-            "SELECT payload,superseded_by FROM automatic_facts WHERE group_id=?", (entry[0]["id"],)
-        ).fetchone()
+        row = (
+            db.execute(
+                "SELECT payload,superseded_by FROM automatic_facts WHERE group_id=?",
+                (entry[0]["id"],),
+            ).fetchone()
+            if facts is None
+            else facts.get(entry[0]["id"])
+        )
         if row:
             fact = json.loads(row["payload"])
             if row["superseded_by"] and not history:
@@ -360,4 +367,4 @@ def filter_current(db, candidates, query, clock):
             ):
                 continue
         result.append(entry)
-    return fact_entities.filter_targets(db, result, query)
+    return fact_entities.filter_targets(db, result, query, facts=facts)

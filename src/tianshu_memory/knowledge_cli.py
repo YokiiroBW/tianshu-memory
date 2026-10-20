@@ -134,9 +134,12 @@ def main():
                 raw = stream.read(262145)
             if len(raw) > 262144:
                 raise ValueError("Operation too large")
-            result = KnowledgeApplication(args.config).execute(
-                strict_json(raw), client=args.client, credential=os.environ.get(args.credential_env)
-            )
+            with closing(KnowledgeApplication(args.config)) as application:
+                result = application.execute(
+                    strict_json(raw),
+                    client=args.client,
+                    credential=os.environ.get(args.credential_env),
+                )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         # A partial directory apply is not success: some confirmed items were refused.
         if result.get("status") in {"failed", "partial"}:
