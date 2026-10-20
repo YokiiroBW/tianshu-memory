@@ -1,6 +1,29 @@
 """Transaction-local batched reads of automatic fact metadata on PostgreSQL."""
 
+import json
+from dataclasses import dataclass
+
+from .fact_migration import installed
 from .postgres import is_postgres
+
+
+@dataclass(frozen=True)
+class FactSnapshot:
+    installed: bool
+    rows: dict
+    decoded: dict
+
+
+def snapshot_for_groups(db, candidates):
+    """Capture once for filtering/ranking inside one select transaction only."""
+    if not is_postgres(db):
+        return None
+    if not installed(db):
+        return FactSnapshot(False, {}, {})
+    rows = for_groups(db, candidates)
+    return FactSnapshot(
+        True, rows, {identity: json.loads(row["payload"]) for identity, row in rows.items()}
+    )
 
 
 def for_groups(db, candidates):

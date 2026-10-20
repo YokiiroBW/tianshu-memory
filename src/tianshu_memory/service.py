@@ -430,10 +430,16 @@ class MemoryService:
 
             eligible = eligible_groups(self, db, groups, scope)
             from .automatic_facts import filter_current
+            from .fact_queries import snapshot_for_groups
 
-            eligible = filter_current(db, eligible, request["query_text"], self.clock)
+            fact_snapshot = snapshot_for_groups(db, eligible)
+            eligible = filter_current(
+                db, eligible, request["query_text"], self.clock, fact_snapshot=fact_snapshot
+            )
             lexical = (
-                self._rank_groups(db, eligible, search_terms, request["query_text"])
+                self._rank_groups(
+                    db, eligible, search_terms, request["query_text"], fact_snapshot=fact_snapshot
+                )
                 if not exact
                 else eligible
             )
@@ -479,10 +485,10 @@ class MemoryService:
                 409,
             )
 
-    def _rank_groups(self, db, eligible, search_terms, query):
+    def _rank_groups(self, db, eligible, search_terms, query, *, fact_snapshot=None):
         from .recall_index import rank_groups
 
-        return rank_groups(self, db, eligible, search_terms, query)
+        return rank_groups(self, db, eligible, search_terms, query, fact_snapshot=fact_snapshot)
 
     def _fit_groups(self, eligible, budget):
         units, dependencies, omissions = [], [], []

@@ -50,11 +50,25 @@ frequency once. The BM25 constants/formula match the existing PostgreSQL
 contribute to these statistics. Python coverage, clause specificity, tie breaking
 and whole-group fitting remain in their existing owner.
 
+The final aggregate joins only query-term frequencies, while document lengths,
+corpus size/average and document frequencies still use the complete authorized
+corpus. A left join retains matching documents whose terms contribute zero score,
+including the literal `OR` edge case. SQL returns only group IDs and scores; Python
+reattaches the exact text from this call's authorized input instead of receiving
+and grouping the full body again. PG lineage reads likewise return only group ID,
+source key/state and current/required revision/epoch, which are the fields consumed
+by both `SourceAuthority.current_many` and the fixture authority fallback.
+
 PostgreSQL also batches automatic-fact metadata for the complete candidate set.
 Replacement families retain exact scope/fact identity, depth 16 and the existing
 128-family overflow refusal. Old evidence still passes its original source and
 projection checks before contributing terms. SQLite keeps its indexed lazy fact
 lookups. Existing persistent search GIN indexes and schema versions are unchanged.
+`MemoryService.select` and memory-context query explicitly share one PG raw/decoded
+fact snapshot between their current-fact/object filtering and rank preparation.
+It belongs only to that select transaction; no service, connection or global cache
+retains it. Later verification transactions keep their fresh authority/group reads.
+SQLite returns no snapshot and keeps the earlier lazy queries and decoding path.
 
 ## Knowledge
 
@@ -95,6 +109,13 @@ cases, hot-store revocation and file checks, configuration/database changes,
 HTTP resource reuse, concurrent request fields and shutdown with a live query.
 PostgreSQL cases require an explicit isolated `TIANSHU_TEST_POSTGRES_URL`; absence
 skips them and is never reported as PostgreSQL verification.
+
+`tests/test_recall_preparation.py` locally checks the final aggregate against the
+original formula, including unrelated/empty corpus rows and zero-score matches;
+ID-only score results recover current input text. SQLite-backed branch doubles
+check single-read/single-decode fact preparation, fresh subsequent captures and
+both reduced-lineage authority paths. These tests do not execute native PG FTS,
+driver adaptation or authority transactions and do not replace the native suite.
 
 `tests/test_postgres_source_snapshot.py` adds real PG stable-probe/no-op and source
 negative cases, owner rollback/generation, local CAS retry, an unrequested-physical

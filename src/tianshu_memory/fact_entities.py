@@ -199,7 +199,7 @@ def fact_key(fact):
     return fact["key"] if entity is None else fact["key"] + "@" + entity["id"]
 
 
-def filter_targets(db, candidates, query, *, facts=None):
+def filter_targets(db, candidates, query, *, facts=None, decoded=None):
     """Constrain explicitly named/numbered objects before ranking, within authorized rows."""
     if query.partition(":")[0] in {"field", "item"}:
         return candidates
@@ -213,7 +213,12 @@ def filter_targets(db, candidates, query, *, facts=None):
             if facts is None
             else facts.get(group["id"])
         )
-        entity = json.loads(row["payload"]).get("entity") if row else None
+        fact = (
+            (json.loads(row["payload"]) if decoded is None else decoded[group["id"]])
+            if row
+            else None
+        )
+        entity = fact.get("entity") if fact else None
         if entity:
             by_group[group["id"]] = entity
             objects.setdefault(entity["kind"], []).append(entity)
@@ -255,7 +260,7 @@ def filter_targets(db, candidates, query, *, facts=None):
     ]
 
 
-def historical_title_groups(db, candidates, query, *, facts=None):
+def historical_title_groups(db, candidates, query, *, facts=None, decoded=None):
     """Link a quoted current/old title to sourced history of that same object/property."""
     titles = re.findall(r'[“「《"]([^”」》"]+)[”」》"]', query)
     if not titles or not history_query(query):
@@ -270,7 +275,11 @@ def historical_title_groups(db, candidates, query, *, facts=None):
             if facts is None
             else facts.get(group["id"])
         )
-        fact = json.loads(row["payload"]) if row else None
+        fact = (
+            (json.loads(row["payload"]) if decoded is None else decoded[group["id"]])
+            if row
+            else None
+        )
         if not fact or not fact.get("entity"):
             continue
         key = (fact["entity"]["id"], fact["key"])

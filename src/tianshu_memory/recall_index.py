@@ -36,7 +36,8 @@ def eligible_groups(service, db, groups, scope):
         placeholders = ",".join("?" for _ in keys)
         records, lineage = defaultdict(list), defaultdict(list)
         for row in db.execute(
-            "SELECT l.group_id,l.revision AS required_revision,l.epoch AS required_epoch,s.* "
+            "SELECT l.group_id,l.revision AS required_revision,l.epoch AS required_epoch,"
+            "s.key,s.state,s.revision,s.epoch "
             f"FROM lineage l JOIN sources s ON s.key=l.source_key WHERE l.group_id IN ({placeholders})",
             keys,
         ):
@@ -116,7 +117,7 @@ def _units(group, rows, scope):
     return units
 
 
-def rank_groups(service, db, eligible, search_terms, query):
+def rank_groups(service, db, eligible, search_terms, query, *, fact_snapshot=None):
     if not search_terms or not eligible:
         return []
     # FTS metadata columns are UNINDEXED. Looking up each record separately scans
@@ -132,10 +133,16 @@ def rank_groups(service, db, eligible, search_terms, query):
     from .fact_references import reference_terms
     from .recall_language import history_query
 
-    facts_installed = installed(db)
-    facts = for_groups(db, eligible) if facts_installed else None
+    facts_installed = installed(db) if fact_snapshot is None else fact_snapshot.installed
+    if fact_snapshot is not None:
+        facts = fact_snapshot.rows
+    else:
+        facts = for_groups(db, eligible) if facts_installed else None
+    decoded = None if fact_snapshot is None else fact_snapshot.decoded
     historical = (
-        historical_title_groups(db, eligible, query, facts=facts) if facts_installed else set()
+        historical_title_groups(db, eligible, query, facts=facts, decoded=decoded)
+        if facts_installed
+        else set()
     )
     references = (
         reference_terms(service, db, eligible, indexed, facts=facts)

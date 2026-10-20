@@ -209,10 +209,16 @@ def execute(application, request, context):
 
             candidates.extend(eligible_groups(service, db, rows, selected_scope))
         from ..automatic_facts import filter_current
+        from ..fact_queries import snapshot_for_groups
 
-        candidates = filter_current(db, candidates, request["query_text"], service.clock)
+        fact_snapshot = snapshot_for_groups(db, candidates)
+        candidates = filter_current(
+            db, candidates, request["query_text"], service.clock, fact_snapshot=fact_snapshot
+        )
         lexical = (
-            service._rank_groups(db, candidates, search_terms, request["query_text"])
+            service._rank_groups(
+                db, candidates, search_terms, request["query_text"], fact_snapshot=fact_snapshot
+            )
             if not exact
             else candidates
         )

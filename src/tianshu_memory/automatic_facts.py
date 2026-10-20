@@ -338,13 +338,14 @@ def index_text(db, unit):
     return " ".join([fact["key"], fact["value"], mention, *fact["keywords"], *quotes])
 
 
-def filter_current(db, candidates, query, clock):
-    if not installed(db):
+def filter_current(db, candidates, query, clock, *, fact_snapshot=None):
+    if not (installed(db) if fact_snapshot is None else fact_snapshot.installed):
         return candidates
     from .recall_language import history_query
 
     history = history_query(query)
-    facts = for_groups(db, candidates)
+    facts = for_groups(db, candidates) if fact_snapshot is None else fact_snapshot.rows
+    decoded = None if fact_snapshot is None else fact_snapshot.decoded
     result = []
     for entry in candidates:
         row = (
@@ -356,7 +357,7 @@ def filter_current(db, candidates, query, clock):
             else facts.get(entry[0]["id"])
         )
         if row:
-            fact = json.loads(row["payload"])
+            fact = json.loads(row["payload"]) if decoded is None else decoded[entry[0]["id"]]
             if row["superseded_by"] and not history:
                 continue
             if fact["valid_from"] and parse_time(fact["valid_from"]) > clock():
@@ -367,4 +368,4 @@ def filter_current(db, candidates, query, clock):
             ):
                 continue
         result.append(entry)
-    return fact_entities.filter_targets(db, result, query, facts=facts)
+    return fact_entities.filter_targets(db, result, query, facts=facts, decoded=decoded)

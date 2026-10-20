@@ -25,24 +25,37 @@ WITH documents AS MATERIALIZED (
 ), terms AS MATERIALIZED (
   SELECT unnest(terms) AS term FROM query
 ), hits AS MATERIALIZED (
-  SELECT d.* FROM documents d CROSS JOIN query q WHERE d.vector @@ q.expression
+  SELECT d.group_id FROM documents d CROSS JOIN query q WHERE d.vector @@ q.expression
 ), document_frequencies AS MATERIALIZED (
   SELECT t.term,count(d.group_id)::double precision AS documents
   FROM terms t LEFT JOIN documents d
     ON d.vector @@ plainto_tsquery('simple',t.term)
   GROUP BY t.term
+), relevant_frequencies AS MATERIALIZED (
+  SELECT f.group_id,f.frequency,df.documents
+  FROM frequencies f JOIN document_frequencies df ON df.term=f.lexeme
+  WHERE f.frequency>0
 )
-SELECT h.group_id,h.text,-coalesce(sum(
-  greatest(0.000001,ln((c.total-df.documents+0.5)/(df.documents+0.5)))
+SELECT h.group_id,-coalesce(sum(
+  greatest(0.000001,ln((c.total-f.documents+0.5)/(f.documents+0.5)))
     * f.frequency*2.2/(f.frequency+1.2*(0.25+0.75*l.length/c.average_length))
-  ) FILTER (WHERE df.term IS NOT NULL AND f.frequency>0 AND c.average_length>0),0) AS relevance
+  ) FILTER (WHERE c.average_length>0),0) AS relevance
 FROM hits h JOIN lengths l USING(group_id) CROSS JOIN corpus c
-LEFT JOIN frequencies f ON f.group_id=h.group_id
-LEFT JOIN document_frequencies df ON df.term=f.lexeme
-GROUP BY h.group_id,h.text
+LEFT JOIN relevant_frequencies f ON f.group_id=h.group_id
+GROUP BY h.group_id
 """
 
 
 def rank(db, documents, expression):
-    payload = canonical([{"group_id": identity, "text": text} for identity, text in documents])
-    return db.native(SQL, (payload, expression, expression))
+    corpus = [{"group_id": identity, "text": text} for identity, text in documents]
+    texts = {document["group_id"]: document["text"] for document in corpus}
+    rows = db.native(SQL, (canonical(corpus), expression, expression))
+    return _matches(rows, texts)
+
+
+def _matches(rows, texts):
+    # SQL returns only identities/scores. The exact input text already belongs to
+    # this authorized call; echoing/grouping it on the server adds no evidence.
+    for row in rows:
+        identity = row["group_id"]
+        yield {"group_id": identity, "relevance": row["relevance"], "text": texts[identity]}
