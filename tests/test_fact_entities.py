@@ -22,6 +22,124 @@ def saved_entity(h, result):
     return json.loads(row[0])["entity"]
 
 
+@pytest.mark.parametrize("mention", ["我这个杯子", "我的那个水杯", "我这只白色杯子"])
+def test_self_reference_corrects_the_unique_owned_object_in_one_commit(sync, mention):
+    initialize(sync)
+    original, _ = add(
+        sync, "我的白色水杯叫浮云", "cup.name", "浮云", entity=entity("白色水杯", kind="cup")
+    )
+    prior = saved_entity(sync, original)
+    changed, job = add(
+        sync,
+        mention + "后来改叫轻舟，另一个人的不变。",
+        "cup.name",
+        "轻舟",
+        second=2,
+        entity=entity(mention, prior["id"], "cup"),
+    )
+    assert saved_entity(sync, changed)["id"] == prior["id"]
+    assert {u["record_id"] for u in recall(sync, "杯子现在叫什么")} == set(changed["record_ids"])
+    assert {u["record_id"] for u in recall(sync, "我这个杯子现在叫什么")} == set(
+        changed["record_ids"]
+    )
+    history = recall(sync, "杯子以前叫什么")
+    assert set(original["record_ids"]) <= {u["record_id"] for u in history}
+    receipt = sync.post("memory/candidates/process", dict(job_id=job, output=None))
+    assert receipt.json()["state"] == "completed"
+
+
+def test_generic_self_reference_cannot_choose_between_two_objects(sync):
+    initialize(sync)
+    white, _ = add(
+        sync, "我的白色水杯叫浮云", "cup.name", "浮云", entity=entity("白色水杯", kind="cup")
+    )
+    blue, _ = add(
+        sync,
+        "我的蓝色水杯叫雪团",
+        "cup.name",
+        "雪团",
+        second=2,
+        entity=entity("蓝色水杯", kind="cup"),
+    )
+    add(
+        sync,
+        "我这个杯子后来改叫轻舟",
+        "cup.name",
+        "轻舟",
+        second=3,
+        entity=entity("我这个杯子", saved_entity(sync, white)["id"], "cup"),
+        expected_state="rejected",
+    )
+    assert {u["record_id"] for u in recall(sync, "两只水杯叫什么")} == set(
+        white["record_ids"] + blue["record_ids"]
+    )
+
+
+def test_qualified_self_reference_distinguishes_two_same_kind_objects(sync):
+    initialize(sync)
+    white, _ = add(
+        sync, "我的白色水杯叫浮云", "cup.name", "浮云", entity=entity("白色水杯", kind="cup")
+    )
+    blue, _ = add(
+        sync,
+        "我的蓝色水杯叫雪团",
+        "cup.name",
+        "雪团",
+        second=2,
+        entity=entity("蓝色水杯", kind="cup"),
+    )
+    changed, _ = add(
+        sync,
+        "我这个白色杯子后来改叫轻舟",
+        "cup.name",
+        "轻舟",
+        second=3,
+        entity=entity("我这个白色杯子", saved_entity(sync, white)["id"], "cup"),
+    )
+    assert saved_entity(sync, changed)["id"] == saved_entity(sync, white)["id"]
+    assert {u["record_id"] for u in recall(sync, "蓝色杯子叫什么")} == set(blue["record_ids"])
+
+
+@pytest.mark.parametrize("case", ["foreign_id", "wrong_kind", "qualified_other", "third_party"])
+def test_deictic_matching_does_not_override_identity_or_source_boundary(sync, case):
+    initialize(sync)
+    original, _ = add(
+        sync, "我的白色水杯叫浮云", "cup.name", "浮云", entity=entity("白色水杯", kind="cup")
+    )
+    proposed = entity("我这个杯子", saved_entity(sync, original)["id"], "cup")
+    text = "我这个杯子后来改叫轻舟"
+    if case == "foreign_id":
+        proposed["id"] = "entity:" + "f" * 64
+    elif case == "wrong_kind":
+        proposed["kind"] = "notebook"
+    elif case == "qualified_other":
+        proposed["mention"] = "我这个蓝色杯子"
+        text = proposed["mention"] + "后来改叫轻舟"
+    else:
+        text = "朋友说：我这个杯子后来改叫轻舟"
+    add(sync, text, "cup.name", "轻舟", second=2, entity=proposed, expected_state="rejected")
+    assert {u["record_id"] for u in recall(sync, "白色杯子叫什么")} == set(original["record_ids"])
+
+
+def test_deictic_reference_does_not_revive_a_forgotten_entity(sync):
+    initialize(sync)
+    original, _ = add(
+        sync, "我的白色水杯叫浮云", "cup.name", "浮云", entity=entity("白色水杯", kind="cup")
+    )
+    one = saved_entity(sync, original)
+    assert sync.post("memory/revise", sync.revision(original["record_ids"][0])).status_code == 200
+    add(
+        sync,
+        "我这个杯子后来改叫轻舟",
+        "cup.name",
+        "轻舟",
+        second=2,
+        entity=entity("我这个杯子", one["id"], "cup"),
+        expected_state="rejected",
+    )
+    assert recall(sync, "白色杯子叫什么") == []
+
+
 def test_same_predicate_keeps_two_objects_and_corrects_only_its_target(sync):
     initialize(sync)
     first, _ = add(sync, "我的第一支钢笔用蓝色墨水", "pen.ink", "蓝色", entity=entity("第一支钢笔"))

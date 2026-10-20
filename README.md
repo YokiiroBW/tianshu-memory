@@ -18,7 +18,7 @@ TS-086 追加项目资料目录与完整语义块分页阅读：`document_list` 
 
 Python 人物与记忆服务，绑定已发布 text-dialogue/v1、profile-memory/v1 与 source-sync/v1 **1.0.0**。提供 SQLite/WAL、完整语义组预算检索、画像查询、修订/遗忘与候选幂等账本。TS-033 增加角色来源账本、物理否定传播、双 owner 读取屏障与真实 HTTPS 来源客户端。
 
-`source_sync` 模式经配置的 Core/Platform HTTPS 接口核验来源；`local_fixture` 保留隔离合成演示。实际测试包含合成 owner 经真实 HTTPS、Memory HTTP 与数据库重启，不代表真实 Core/Platform 产品联合通过。TS-034 提供独立部署凭据认证的本地用户确认、画像批准/发布/撤销入口；未配置时仍不可用。Chat Audit、跨平台账号证明仍未接入；现有嵌入接口没有因存储切换扩大缓存范围。候选受理不自动生成记忆。
+`source_sync` 模式经配置的 Core/Platform HTTPS 接口核验来源；`local_fixture` 保留隔离合成演示。实际测试包含合成 owner 经真实 HTTPS、Memory HTTP 与数据库重启，不代表真实 Core/Platform 产品联合通过。TS-034 提供独立部署凭据认证的本地用户确认、画像批准/发布/撤销入口；未配置时仍不可用。Chat Audit、跨平台账号证明仍未接入。已有可选[关键词、向量、混合检索及重排序](docs/retrieval.md)，由实际部署配置决定启用状态；代码存在不代表嵌入模型已经启用或通过实机验收，存储切换也不扩大嵌入缓存范围。候选受理不会自行生成事实，仍需经过抽取与核验提交。
 
 本地用户入口、精确权限登记与批准迁移见 [本地用户操作](docs/local-user-actions.md)。
 
