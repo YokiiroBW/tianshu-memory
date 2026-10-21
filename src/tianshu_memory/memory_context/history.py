@@ -17,14 +17,27 @@ def history_version(service, db, scope, *, input_only=False):
     row = db.execute("SELECT value FROM metadata WHERE key=?", (metadata_key(scope),)).fetchone()
     if row is None:
         return current
-    value = json.loads(row[0])
+    return _retained_versions(current, json.loads(row[0]))[bool(input_only)]
+
+
+def postgres_history_versions(db, scope):
+    """Read both prior epochs together, immediately before a PG scope bump."""
+    row = db.native(
+        "SELECT COALESCE((SELECT version FROM scopes WHERE key=?),1),"
+        "(SELECT value FROM metadata WHERE key=?)",
+        (canonical(scope), metadata_key(scope)),
+    ).fetchone()
+    if row[1] is None:
+        return row[0], row[0]
+    return _retained_versions(row[0], json.loads(row[1]))
+
+
+def _retained_versions(current, value):
     # An unclassified writer, or an old database, must not preserve stale history.
     if value["scope_version"] != current:
-        return current
-    if input_only:
-        # Older databases inherit the stricter epoch; no prior withdrawal is undone.
-        return value.get("source_history_version", value["history_version"])
-    return value["history_version"]
+        return current, current
+    # Older databases inherit the stricter epoch; no prior withdrawal is undone.
+    return value["history_version"], value.get("source_history_version", value["history_version"])
 
 
 def record_version(db, scope, content_version, retained_version, source_version):

@@ -203,3 +203,47 @@ The coordinator's fixed-0.1.2 PG-enabled related collection passed **159/159**:
 96 native PG cases and 63 local/SQL-double cases, rather than 159 native cases.
 The separate TS-257 three-round comparison was still running at the TS-256 handoff;
 statement counts and those correctness results establish no performance-parity claim.
+
+## TS-264 short reads, synchronization and writes
+
+`Contracts` prepares the official referencing registry with `crawl()` and retains
+one official Draft 2020-12 validator per qualified reference in that registry.
+Every call still validates the complete current input. The cache contains rules,
+format-checker preparation and validators only. Verified schema trees are frozen
+after loading; supported `load_*` calls replace the immutable registry and invalidate
+preparation. In-place edits to those verified schema dictionaries are not a hot
+contract-update API. A registry replaced during preparation cannot be mislabeled
+as the registry that was crawled. Validation uses the same installed format checkers
+as a fresh validator, including the environment's optional-checker availability.
+
+The PostgreSQL scope bump reads current content/history/input-history state in one
+statement and obtains the new scope version from `UPSERT RETURNING`. It keeps the
+same two mutations and per-row revision triggers, but uses three product statements
+instead of seven. SQLite retains its existing scope/history SQL. Retained history
+still fails conservatively after an unclassified write; missing or invalid history
+has the same fallback/error behavior, and the next bump reads again after DML or
+rollback. Index writing reads the current automatic-fact/evidence text once per
+`_index` call instead of twice. It does not retain that text across calls or writes.
+
+`SourceSnapshot` submits its existing independent SELECTs together through the
+TS-269 shared `read_batch` API. This requires that API in the assembled storage
+dependency; pin, lock and vendor changes belong to the coordinator. All results
+are confirmed before consumption, after the existing fresh revision/coverage CAS
+and before the first mutation. The seven original SQL statements, their domains
+and order remain; empty-key lookups keep their original skips. Full receipt-collision
+coverage, NULL-payload aliases, cross-actor withdrawal and in-transaction epoch
+updates are unchanged. Setup pipelining, six fresh revision checks, lock ordering,
+guard-before-commit, durability, and the after-checkpoint are unchanged.
+
+`tests/test_contract_preparation.py` compares published documents and invalid inputs
+against fresh official validators, including error paths, installed formats,
+missing references, registry/load replacement and concurrent validation.
+`tests/test_write_preparation.py` compares history epochs/errors with the original
+SQLite SQL path and checks per-call fact/evidence text freshness. Its one native
+PG test requires the explicit isolated test database. `tests/test_source_read_batch.py`
+uses a confirmed-result double; it is not PG transaction evidence. The existing
+native source-snapshot suite now counts statements inside read batches too.
+
+Performance parity and SQLite write non-regression require the separate TS-265
+three-round comparison and paired real-commit write control. Local SQL doubles and
+fewer statements establish neither latency nor PostgreSQL correctness by themselves.

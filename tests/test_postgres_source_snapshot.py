@@ -122,20 +122,33 @@ def test_stable_postgres_apply_reads_a_whole_batch_without_noop_mutations(pg_syn
     calls = []
 
     def apply(service, db, snapshot, access):
-        statements = []
-        native = db.native
+        statements, batches = [], []
+        native, read_batch = db.native, db.read_batch
+        batching = False
 
         def observed(sql, parameters=(), **options):
-            statements.append(sql)
+            if not batching:
+                statements.append(sql)
             return native(sql, parameters, **options)
 
-        db.native = observed
+        def observed_batch(requests):
+            nonlocal batching
+            requests = list(requests)
+            batches.append(requests)
+            statements.extend(sql for sql, _ in requests)
+            batching = True
+            try:
+                return read_batch(requests)
+            finally:
+                batching = False
+
+        db.native, db.read_batch = observed, observed_batch
         try:
             result = original(service, db, snapshot, access)
-            calls.append(statements)
+            calls.append((statements, batches))
             return result
         finally:
-            db.native = native
+            db.native, db.read_batch = native, read_batch
 
     monkeypatch.setattr(authority, "_apply", apply)
     guard = pg_sync.store.recovery_path
@@ -143,10 +156,11 @@ def test_stable_postgres_apply_reads_a_whole_batch_without_noop_mutations(pg_syn
     for _ in range(2):
         pg_sync.select(budget=0)
     assert len(calls) == 2
-    for statements in calls:
+    for statements, batches in calls:
         # Fixed authority/schema probes may accompany the seven batched reads;
         # thirty sources must not turn these into per-source round trips.
         assert len(statements) <= 16
+        assert len(batches) == 1 and len(batches[0]) == 7
         assert not any(
             sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")) for sql in statements
         )

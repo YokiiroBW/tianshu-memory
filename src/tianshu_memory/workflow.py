@@ -313,16 +313,16 @@ class _WorkflowBase:
                 item or "",
             ]
         )
+        # No DML occurs between lexical/token preparation. Read the complete
+        # current fact/evidence text once here, and reread on the next _index call.
+        text += " " + index_text(db, unit)
         db.execute(
             "INSERT INTO search_index VALUES (?,?,?,?)",
             (
                 unit["record_id"],
                 unit["record_version"],
                 canonical(scope),
-                " ".join(
-                    terms(text + " " + index_text(db, unit))
-                    + topic_tokens(text + " " + index_text(db, unit))
-                ),
+                " ".join(terms(text) + topic_tokens(text)),
             ),
         )
 

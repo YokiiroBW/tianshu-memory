@@ -66,21 +66,37 @@ class MemoryService:
         return row[0] if row else 1
 
     def _bump(self, db, scope, *, history_changed=True, source_history_changed=None):
-        from .memory_context.history import history_version, record_version
+        from .memory_context.history import (
+            history_version,
+            postgres_history_versions,
+            record_version,
+        )
+        from .postgres import is_postgres
 
         if self.retrieval is not None:
             self.retrieval.invalidate()
         if "profile_subject" in scope:
             scope = {k: v for k, v in scope.items() if k != "profile_subject"}
-        previous_history = history_version(self, db, scope)
-        previous_source = history_version(self, db, scope, input_only=True)
+        postgres = is_postgres(db)
+        if postgres:
+            previous_history, previous_source = postgres_history_versions(db, scope)
+        else:
+            previous_history = history_version(self, db, scope)
+            previous_source = history_version(self, db, scope, input_only=True)
         if source_history_changed is None:
             source_history_changed = history_changed
-        db.execute(
-            "INSERT INTO scopes VALUES (?,2) ON CONFLICT(key) DO UPDATE SET version=version+1",
-            (canonical(scope),),
-        )
-        version = self._scope_version(db, scope)
+        if postgres:
+            version = db.native(
+                "INSERT INTO scopes VALUES (?,2) ON CONFLICT(key) DO UPDATE SET "
+                "version=scopes.version+1 RETURNING version",
+                (canonical(scope),),
+            ).fetchone()[0]
+        else:
+            db.execute(
+                "INSERT INTO scopes VALUES (?,2) ON CONFLICT(key) DO UPDATE SET version=version+1",
+                (canonical(scope),),
+            )
+            version = self._scope_version(db, scope)
         record_version(
             db,
             scope,

@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+from threading import Lock
 
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
@@ -52,6 +53,9 @@ class Contracts:
         self.source_batch_rules = None
         self.context_version = None
         self.content_version = None
+        self._validation_lock = Lock()
+        self._validation_registry = None
+        self._validators = {}
 
     def load_profiles(self):
         directory = self.directory.parent.parent / "profile-memory/v1"
@@ -298,8 +302,25 @@ class Contracts:
 
     def validate(self, name: str, document: dict):
         module, definition = name.split("#")
-        Draft202012Validator(
-            {"$ref": f"{self.schemas[module]['$id']}#/$defs/{definition}"},
-            registry=self.registry,
-            format_checker=FormatChecker(),
-        ).validate(document)
+        reference = f"{self.schemas[module]['$id']}#/$defs/{definition}"
+        # Verified schema trees are immutable after loading. Each load_* method
+        # replaces the persistent registry; retain preparation only for that exact
+        # registry, never a document, an authority result or a resolved permission.
+        with self._validation_lock:
+            registry = self.registry
+            if self._validation_registry is not registry:
+                self._crawled_registry = registry.crawl()
+                self._format_checker = FormatChecker()
+                self._validators = {}
+                self._validation_registry = registry
+            validator = self._validators.get(reference)
+            if validator is None:
+                validator = Draft202012Validator(
+                    {"$ref": reference},
+                    registry=self._crawled_registry,
+                    format_checker=self._format_checker,
+                )
+                self._validators[reference] = validator
+        # The official validator still traverses this call's complete current
+        # document, including formats, referenced schemas and error ordering.
+        validator.validate(document)

@@ -31,28 +31,35 @@ class SourceSnapshot:
             )
             for key in keys
         ]
-        self.heads = self._rows(db, "owner_heads", ["core", "platform"], "owner")
-        self.observations = {
-            (row["kind"], row["key"]): row
-            for row in db.native(
+        requests = []
+        heads = self._request(requests, "owner_heads", ["core", "platform"], "owner")
+        observations_index = len(requests)
+        requests.append(
+            (
                 "SELECT s.* FROM source_observations s JOIN jsonb_to_recordset(?::jsonb) "
                 "AS wanted(kind text,key text) USING(kind,key)",
                 (canonical(observations),),
             )
-        }
-        self.physicals = self._rows(db, "physical_sources", physicals)
-        self.bindings = self._rows(db, "accounts", authors, "account_key")
-        self.sources = self._rows(db, "sources", admissions)
-        self.suppressed = set(self._rows(db, "suppression", admissions, "source_key"))
+        )
+        physicals_index = self._request(requests, "physical_sources", physicals)
+        bindings = self._request(requests, "accounts", authors, "account_key")
+        sources = self._request(requests, "sources", admissions)
+        suppressed = self._request(requests, "suppression", admissions, "source_key")
         # Physical aliases include other actors for negative broadcast. Receipt
         # collisions must also include unrelated physicals, not just this scope.
-        self.admissions = {
-            row["key"]: row
-            for row in db.native(
-                ADMISSIONS_SQL,
-                (physicals, admissions, receipts),
-            )
-        }
+        admissions_index = len(requests)
+        requests.append((ADMISSIONS_SQL, (physicals, admissions, receipts)))
+        # All SELECTs execute after the caller's fresh revision/coverage CAS and
+        # before its first mutation. read_batch confirms every result before it
+        # returns; no setup or authority lock is moved into this read pipeline.
+        cursors = db.read_batch(requests)
+        self.heads = self._rows(cursors, heads, "owner")
+        self.observations = {(row["kind"], row["key"]): row for row in cursors[observations_index]}
+        self.physicals = self._rows(cursors, physicals_index)
+        self.bindings = self._rows(cursors, bindings, "account_key")
+        self.sources = self._rows(cursors, sources)
+        self.suppressed = set(self._rows(cursors, suppressed, "source_key"))
+        self.admissions = self._rows(cursors, admissions_index)
         self.receipts = {}
         self.aliases = {}
         for key, row in self.admissions.items():
@@ -61,14 +68,17 @@ class SourceSnapshot:
                 self.receipts.setdefault(row["receipt"], set()).add(key)
 
     @staticmethod
-    def _rows(db, table, keys, column="key"):
+    def _request(requests, table, keys, column="key"):
         if not keys:
-            return {}
+            return None
         # The identifiers are fixed internal call sites above, never owner input.
-        return {
-            row[column]: row
-            for row in db.native(f"SELECT * FROM {table} WHERE {column}=ANY(?::text[])", (keys,))
-        }
+        index = len(requests)
+        requests.append((f"SELECT * FROM {table} WHERE {column}=ANY(?::text[])", (keys,)))
+        return index
+
+    @staticmethod
+    def _rows(cursors, index, column="key"):
+        return {} if index is None else {row[column]: row for row in cursors[index]}
 
     def withdraw(self, key):
         # _apply broadcasts a physical negative before evaluating this actor's
