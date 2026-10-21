@@ -3,6 +3,16 @@
 from pathlib import Path
 
 from .domain import require
+from .postgres import INDEX_CATALOG, is_postgres
+
+POSTGRES_READY = (
+    "SELECT max(value) FILTER (WHERE key='source_lookup_schema') AS source_lookup_schema,"
+    "max(value) FILTER (WHERE key='source_revision') AS source_revision,"
+    "max(value) FILTER (WHERE key='source_recovery') AS source_recovery,"
+    f"(SELECT count(*) FROM {INDEX_CATALOG} "
+    "WHERE name IN ('admissions_receipt','sources_scope')) AS index_count "
+    "FROM metadata WHERE key IN ('source_lookup_schema','source_revision','source_recovery')"
+)
 
 
 def install(db):
@@ -16,6 +26,13 @@ def install(db):
 
 
 def require_ready(db):
+    if is_postgres(db):
+        # Aggregate without GROUP BY always returns one row, including missing
+        # markers. Every invocation gets its own current statement snapshot.
+        row = db.native(POSTGRES_READY).fetchone()
+        require(row["source_lookup_schema"] == "1", "dependency_unavailable", 503)
+        require(row["index_count"] == 2, "dependency_unavailable", 503)
+        return row
     row = db.execute("SELECT value FROM metadata WHERE key='source_lookup_schema'").fetchone()
     require(row is not None and row[0] == "1", "dependency_unavailable", 503)
     require(

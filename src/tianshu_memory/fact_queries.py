@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 
 from .fact_migration import installed
-from .postgres import is_postgres
+from .postgres import GROUP_READ_BATCH, is_postgres
 
 
 @dataclass(frozen=True)
@@ -33,8 +33,8 @@ def for_groups(db, candidates):
         return None
     keys = [entry[0]["id"] for entry in candidates]
     result = {}
-    for offset in range(0, len(keys), 128):
-        batch = keys[offset : offset + 128]
+    for offset in range(0, len(keys), GROUP_READ_BATCH):
+        batch = keys[offset : offset + GROUP_READ_BATCH]
         result.update(
             (row["group_id"], row)
             for row in db.execute(

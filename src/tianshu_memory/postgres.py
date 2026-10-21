@@ -26,6 +26,12 @@ SEARCH_TABLES = {
     "research_note_index",
 }
 ORDERED = {"groups", "jobs", "automatic_evidence", "relationship_events"}
+GROUP_READ_BATCH = 512
+INDEX_CATALOG = (
+    "(SELECT c.relname AS name FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+    "WHERE n.nspname=current_schema() AND c.relkind IN ('i','I')) AS memory_catalog"
+)
 
 FUNCTIONS = r"""
 CREATE OR REPLACE FUNCTION memory_source_revision() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -144,7 +150,7 @@ def dialect(db, sql, parameters):
         elif "type='index'" in sql and "sql" not in sql.partition("FROM")[0].lower():
             sql = sql.replace(
                 "sqlite_master",
-                "(SELECT indexname AS name FROM pg_indexes WHERE schemaname=current_schema()) AS memory_catalog",
+                INDEX_CATALOG,
             )
             sql = sql.replace("type='index' AND ", "").replace("type='index'", "TRUE")
         else:

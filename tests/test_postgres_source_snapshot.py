@@ -2,6 +2,7 @@
 
 from contextlib import closing
 from copy import deepcopy
+from uuid import uuid4
 
 import pytest
 from test_source_batches import retain_history
@@ -37,6 +38,81 @@ from test_storage_backends import source_examples as source_examples
 
 from tianshu_memory.domain import Fault, canonical, fingerprint
 from tianshu_memory.postgres_source_snapshot import ADMISSIONS_SQL
+from tianshu_memory.source_lookup_migration import POSTGRES_READY
+
+
+def test_postgres_all_six_revision_checks_remain_fresh_single_statements(pg_sync, monkeypatch):
+    pg_sync.seed()
+    authority = pg_sync.service.source_authority
+    revision = authority.revision
+    calls = []
+
+    def observed(db):
+        native, statements = db.native, []
+
+        def record(sql, parameters=(), **options):
+            statements.append(sql)
+            return native(sql, parameters, **options)
+
+        db.native = record
+        try:
+            return revision(db)
+        finally:
+            db.native = native
+            calls.append(statements)
+
+    monkeypatch.setattr(authority, "revision", observed)
+    pg_sync.select(budget=0)
+    assert calls == [[POSTGRES_READY]] * 6
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing-marker",
+        "missing-index",
+        "renamed-index",
+        "other-schema-index",
+        "same-name-table",
+        "missing-revision",
+        "pending",
+    ],
+)
+def test_postgres_ready_probe_rereads_after_dml_or_ddl_and_rollback(pg_sync, damage):
+    store, authority = pg_sync.store, pg_sync.service.source_authority
+    before_guard = store.recovery_path.read_bytes()
+    with closing(store.database.connect(isolation_level=None)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        before = authority.revision(db)
+        try:
+            db.native("INSERT INTO people VALUES (?)", ("source-state-" + uuid4().hex,))
+            assert authority.revision(db) == before + 1
+            if damage == "other-schema-index":
+                other = "ts256" + uuid4().hex
+                db.native("DROP INDEX sources_scope")
+                db.native(f'CREATE SCHEMA "{other}"')
+                db.native(f'CREATE TABLE "{other}".synthetic(id integer)')
+                db.native(f'CREATE INDEX sources_scope ON "{other}".synthetic(id)')
+            elif damage == "same-name-table":
+                db.native("DROP INDEX sources_scope")
+                db.native("CREATE TABLE sources_scope(id integer)")
+            else:
+                db.native(
+                    {
+                        "missing-marker": "DELETE FROM metadata WHERE key='source_lookup_schema'",
+                        "missing-index": "DROP INDEX sources_scope",
+                        "renamed-index": "ALTER INDEX sources_scope RENAME TO moved_sources_scope",
+                        "missing-revision": "DELETE FROM metadata WHERE key='source_revision'",
+                        "pending": "UPDATE metadata SET value='pending' WHERE key='source_recovery'",
+                    }[damage]
+                )
+            with pytest.raises(Fault, match="dependency_unavailable"):
+                authority.revision(db)
+        finally:
+            db.rollback()
+    with store.transaction() as db:
+        assert authority.revision(db) == before
+    assert store.recovery_path.read_bytes() == before_guard
 
 
 def test_stable_postgres_apply_reads_a_whole_batch_without_noop_mutations(pg_sync, monkeypatch):

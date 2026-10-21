@@ -35,7 +35,14 @@ class SourceAuthority:
 
     @staticmethod
     def revision(db):
-        require_ready(db)
+        state = require_ready(db)
+        if is_postgres(db):
+            require(
+                state["source_revision"] is not None and state["source_recovery"] == "ready",
+                "dependency_unavailable",
+                503,
+            )
+            return int(state["source_revision"])
         row = db.execute("SELECT value FROM metadata WHERE key='source_revision'").fetchone()
         ready = db.execute("SELECT value FROM metadata WHERE key='source_recovery'").fetchone()
         require(

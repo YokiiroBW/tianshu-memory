@@ -9,7 +9,7 @@ from .domain import canonical
 
 SQL = r"""
 WITH documents AS MATERIALIZED (
-  SELECT group_id,text,to_tsvector('simple',text) AS vector
+  SELECT group_id,to_tsvector('simple',text) AS vector
   FROM jsonb_to_recordset(?::jsonb) AS corpus(group_id text,text text)
 ), frequencies AS MATERIALIZED (
   SELECT d.group_id,t.lexeme,cardinality(t.positions)::double precision AS frequency
@@ -23,13 +23,14 @@ WITH documents AS MATERIALIZED (
   SELECT websearch_to_tsquery('simple',?) AS expression,
     tsvector_to_array(to_tsvector('simple',regexp_replace(?,'"|\mOR\M',' ','g'))) AS terms
 ), terms AS MATERIALIZED (
-  SELECT unnest(terms) AS term FROM query
+  SELECT term,plainto_tsquery('simple',term) AS expression
+  FROM (SELECT unnest(terms) AS term FROM query) AS query_terms
 ), hits AS MATERIALIZED (
   SELECT d.group_id FROM documents d CROSS JOIN query q WHERE d.vector @@ q.expression
 ), document_frequencies AS MATERIALIZED (
   SELECT t.term,count(d.group_id)::double precision AS documents
   FROM terms t LEFT JOIN documents d
-    ON d.vector @@ plainto_tsquery('simple',t.term)
+    ON d.vector @@ t.expression
   GROUP BY t.term
 ), relevant_frequencies AS MATERIALIZED (
   SELECT f.group_id,f.frequency,df.documents

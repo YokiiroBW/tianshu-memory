@@ -6,7 +6,7 @@ from collections import defaultdict
 from .domain import Fault, canonical, terms
 from .fact_migration import installed
 from .fact_queries import for_groups
-from .postgres import is_postgres
+from .postgres import GROUP_READ_BATCH, is_postgres
 from .recall_language import normalize_objects, topic_tokens
 from .recall_relevance import LexicalQuery
 
@@ -33,8 +33,8 @@ def eligible_groups(service, db, groups, scope):
                 result.append((group, rows, units))
         return result
     result = []
-    for offset in range(0, len(groups), 128):
-        batch = groups[offset : offset + 128]
+    for offset in range(0, len(groups), GROUP_READ_BATCH):
+        batch = groups[offset : offset + GROUP_READ_BATCH]
         keys = [group["id"] for group in batch]
         placeholders = ",".join("?" for _ in keys)
         records, lineage = defaultdict(list), defaultdict(list)

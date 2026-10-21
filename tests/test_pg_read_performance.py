@@ -135,6 +135,7 @@ def test_postgres_bm25_matches_original_formula_and_preserves_the_whole_corpus(t
         ("empty", ""),
         ("unmatched", "other long words no match"),
         ("operator-word", "or and"),
+        ("parser-compounds", "foo-bar baz café foo.bar receipt retry"),
     ]
     with postgres_store(tmp_path / "bm25.sqlite") as (store, _):
         with store.transaction() as db:
@@ -142,7 +143,15 @@ def test_postgres_bm25_matches_original_formula_and_preserves_the_whole_corpus(t
                 "CREATE VIRTUAL TABLE temp.allowed_search USING fts5(group_id UNINDEXED,text)"
             )
             db.executemany("INSERT INTO temp.allowed_search VALUES (?,?)", documents)
-            for expression in ('"receipt" OR "retry"', '"咖啡"', '"missing"', '"OR"'):
+            for expression in (
+                '"receipt" OR "retry"',
+                '"咖啡"',
+                '"missing"',
+                '"OR"',
+                '"foo-bar" OR "café"',
+                '"receipt retry" OR "foo.bar"',
+                '"foo-bar" OR "receipt" OR "retry"',
+            ):
                 before = {
                     row["group_id"]: row["relevance"]
                     for row in db.execute(
