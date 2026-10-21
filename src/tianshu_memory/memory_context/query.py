@@ -80,12 +80,14 @@ def execute(application, request, context):
             result["omissions"] = ["no_match"]
             return result
         candidates, witnesses = [], []
+        authorized_group_ids = None
         ranking_query = request["query_text"]
         if shared:
             owners = [scope] if self_reference(ranking_query) else None
             # Name uniqueness and target relevance share one window across categories;
             # an unselected identity category must not hide a same-name other owner.
             candidates, complete = group_candidates(service, db, scope, owners=owners)
+            authorized_group_ids = frozenset(entry[0]["id"] for entry in candidates)
             result["coverage"]["complete"] &= complete
             if exact:
                 candidates = [
@@ -166,7 +168,12 @@ def execute(application, request, context):
         )
         lexical = (
             service._rank_groups(
-                db, candidates, search_terms, ranking_query, fact_snapshot=fact_snapshot
+                db,
+                candidates,
+                search_terms,
+                ranking_query,
+                fact_snapshot=fact_snapshot,
+                authorized_group_ids=authorized_group_ids,
             )
             if not exact
             else candidates

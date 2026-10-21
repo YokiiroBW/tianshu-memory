@@ -168,7 +168,10 @@ def test_cold_group_recall_preserves_owner_and_legacy_select_stays_exact(room):
     current = next(body for kind, body, _ in h.calls if kind == "current")
     assert current["viewer"]["scope"] == h.scope()
     assert any(admission["scope"] == h.scope(a) for admission in current["admissions"])
-    assert h.select()["selected_units"] == []
+    legacy = h.selection()
+    legacy.update(query_text="群里那只猫叫什么", selection=["evidence"])
+    response = h.post("memory/select", legacy)
+    assert response.status_code == 200 and response.json()["selected_units"] == []
     assert recalled(h, probe(h, selected))["scope_checks"] == selected["scope_checks"]
 
 
@@ -263,14 +266,17 @@ def test_names_use_unique_current_identity_witness_and_keep_self_topics(room):
     assert len(selected["dependency_groups"]) == 2
     assert recalled(h, query(h, "我的宠物名字和种类是什么"))["selected_units"] == []
     cat(h, 0, "雪球", second=5)
+    add(h, "我叫晓北", "identity.name", "晓北", second=6)
     mine = recalled(h, query(h, "我的猫叫什么"))
     assert [unit["statement"] for unit in mine["selected_units"]] == ["我的猫叫雪球"]
     assert len(mine["scope_checks"]) == 1
+    pet = recalled(h, query(h, "我的宠物名字和种类是什么"))
+    assert [unit["statement"] for unit in pet["selected_units"]] == ["我的猫叫雪球"]
     assert self_reference("我的猫叫什么")
     assert not self_reference("阿川说‘我的猫’，群里那只猫叫什么")
 
 
-def test_multiple_owner_payloads_use_the_existing_single_pg_batch(room, monkeypatch):
+def test_multiple_owner_payloads_and_rank_index_use_bounded_batches(room, monkeypatch):
     h = room
     named_cats(h)
     transaction = h.store.transaction
@@ -287,11 +293,20 @@ def test_multiple_owner_payloads_use_the_existing_single_pg_batch(room, monkeypa
                     return native(sql, parameters, **options)
 
                 db.native = record
+            else:
+                db.set_trace_callback(statements.append)
             yield db
 
     monkeypatch.setattr(h.store, "transaction", observe)
     selected = recalled(h)
-    assert len(selected["selected_units"]) == 2
+    assert {unit["statement"] for unit in selected["selected_units"]} == {
+        "我的猫叫栗团",
+        "我的猫叫栗糖",
+    }
+    indexes = [
+        sql for sql in statements if "SELECT record_id,record_version,text FROM search_index" in sql
+    ]
+    assert len(indexes) == 1 and "WHERE scope IN (" in indexes[0]
     if h.store.backend == "postgresql":
         bodies = [sql for sql in statements if "SELECT * FROM records WHERE group_id" in sql]
         assert len(bodies) == 1 and "group_id IN (" in bodies[0]
@@ -419,6 +434,37 @@ def test_mixed_private_lineage_is_rejected_before_payload_read(room):
         db.execute("INSERT INTO lineage VALUES (?,?,?,?)", (group, *source))
         db.execute("UPDATE records SET payload='not-json' WHERE group_id=?", (group,))
     assert recalled(h)["selected_units"] == []
+
+
+def test_old_alias_hints_require_the_same_fresh_whole_group_domain(room):
+    h = room
+    a, b = owner(h), owner(h, audience="self_private")
+    old, _ = add(
+        h,
+        "周日约在银杏咖啡馆，先在东门等",
+        "event.appointment",
+        actor=a,
+        second=1,
+        keywords=["周日", "银杏咖啡馆", "东门"],
+    )
+    current, _ = add(
+        h,
+        "周日东门太晒了，换到后门等",
+        "event.appointment",
+        actor=a,
+        second=2,
+        keywords=["周日", "后门", "等候"],
+    )
+    request = query(h, "银杏咖啡馆最后在哪儿等？")
+    selected = recalled(h, request)
+    assert {unit["record_id"] for unit in selected["selected_units"]} == set(current["record_ids"])
+    cat(h, b, second=3)
+    with h.store.transaction() as db:
+        source = db.execute(
+            "SELECT key,revision,epoch FROM sources WHERE scope=?", (canonical(h.scope(b)),)
+        ).fetchone()
+        db.execute("INSERT INTO lineage VALUES (?,?,?,?)", (old["group_ids"][0], *source))
+    assert recalled(h, request)["selected_units"] == []
 
 
 @pytest.mark.parametrize("change", ["none", "source", "grant", "witness"])

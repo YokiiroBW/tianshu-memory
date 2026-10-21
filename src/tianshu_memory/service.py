@@ -511,10 +511,20 @@ class MemoryService:
                 409,
             )
 
-    def _rank_groups(self, db, eligible, search_terms, query, *, fact_snapshot=None):
+    def _rank_groups(
+        self, db, eligible, search_terms, query, *, fact_snapshot=None, authorized_group_ids=None
+    ):
         from .recall_index import rank_groups
 
-        return rank_groups(self, db, eligible, search_terms, query, fact_snapshot=fact_snapshot)
+        return rank_groups(
+            self,
+            db,
+            eligible,
+            search_terms,
+            query,
+            fact_snapshot=fact_snapshot,
+            authorized_group_ids=authorized_group_ids,
+        )
 
     def _fit_groups(self, eligible, budget, *, requester_scope=None):
         units, dependencies, omissions = [], [], []

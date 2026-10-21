@@ -223,16 +223,23 @@ def _units(group, rows, scope, scope_key):
     return units
 
 
-def rank_groups(service, db, eligible, search_terms, query, *, fact_snapshot=None):
+def rank_groups(
+    service, db, eligible, search_terms, query, *, fact_snapshot=None, authorized_group_ids=None
+):
     if not search_terms or not eligible:
         return []
     # FTS metadata columns are UNINDEXED. Looking up each record separately scans
-    # the whole virtual table for every record. Read this scope once, retaining
-    # exact record versions before constructing the authorized ranking corpus.
+    # the whole virtual table for every record. Read only eligible scopes in bounded
+    # batches, retaining exact versions before constructing the authorized corpus.
     indexed = {}
-    for scope in {group["scope"] for group, _, _ in eligible}:
+    scopes = sorted({group["scope"] for group, _, _ in eligible})
+    for offset in range(0, len(scopes), 256):
+        batch = scopes[offset : offset + 256]
         for row in db.execute(
-            "SELECT record_id,record_version,text FROM search_index WHERE scope=?", (scope,)
+            "SELECT record_id,record_version,text FROM search_index WHERE scope IN ("
+            + ",".join("?" for _ in batch)
+            + ")",
+            batch,
         ):
             indexed.setdefault((row["record_id"], row["record_version"]), row["text"])
     from .fact_entities import historical_title_groups
@@ -251,7 +258,9 @@ def rank_groups(service, db, eligible, search_terms, query, *, fact_snapshot=Non
         else set()
     )
     references = (
-        reference_terms(service, db, eligible, indexed, facts=facts)
+        reference_terms(
+            service, db, eligible, indexed, facts=facts, authorized_group_ids=authorized_group_ids
+        )
         if facts_installed and not history_query(query)
         else {}
     )

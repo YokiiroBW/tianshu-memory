@@ -27,7 +27,7 @@ def expand_candidates(query_sql, parameters, scope):
     )
 
 
-def reference_terms(service, db, eligible, indexed, *, facts=None):
+def reference_terms(service, db, eligible, indexed, *, facts=None, authorized_group_ids=None):
     """Validate old groups before any of their tokens affect current ranking.
 
     The caller has already verified the current scope and eligible output units.
@@ -55,6 +55,10 @@ def reference_terms(service, db, eligible, indexed, *, facts=None):
         if key in checked:
             return checked[key]
         checked[key] = None
+        # Group readers may borrow only from original whole groups whose complete
+        # lineage passed this operation's viewer/source barrier and bounded window.
+        if authorized_group_ids is not None and group_id not in authorized_group_ids:
+            return None
         group = db.execute("SELECT * FROM groups WHERE id=?", (group_id,)).fetchone()
         if (
             not group
