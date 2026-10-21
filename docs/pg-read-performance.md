@@ -276,3 +276,14 @@ lineage/sources have zero loops, rather than inferring a bound from returned row
 Performance parity and SQLite write non-regression require the separate TS-265
 three-round comparison and paired real-commit write control. Local SQL doubles and
 fewer statements establish neither latency nor PostgreSQL correctness by themselves.
+
+The coordinator completed TS-265: the original 24 runs/4,560 samples, 12 separate
+SourceAuthority write runs/720 samples, and 240 byte-identical SQLite write pairs
+all passed content and durable-reopen checks. Source keyword PG p50 fell
+494.524→270.659 ms and source commits 627.950→369.097 ms. Short field still trails
+SQLite (4.479 vs 2.924 ms); the complete source-write flow trails by 5.40%.
+SQLite paired ordinary writes show no stable regression, and source writes improve
+about 40%; sequential upward results and all tails remain in the report. See the
+coordinator's `docs/development/pg-write-performance-2026-10-21.md` and integration
+JSON for complete evidence, final history and released Memory write ownership.
+Production was not deployed or migrated by this round.
