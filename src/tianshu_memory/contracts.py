@@ -1,11 +1,16 @@
 import hashlib
 import importlib.util
 import json
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
+from urllib.parse import urldefrag, urljoin
 
 from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema.validators import extend
 from referencing import Registry, Resource
+from referencing.exceptions import CannotDetermineSpecification, Unresolvable
+from referencing.jsonschema import UnknownDialect
 
 MANIFEST_SHA256 = "90697e6ecbb587d3db8c8e4682f7f8f43a8b1a98f70d8835c8282b03828d2d3a"
 PROFILE_MANIFEST_SHA256 = "757b243a25945a75d55dafab9da94828e79a009a0a77ce2aeb43039e4c2565c9"
@@ -19,6 +24,90 @@ LIFE_MANIFEST_SHA256 = "ff7cbaf5bb9cf1330a11821c0e5f0eefb728a934e9fb8698c9b644e0
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+
+
+def _prepare_validation(registry):
+    """Prepare static local references; official callbacks own every other case."""
+    draft = Draft202012Validator.META_SCHEMA["$id"]
+    roots = [registry[uri] for uri in registry]
+    if any(
+        not isinstance(root.contents, dict) or root.contents.get("$schema") != draft
+        for root in roots
+    ):
+        return registry, Draft202012Validator
+    dynamic = {"$dynamicRef", "$dynamicAnchor", "$recursiveRef", "$recursiveAnchor"}
+    pending, seen = [root.contents for root in roots], set()
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, dict):
+            if dynamic.intersection(node) or ("$schema" in node and node["$schema"] != draft):
+                return registry, Draft202012Validator
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+    try:
+        crawled = registry.crawl()
+    except (CannotDetermineSpecification, UnknownDialect):
+        return registry, Draft202012Validator
+    contexts, references, visited = {}, {}, set()
+
+    def walk(resource, base):
+        node = resource.contents
+        if (id(node), base) in visited:
+            return
+        visited.add((id(node), base))
+        contexts.setdefault(id(node), set()).add(base)
+        if isinstance(node, dict) and isinstance(node.get("$ref"), str):
+            references[id(node)] = node["$ref"]
+        for child in resource.subresources():
+            walk(child, urljoin(base, child.id() or ""))
+
+    # A registered URI is already a resolution base. Applying that resource's
+    # relative $id again would incorrectly turn nested/ into nested/nested/.
+    for uri in crawled:
+        walk(crawled[uri], uri)
+    local_uris = frozenset(crawled)
+    local_references = {}
+    for node_id, reference in references.items():
+        bases = contexts[node_id]
+        if len(bases) != 1:
+            continue
+        base = next(iter(bases))
+        try:
+            if urldefrag(urljoin(base, reference))[0] in local_uris:
+                local_references[node_id] = base, reference
+        except ValueError:
+            pass
+    official_ref = Draft202012Validator.VALIDATORS["$ref"]
+
+    @lru_cache(maxsize=1024)
+    def resolve(base, reference):
+        # Exceptions are deliberately not cached by lru_cache.
+        return crawled.resolver(base_uri=base).lookup(reference)
+
+    def static_ref(validator, reference, instance, schema):
+        location = local_references.get(id(schema))
+        if (
+            location is not None
+            and reference == location[1]
+            and validator.META_SCHEMA.get("$id") == draft
+        ):
+            try:
+                target = resolve(*location)
+            except Unresolvable:
+                pass
+            else:
+                # Only lookup preparation is reused. The official descendant
+                # validator checks this call's entire current instance.
+                yield from validator.descend(instance, target.contents, resolver=target.resolver)
+                return
+        yield from official_ref(validator, reference, instance, schema)
+
+    # No version argument: never register this per-registry class globally.
+    return crawled, extend(Draft202012Validator, {"$ref": static_ref})
 
 
 class Contracts:
@@ -309,13 +398,13 @@ class Contracts:
         with self._validation_lock:
             registry = self.registry
             if self._validation_registry is not registry:
-                self._crawled_registry = registry.crawl()
+                self._crawled_registry, self._validator_type = _prepare_validation(registry)
                 self._format_checker = FormatChecker()
                 self._validators = {}
                 self._validation_registry = registry
             validator = self._validators.get(reference)
             if validator is None:
-                validator = Draft202012Validator(
+                validator = self._validator_type(
                     {"$ref": reference},
                     registry=self._crawled_registry,
                     format_checker=self._format_checker,

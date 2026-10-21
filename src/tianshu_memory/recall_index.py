@@ -5,7 +5,7 @@ from collections import defaultdict
 
 from .domain import Fault, canonical, terms
 from .fact_migration import installed
-from .fact_queries import for_groups
+from .fact_queries import FactSnapshot, for_groups, group_queries, snapshot_for_groups
 from .postgres import GROUP_READ_BATCH, is_postgres
 from .recall_language import normalize_objects, topic_tokens
 from .recall_relevance import LexicalQuery
@@ -45,12 +45,7 @@ def eligible_groups(service, db, groups, scope):
             keys,
         ):
             lineage[row["group_id"]].append(row)
-        current_many = getattr(service.source_authority, "current_many", None)
-        current = (
-            current_many(db, lineage)
-            if current_many is not None
-            else {key for key in keys if service._group_current(db, key, rows=lineage[key])}
-        )
+        current = _current_groups(service, db, keys, lineage)
         selected_keys = [key for key in keys if key in current]
         if not selected_keys:
             continue
@@ -65,23 +60,9 @@ def eligible_groups(service, db, groups, scope):
             for group in batch
             if group["id"] in current
         }
-        refs = list(
-            {
-                source["projection_ref"]
-                for group_units in units.values()
-                if group_units is not None
-                for unit in group_units
-                for source in unit["sources"]
-                if source["kind"] == "shareable_projection"
-            }
-        )
         projections = {}
-        for start in range(0, len(refs), 256):
-            selected = refs[start : start + 256]
-            for row in db.execute(
-                "SELECT * FROM projections WHERE ref IN (" + ",".join("?" for _ in selected) + ")",
-                selected,
-            ):
+        for sql, parameters in _projection_queries(units):
+            for row in db.execute(sql, parameters):
                 projections[row["ref"]] = row
         for group in batch:
             group_units = units.get(group["id"])
@@ -90,6 +71,128 @@ def eligible_groups(service, db, groups, scope):
             ):
                 result.append((group, records[group["id"]], group_units))
     return result
+
+
+def exact_groups(service, db, scope, selection, kind, value):
+    """PG-only exact recall: bounded metadata, then confirmed authorized reads."""
+    if service.source_authority is None:
+        raise Fault("dependency_unavailable", 503)
+    scope_key = canonical(scope)
+    placeholders = ",".join("?" for _ in selection)
+    field = {"field": "field_key", "item": "item_key"}[kind]
+    rows = db.native(
+        "WITH candidates AS MATERIALIZED ("
+        "SELECT * FROM groups WHERE scope=? AND state='active' AND category IN ("
+        + placeholders
+        + f") AND {field}=?),"
+        "candidate_count AS MATERIALIZED (SELECT count(*) AS total FROM candidates),"
+        "lineage_rows AS MATERIALIZED ("
+        "SELECT l.group_id,l.revision AS required_revision,l.epoch AS required_epoch,"
+        "s.key,s.state,s.revision,s.epoch FROM lineage l JOIN sources s ON s.key=l.source_key "
+        "WHERE (SELECT total FROM candidate_count)<=? "
+        "AND l.group_id IN (SELECT id FROM candidates)) "
+        "SELECT g.id,g.scope,g.state,g.members,g.category,g.field_key,g.item_key,n.total AS exact_count,"
+        "l.group_id AS exact_group_id,l.required_revision AS exact_required_revision,"
+        "l.required_epoch AS exact_required_epoch,l.key AS exact_key,l.state AS exact_state,"
+        "l.revision AS exact_revision,l.epoch AS exact_epoch "
+        "FROM candidates g CROSS JOIN candidate_count n "
+        "LEFT JOIN lineage_rows l ON l.group_id=g.id ORDER BY g.id",
+        [scope_key, *selection, value, GROUP_READ_BATCH],
+    ).fetchall()
+    groups, lineage = [], defaultdict(list)
+    group_fields = ("id", "scope", "state", "members", "category", "field_key", "item_key")
+    lineage_fields = ("required_revision", "required_epoch", "key", "state", "revision", "epoch")
+    for row in rows:
+        if not groups or groups[-1]["id"] != row["id"]:
+            groups.append({key: row[key] for key in group_fields})
+        if row["exact_group_id"] is not None:
+            lineage[row["id"]].append({key: row["exact_" + key] for key in lineage_fields})
+    if not groups or rows[0]["exact_count"] > GROUP_READ_BATCH:
+        # The oversized metadata query emits no lineage rows. Retain the original
+        # 512-group reads and complete candidate set, with no LIMIT/truncation.
+        eligible = eligible_groups(service, db, groups, scope)
+        return eligible, snapshot_for_groups(db, eligible)
+
+    current = _current_groups(service, db, [group["id"] for group in groups], lineage)
+    selected = [group["id"] for group in groups if group["id"] in current]
+    if not selected:
+        return [], snapshot_for_groups(db, [])
+    # Never queue record bodies before current_many/current has accepted every
+    # source in the group. This batch contains no admission or suppression reads.
+    record_rows, marker_rows = db.read_batch(
+        [
+            (
+                "SELECT * FROM records WHERE group_id IN ("
+                + ",".join("?" for _ in selected)
+                + ") ORDER BY group_id,id",
+                selected,
+            ),
+            ("SELECT value FROM metadata WHERE key='automatic_fact_schema'", ()),
+        ]
+    )
+    records = defaultdict(list)
+    for row in record_rows:
+        records[row["group_id"]].append(row)
+    units = {
+        group["id"]: _units(group, records[group["id"]], scope, scope_key)
+        for group in groups
+        if group["id"] in current
+    }
+    marker = marker_rows.fetchone()
+    fact_installed = marker is not None and marker[0] == "1"
+    projection_queries = list(_projection_queries(units))
+    valid_keys = [key for key, value in units.items() if value is not None]
+    requests = projection_queries + (list(group_queries(valid_keys)) if fact_installed else [])
+    cursors = db.read_batch(requests) if requests else []
+    projections = {
+        row["ref"]: row for cursor in cursors[: len(projection_queries)] for row in cursor
+    }
+    eligible = [
+        (group, records[group["id"]], units[group["id"]])
+        for group in groups
+        if units.get(group["id"]) is not None
+        and service._projections_current(db, units[group["id"]], projections=projections)
+    ]
+    # A bad projection may coexist with malformed fact JSON. The old path never
+    # decodes that discarded group's fact; retain the same omission/error order.
+    valid_keys = {group["id"] for group, _, _ in eligible}
+    facts = {
+        row["group_id"]: row
+        for cursor in cursors[len(projection_queries) :]
+        for row in cursor
+        if row["group_id"] in valid_keys
+    }
+    return eligible, (
+        FactSnapshot.from_rows(facts) if fact_installed else FactSnapshot(False, {}, {})
+    )
+
+
+def _current_groups(service, db, keys, lineage):
+    current_many = getattr(service.source_authority, "current_many", None)
+    return (
+        current_many(db, lineage)
+        if current_many is not None
+        else {key for key in keys if service._group_current(db, key, rows=lineage[key])}
+    )
+
+
+def _projection_queries(units):
+    refs = list(
+        {
+            source["projection_ref"]
+            for group_units in units.values()
+            if group_units is not None
+            for unit in group_units
+            for source in unit["sources"]
+            if source["kind"] == "shareable_projection"
+        }
+    )
+    for start in range(0, len(refs), 256):
+        selected = refs[start : start + 256]
+        yield (
+            "SELECT * FROM projections WHERE ref IN (" + ",".join("?" for _ in selected) + ")",
+            selected,
+        )
 
 
 def _units(group, rows, scope, scope_key):

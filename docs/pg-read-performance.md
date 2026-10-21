@@ -209,7 +209,16 @@ statement counts and those correctness results establish no performance-parity c
 `Contracts` prepares the official referencing registry with `crawl()` and retains
 one official Draft 2020-12 validator per qualified reference in that registry.
 Every call still validates the complete current input. The cache contains rules,
-format-checker preparation and validators only. Verified schema trees are frozen
+format-checker preparation, validators and successfully resolved local schema
+targets only. A per-registry `validators.extend` callback uses public
+`Registry.resolver(base_uri).lookup()` for static references with a unique local
+base, then runs the official `descend` against every current instance. It retains
+relative IDs, anchors, sibling constraints and current error paths. Any dynamic or
+recursive keyword or unknown dialect keeps the entire graph on the official
+callback. Ambiguous contexts, unknown schema contexts, remote targets and lookup
+failures likewise fall back; failures are not cached. The validator class is not
+globally registered and no private or deprecated resolver API is used.
+Verified schema trees are frozen
 after loading; supported `load_*` calls replace the immutable registry and invalidate
 preparation. In-place edits to those verified schema dictionaries are not a hot
 contract-update API. A registry replaced during preparation cannot be mislabeled
@@ -235,14 +244,34 @@ coverage, NULL-payload aliases, cross-actor withdrawal and in-transaction epoch
 updates are unchanged. Setup pipelining, six fresh revision checks, lock ordering,
 guard-before-commit, durability, and the after-checkpoint are unchanged.
 
+PostgreSQL exact field/item reads combine group and lineage metadata for at most
+512 candidate groups. Above that boundary the statement suppresses lineage output
+and retains all group metadata, then uses the original bounded validation path.
+The existing source authority must accept the complete group before any record
+body is queued. A first confirmed read batch then obtains records and the fact
+schema marker; a second obtains projection rows and, only when enabled, fact rows.
+The existing unit/projection rules remain authoritative. `FactSnapshot` decodes
+only rows belonging to groups that survived those checks, so a discarded group's
+invalid fact JSON does not introduce a new error. Each subsequent capture starts
+fresh. SQLite retains its original statements, lazy body reads, known-version and
+zero-budget shortcuts.
+
 `tests/test_contract_preparation.py` compares published documents and invalid inputs
 against fresh official validators, including error paths, installed formats,
-missing references, registry/load replacement and concurrent validation.
+missing references, registry/load replacement and concurrent validation. Its
+static-reference cases also cover nested relative IDs, anchors, ambiguous bases,
+dynamic fallback, unknown dialects, external lookups and failed-target behavior.
 `tests/test_write_preparation.py` compares history epochs/errors with the original
 SQLite SQL path and checks per-call fact/evidence text freshness. Its one native
 PG test requires the explicit isolated test database. `tests/test_source_read_batch.py`
 uses a confirmed-result double; it is not PG transaction evidence. The existing
 native source-snapshot suite now counts statements inside read batches too.
+`tests/test_pg_exact.py` checks source-before-body ordering, both authority paths,
+NULL admissions, ten incomplete member/projection cases, disabled fact markers,
+malformed discarded fact JSON, fresh subsequent reads, and 512/513 boundaries.
+The coordinator's isolated native run passed all 36 cases in that file: five
+native PG cases and 31 local/double cases. Its oversize EXPLAIN check verifies that
+lineage/sources have zero loops, rather than inferring a bound from returned rows.
 
 Performance parity and SQLite write non-regression require the separate TS-265
 three-round comparison and paired real-commit write control. Local SQL doubles and

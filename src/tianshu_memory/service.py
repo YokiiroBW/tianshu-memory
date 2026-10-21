@@ -433,22 +433,32 @@ class MemoryService:
                 response["omissions"] = ["no_match"]
                 return response
             # Materialize only authorized, current groups BEFORE any lexical/FTS matching.
-            placeholders = ",".join("?" for _ in request["selection"])
-            exact_filter = f" AND {exact_kind}_key=?" if exact else ""
-            parameters = [canonical(scope), *request["selection"]]
-            if exact:
-                parameters.append(exact_value)
-            groups = db.execute(
-                f"SELECT * FROM groups WHERE scope=? AND state='active' AND category IN ({placeholders}){exact_filter} ORDER BY id",
-                parameters,
-            ).fetchall()
-            from .recall_index import eligible_groups
+            from .postgres import is_postgres
 
-            eligible = eligible_groups(self, db, groups, scope)
+            if exact and is_postgres(db):
+                from .recall_index import exact_groups
+
+                eligible, fact_snapshot = exact_groups(
+                    self, db, scope, request["selection"], exact_kind, exact_value
+                )
+            else:
+                placeholders = ",".join("?" for _ in request["selection"])
+                exact_filter = f" AND {exact_kind}_key=?" if exact else ""
+                parameters = [canonical(scope), *request["selection"]]
+                if exact:
+                    parameters.append(exact_value)
+                groups = db.execute(
+                    f"SELECT * FROM groups WHERE scope=? AND state='active' AND category IN ({placeholders}){exact_filter} ORDER BY id",
+                    parameters,
+                ).fetchall()
+                from .fact_queries import snapshot_for_groups
+                from .recall_index import eligible_groups
+
+                eligible = eligible_groups(self, db, groups, scope)
+                fact_snapshot = snapshot_for_groups(db, eligible)
+
             from .automatic_facts import filter_current
-            from .fact_queries import snapshot_for_groups
 
-            fact_snapshot = snapshot_for_groups(db, eligible)
             eligible = filter_current(
                 db, eligible, request["query_text"], self.clock, fact_snapshot=fact_snapshot
             )

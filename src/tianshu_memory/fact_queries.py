@@ -13,6 +13,13 @@ class FactSnapshot:
     rows: dict
     decoded: dict
 
+    @classmethod
+    def from_rows(cls, rows):
+        """Decode only rows retained after complete-group/projection validation."""
+        return cls(
+            True, rows, {identity: json.loads(row["payload"]) for identity, row in rows.items()}
+        )
+
 
 def snapshot_for_groups(db, candidates):
     """Capture once for filtering/ranking inside one select transaction only."""
@@ -20,10 +27,19 @@ def snapshot_for_groups(db, candidates):
         return None
     if not installed(db):
         return FactSnapshot(False, {}, {})
-    rows = for_groups(db, candidates)
-    return FactSnapshot(
-        True, rows, {identity: json.loads(row["payload"]) for identity, row in rows.items()}
-    )
+    return FactSnapshot.from_rows(for_groups(db, candidates))
+
+
+def group_queries(keys):
+    """The same bounded fact reads, independently queueable after source approval."""
+    for offset in range(0, len(keys), GROUP_READ_BATCH):
+        batch = keys[offset : offset + GROUP_READ_BATCH]
+        yield (
+            "SELECT * FROM automatic_facts WHERE group_id IN ("
+            + ",".join("?" for _ in batch)
+            + ")",
+            batch,
+        )
 
 
 def for_groups(db, candidates):
@@ -33,17 +49,8 @@ def for_groups(db, candidates):
         return None
     keys = [entry[0]["id"] for entry in candidates]
     result = {}
-    for offset in range(0, len(keys), GROUP_READ_BATCH):
-        batch = keys[offset : offset + GROUP_READ_BATCH]
-        result.update(
-            (row["group_id"], row)
-            for row in db.execute(
-                "SELECT * FROM automatic_facts WHERE group_id IN ("
-                + ",".join("?" for _ in batch)
-                + ")",
-                batch,
-            )
-        )
+    for sql, parameters in group_queries(keys):
+        result.update((row["group_id"], row) for row in db.execute(sql, parameters))
     return result
 
 
