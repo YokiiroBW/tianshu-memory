@@ -50,6 +50,7 @@ def add(
     expected_state="completed",
     memories=None,
     actor=0,
+    sent_at=None,
 ):
     physical, admission, grant = [
         copy.deepcopy(items[actor]) for items in (h.physicals, h.admissions, h.grants)
@@ -67,7 +68,7 @@ def add(
     data = dict(
         message_key=dict(physical["key"], revision=physical["revision"]),
         author=physical["author"],
-        sent_at=f"2026-10-11T00:00:{second:02d}Z",
+        sent_at=sent_at or f"2026-10-11T00:00:{second:02d}Z",
         kind=physical["kind"],
         parts=[dict(kind="text", text=text)],
         reply_refs=[],

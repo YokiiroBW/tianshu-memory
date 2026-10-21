@@ -195,16 +195,10 @@ def execute(application, request, context):
     # Model and content I/O never hold the authority write transaction.
     missing = 0
     if period is not None and candidates:
-        ranged, missing = filter_candidates(
-            service, prepared, together(witnesses, candidates), scope, context, period
-        )
+        ranged, missing = filter_candidates(service, prepared, candidates, scope, context, period)
         allowed = {entry[0]["id"] for entry in ranged}
         candidates = [entry for entry in candidates if entry[0]["id"] in allowed]
-        if any(entry[0]["id"] not in allowed for entry in witnesses):
-            candidates = []
         lexical = [entry for entry in lexical if entry[0]["id"] in allowed]
-        if any(entry[0]["id"] not in allowed for entry in witnesses):
-            lexical = []
     if remote_rank:
         result["coverage"]["complete"] &= len(candidates) <= settings["candidates"]
         candidates = service.retrieval.rank(ranking_query, candidates, lexical, settings)
@@ -221,6 +215,27 @@ def execute(application, request, context):
             "scope_changed",
             409,
         )
+        if witnesses:
+            # A clock boundary can change current names without any DML/revision.
+            # Reuse the same bounded authorized domain to reprove both this witness
+            # and uniqueness against all other owners, not just the returned owner.
+            fresh, complete = group_candidates(service, db, scope)
+            fresh_snapshot = snapshot_for_groups(db, fresh)
+            _, current_witnesses, current_query = named_owner(
+                service,
+                db,
+                fresh,
+                request["query_text"],
+                complete=complete,
+                fact_snapshot=fresh_snapshot,
+            )
+            require(
+                [(entry[0]["id"], entry[0]["scope"]) for entry in current_witnesses]
+                == [(entry[0]["id"], entry[0]["scope"]) for entry in witnesses]
+                and current_query == ranking_query,
+                "scope_changed",
+                409,
+            )
         service._verify_retrieval(db, together(witnesses, candidates))
         result["coverage"]["missing_source_times"] = missing
         result["coverage"]["complete"] &= not missing

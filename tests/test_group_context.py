@@ -3,6 +3,7 @@
 import copy
 import json
 from contextlib import ExitStack, contextmanager
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from source_sync_harness import SyncHarness
@@ -12,7 +13,7 @@ from test_source_sync import source_contracts as source_contracts
 from test_source_sync import source_examples as source_examples
 from test_storage_backends import postgres_store
 
-from tianshu_memory.domain import canonical
+from tianshu_memory.domain import canonical, utc
 from tianshu_memory.postgres import is_postgres
 from tianshu_memory.recall_language import self_reference
 
@@ -140,8 +141,8 @@ def history(h, selected=None, known=None):
     )
 
 
-def cat(h, actor, name="栗团", second=1):
-    return add(h, "我的猫叫" + name, "pet.cat.name", name, actor=actor, second=second)
+def cat(h, actor, name="栗团", second=1, **kwargs):
+    return add(h, "我的猫叫" + name, "pet.cat.name", name, actor=actor, second=second, **kwargs)
 
 
 def named_cats(h):
@@ -528,3 +529,94 @@ def test_time_range_uses_one_real_viewer_batch_and_rechecks_after_io(room, revok
     assert all(
         body["viewer"]["scope"] == h.scope() for kind, body, _ in h.calls if kind == "current"
     )
+
+
+def test_current_name_witness_can_predate_the_target_time_window(room):
+    h = room
+    a = owner(h)
+    add(h, "我叫阿川", "identity.name", "阿川", actor=a, second=1, sent_at="2026-10-01T00:00:00Z")
+    cat(h, a, second=2, sent_at="2026-10-20T00:00:00Z")
+    h.calls.clear()
+    selected = recalled(
+        h,
+        query(
+            h,
+            "阿川那只猫叫什么",
+            time_range={"from": "2026-10-19T00:00:00Z", "to": "2026-10-26T00:00:00Z"},
+        ),
+    )
+    assert {unit["statement"] for unit in selected["selected_units"]} == {
+        "我叫阿川",
+        "我的猫叫栗团",
+    }
+    assert selected["coverage"]["missing_source_times"] == 0
+    time_reads = [
+        body for kind, body, _ in h.calls if kind == "snapshot" and body["include_content"]
+    ]
+    assert len(time_reads) == 1
+    assert [selector["key"]["message_id"] for selector in time_reads[0]["selectors"]] == [
+        "quality-source:2"
+    ]
+    outside = recalled(
+        h,
+        query(
+            h,
+            "阿川那只猫叫什么",
+            time_range={"from": "2026-10-22T00:00:00Z", "to": "2026-10-23T00:00:00Z"},
+        ),
+    )
+    assert not outside["selected_units"]
+
+
+@pytest.mark.parametrize("change", ["expiry", "same-name-start", "new-name-write"])
+def test_external_io_reproves_current_name_and_room_uniqueness(room, change):
+    h = room
+    moment = [datetime(2026, 10, 21, tzinfo=UTC)]
+    h.service.clock = lambda: moment[0]
+    a, b = owner(h), owner(h)
+    add(
+        h,
+        "我叫阿川，有效期截止2026-10-21T00:00:01Z" if change == "expiry" else "我叫阿川",
+        "identity.name",
+        "阿川",
+        actor=a,
+        second=1,
+        valid_to=utc(moment[0] + timedelta(seconds=1)) if change == "expiry" else None,
+    )
+    cat(h, a, second=2)
+    if change == "same-name-start":
+        add(
+            h,
+            "我从2026-10-21T00:00:01Z起叫阿川",
+            "identity.name",
+            "阿川",
+            actor=b,
+            second=3,
+            valid_from=utc(moment[0] + timedelta(seconds=1)),
+        )
+    else:
+        add(h, "我叫小禾", "identity.name", "小禾", actor=b, second=3)
+    cat(h, b, "栗糖", second=4)
+    assert len(recalled(h, query(h, "阿川那只猫叫什么"))["selected_units"]) == 2
+
+    class Ranker:
+        def settings_for(self, request):
+            return dict(mode="hybrid", candidates=100)
+
+        def invalidate(self):
+            pass
+
+        def rank(self, query_text, candidates, lexical, settings):
+            if change == "new-name-write":
+                with h.store.transaction() as db:
+                    before = h.service._scope_version(db, h.scope())
+                add(h, "我叫阿川", "identity.name", "阿川", actor=b, second=5)
+                with h.store.transaction() as db:
+                    assert h.service._scope_version(db, h.scope()) == before
+            else:
+                moment[0] += timedelta(seconds=2)
+            return lexical
+
+    h.service.retrieval = Ranker()
+    response = h.post("memory/context/query", query(h, "阿川那只猫叫什么"))
+    assert response.status_code in {409, 503}, response.text

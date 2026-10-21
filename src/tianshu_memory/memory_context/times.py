@@ -38,6 +38,13 @@ def prepare(db, candidates):
 
 def filter_candidates(service, prepared, candidates, scope, context, period):
     groups, selectors, heads = (prepared[key] for key in ("groups", "selectors", "heads"))
+    # Current identity witnesses connect an owner to a requested fact; their naming
+    # date is not the event date being queried. They remain in the outer authority
+    # snapshot/revision and final complete-group verification, not this time filter.
+    identities = {candidate[0]["id"] for candidate in candidates}
+    groups = {identity: keys for identity, keys in groups.items() if identity in identities}
+    required = {key for keys in groups.values() for key in keys}
+    selectors = {key: value for key, value in selectors.items() if key in required}
     times = {}
     if service.synchronized:
         authority = service.source_authority
