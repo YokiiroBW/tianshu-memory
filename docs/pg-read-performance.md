@@ -5,11 +5,16 @@ It changes product read paths, with no schema migration, Redis result cache or
 production operation. Shared-driver packaging remains coordinator-owned; SQLite
 remains the default backend.
 
+TS-256 follows the locally integrated `84c2f56`/shared 0.1.2 candidate in a new
+worktree. Its source is `45d80619803a145bfa4c94108bb990d6868a17a3`. This phase keeps
+the same transaction/authority boundaries and default SQLite behavior; coordinated
+native PG verification and the new comparison belong to TS-257.
+
 ## Memory
 
 `recall_index.eligible_groups` reuses the whole-group validation introduced in Q15
 `58a5a1bee4565f83ba31e8531df1f9a936f12567`, shared by `MemoryService.select` and the
-memory-context query. PostgreSQL reads lineage for at most 128 groups, checks current
+memory-context query. PostgreSQL reads lineage for at most 512 groups, checks current
 admissions and suppression in batches of 256 source keys, then reads records and
 projections only for currently authorized groups. It preserves candidate order, exact
 scope/person, active state, exact members, payload record ID/version/group, shared
@@ -45,6 +50,18 @@ after-checkpoint. This replaces five reads with two; it never uses a snapshot fr
 before the lock or combines the lock with the read. The pure checkpoint conversion
 is shared with SQLite, whose catalog/metadata SQL and persistence order are unchanged.
 
+TS-256 also folds each PG `SourceAuthority.revision` check's four read statements
+into one fresh statement. It reads `source_lookup_schema`, `source_revision` and
+`source_recovery`, plus the two required index names in the current logical schema.
+Validation still runs in marker, index-count, revision/recovery and integer-conversion
+order. All six normal checks remain, including the separate coverage checks and
+the post-`_apply` read; no Store-start metadata or earlier result replaces them.
+Index-name queries use `pg_class` with the current namespace and index relation
+kinds, so an index in another schema or an ordinary table cannot satisfy readiness.
+They add no new index-validity/definition rule. No catalog or authority result is
+cached, including across two calls after DML/DDL in the same transaction. SQLite
+keeps its original four read statements per revision check.
+
 SQLite keeps the earlier lazy order: source check, record read, projection read. It
 does not prefetch invalid sources' payloads, add admission batch queries or replace
 its FTS5 ranking. Zero-budget and exact-field/item filtering still happen before
@@ -57,6 +74,10 @@ frequency once. The BM25 constants/formula match the existing PostgreSQL
 `memory_bm25`, including zero scores. Hidden or stale persistent search rows do not
 contribute to these statistics. Python coverage, clause specificity, tie breaking
 and whole-group fitting remain in their existing owner.
+The materialized query terms now parse each `plainto_tsquery` once per term rather
+than inside the document-frequency join. Compound lexemes keep that same parser
+and matching predicate. The document CTE retains its ID/vector and no unused full
+text column; every authorized input text still contributes to corpus statistics.
 
 The final aggregate joins only query-term frequencies, while document lengths,
 corpus size/average and document frequencies still use the complete authorized
@@ -68,6 +89,11 @@ source key/state and current/required revision/epoch, which are the fields consu
 by both `SourceAuthority.current_many` and the fixture authority fallback.
 
 PostgreSQL also batches automatic-fact metadata for the complete candidate set.
+Its group and raw fact reads share a 512-ID bound (previously 128 on PG). Source
+admission/suppression and projection reads retain their independent 256-key bound;
+current authority is still checked before any group's record body is fetched.
+The candidate set, order and complete-group checks are unchanged. SQLite does not
+take these batch paths.
 Replacement families retain exact scope/fact identity, depth 16 and the existing
 128-family overflow refusal. Old evidence still passes its original source and
 projection checks before contributing terms. SQLite keeps its indexed lazy fact
@@ -143,9 +169,19 @@ negative cases, owner rollback/generation, local CAS retry, an unrequested-physi
 receipt collision, marker/checkpoint corruption and a 4,000-row synthetic index
 plan. Ordinary ANALYZE, without planner setting changes, verifies the physical,
 primary-key and partial receipt indexes while retaining a NULL-payload alias.
-Stable synchronization over 30 historical sources executes 13 `_apply` statements
+The earlier TS-248 synchronization measurement over 30 historical sources used
+13 `_apply` statements
 with zero mutations and leaves guard bytes/mtime unchanged. These are scoped test
 observations, not production latency claims.
+
+`tests/test_pg_followup.py` checks combined readiness with local SQLite SQL/catalog
+doubles, fault precedence, DML/DDL/rollback freshness, the unchanged SQLite query
+shape, and 513-group/fact batch boundaries. Its additional native PG case verifies
+the group boundary using a real selected backend. The source-snapshot suite adds
+native checks for all six fresh probes, trigger-driven revision changes, a dropped/
+renamed index, an index in another schema, an ordinary same-name table, readiness
+damage and rollback. The BM25 oracle also covers compounds, quoted multiword terms,
+Unicode and OR. Skipped native cases or local doubles are not native PG evidence.
 
 Use the same synthetic seed, contract bytes, file tree, budgets and query sequence
 for baseline SQLite, baseline PostgreSQL, candidate SQLite and candidate PostgreSQL.
@@ -160,3 +196,10 @@ Statement-count/score tests are correctness evidence, not a speed claim. Same-NA
 measurements and SQLite non-regression acceptance belong to the coordinator's
 TS-249 report. Production data, media, configuration and running services are
 outside this implementation's validation scope.
+
+TS-256 source `45d8061` passed its full local SQLite collection with **1540 passed,
+97 skipped, one inherited account-authority 403/400 mismatch and no setup errors**.
+The coordinator's fixed-0.1.2 PG-enabled related collection passed **159/159**:
+96 native PG cases and 63 local/SQL-double cases, rather than 159 native cases.
+The separate TS-257 three-round comparison was still running at the TS-256 handoff;
+statement counts and those correctness results establish no performance-parity claim.
