@@ -11,13 +11,12 @@ from .recall_language import normalize_objects, topic_tokens
 from .recall_relevance import LexicalQuery
 
 
-def eligible_groups(service, db, groups, scope):
+def eligible_groups(service, db, groups, scope, *, scopes_by_group=None):
     """Validate whole groups, batching remote reads without prefetching stale content."""
     if service.source_authority is None:
         raise Fault("dependency_unavailable", 503)
     if not groups:
         return []
-    scope_key = canonical(scope)
     if not is_postgres(db):
         # Local SQLite keeps its inexpensive, lazy reads. In particular, a revoked
         # source must short-circuit before any record payload/projection is read.
@@ -28,7 +27,8 @@ def eligible_groups(service, db, groups, scope):
             rows = db.execute(
                 "SELECT * FROM records WHERE group_id=? ORDER BY id", (group["id"],)
             ).fetchall()
-            units = _units(group, rows, scope, scope_key)
+            owner = scope if scopes_by_group is None else scopes_by_group[group["id"]]
+            units = _units(group, rows, owner, canonical(owner))
             if units is not None and service._projections_current(db, units):
                 result.append((group, rows, units))
         return result
@@ -55,11 +55,11 @@ def eligible_groups(service, db, groups, scope):
             selected_keys,
         ):
             records[row["group_id"]].append(row)
-        units = {
-            group["id"]: _units(group, records[group["id"]], scope, scope_key)
-            for group in batch
-            if group["id"] in current
-        }
+        units = {}
+        for group in batch:
+            if group["id"] in current:
+                owner = scope if scopes_by_group is None else scopes_by_group[group["id"]]
+                units[group["id"]] = _units(group, records[group["id"]], owner, canonical(owner))
         projections = {}
         for sql, parameters in _projection_queries(units):
             for row in db.execute(sql, parameters):

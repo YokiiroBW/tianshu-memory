@@ -41,7 +41,7 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
             try:
                 require(application is not None and auth is not None, "dependency_unavailable", 503)
                 require(
-                    application.service.contracts.context_version == "1.0.0",
+                    application.service.contracts.context_version == "1.1.0",
                     "dependency_unavailable",
                     503,
                 )

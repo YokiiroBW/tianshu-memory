@@ -44,7 +44,14 @@ def filter_candidates(service, prepared, candidates, scope, context, period):
         by_scope = {}
         for key in sorted(selectors)[:SOURCE_LIMIT]:
             row, selected_scope = selectors[key]
-            by_scope.setdefault(canonical(selected_scope), []).append(row)
+            same_group = (
+                scope["audience"] == "group"
+                and selected_scope["audience"] == "group"
+                and selected_scope["actor_id"] == scope["actor_id"]
+                and selected_scope["conversation_id"] == scope["conversation_id"]
+            )
+            # Same-room admissions keep their real owners in one viewer-bound batch.
+            by_scope.setdefault(canonical(scope if same_group else selected_scope), []).append(row)
         for encoded_scope, rows in by_scope.items():
             selected_scope = json.loads(encoded_scope)
             request = dict(

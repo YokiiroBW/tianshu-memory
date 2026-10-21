@@ -52,14 +52,24 @@ class SourceAuthority:
         )
         return int(row[0])
 
-    def coverage(self, db, scope, sources, profile):
+    def coverage(self, db, scope, sources, profile, group_read=False):
         self.revision(db)
         selected = {
             canonical(source_selector(s, scope)): source_selector(s, scope) for s in sources
         }
         # Exact text domain includes historical/tombstoned dependencies. Profile domain covers
         # every active public/current-group projection, including other authors and targets.
-        if profile:
+        if group_read:
+            # Include negatives and historical dependencies, not just currently active
+            # projections. The requester is the viewer; admissions retain their owners.
+            rows = db.execute(
+                "SELECT a.selector FROM source_admissions a JOIN sources s ON s.key=a.key "
+                "WHERE json_extract(s.scope,'$.actor_id')=? "
+                "AND json_extract(s.scope,'$.audience')='group' "
+                "AND json_extract(s.scope,'$.conversation_id')=?",
+                (scope["actor_id"], scope["conversation_id"]),
+            )
+        elif profile:
             rows = db.execute(
                 "SELECT DISTINCT a.selector FROM source_admissions a JOIN lineage l ON l.source_key=a.key "
                 "JOIN groups g ON g.id=l.group_id JOIN profile_shares p ON p.group_id=g.id "
@@ -120,12 +130,34 @@ class SourceAuthority:
         return request, access
 
     def barrier(
-        self, service, scope, *, sources=(), context=None, profile=False, event=None, check=None
+        self,
+        service,
+        scope,
+        *,
+        sources=(),
+        context=None,
+        profile=False,
+        group_read=False,
+        event=None,
+        check=None,
     ):
+        require(
+            not group_read
+            or (
+                context is not None
+                and scope["audience"] == "group"
+                and not profile
+                and not sources
+                and event is None
+                and check is None
+            ),
+            "dependency_unavailable",
+            503,
+        )
         for _ in range(3):
             with service.store.transaction() as db:
                 m0 = self.revision(db)
-                selectors = self.coverage(db, scope, sources, profile)
+                selectors = self.coverage(db, scope, sources, profile, group_read)
                 if context is not None:
                     service._authorize(db, context, scope=scope)
             turn_ids = [event["aggregate_id"]] if event else [check["turn_id"]] if check else []
@@ -193,7 +225,13 @@ class SourceAuthority:
             try:
                 if len(observations) == 1:
                     result = self.sync(
-                        service, first, m0=m0, scope=scope, sources=sources, profile=profile
+                        service,
+                        first,
+                        m0=m0,
+                        scope=scope,
+                        sources=sources,
+                        profile=profile,
+                        group_read=group_read,
                     )
                 else:
                     result = self.sync_batches(
@@ -209,6 +247,7 @@ class SourceAuthority:
                         scope=scope,
                         sources=sources,
                         profile=profile,
+                        group_read=group_read,
                     )
             except LocalRevisionChanged:
                 continue
@@ -268,14 +307,22 @@ class SourceAuthority:
         observation["snapshot"] = after
         return True
 
-    def sync(self, service, observation, *, m0, scope, sources=(), profile=False):
+    def sync(self, service, observation, *, m0, scope, sources=(), profile=False, group_read=False):
         """Trusted source-sync port. m0 and scope are local state, never wire authority."""
         self.contracts.validate("sync-workflow#sync_input", observation)
         return self._commit_observations(
-            service, [observation], m0=m0, scope=scope, sources=sources, profile=profile
+            service,
+            [observation],
+            m0=m0,
+            scope=scope,
+            sources=sources,
+            profile=profile,
+            group_read=group_read,
         )
 
-    def sync_batches(self, service, observation, *, m0, scope, sources=(), profile=False):
+    def sync_batches(
+        self, service, observation, *, m0, scope, sources=(), profile=False, group_read=False
+    ):
         self.contracts.validate("sync-batch#barrier", observation)
         try:
             self.contracts.source_batch_rules.batch_barrier(observation, utc(service.clock()))
@@ -288,9 +335,12 @@ class SourceAuthority:
             scope=scope,
             sources=sources,
             profile=profile,
+            group_read=group_read,
         )
 
-    def _commit_observations(self, service, observations, *, m0, scope, sources, profile):
+    def _commit_observations(
+        self, service, observations, *, m0, scope, sources, profile, group_read=False
+    ):
         for observation in observations:
             self._relations("sync_barrier", dict(observation, now=utc(service.clock())))
         selectors = sorted(
@@ -323,7 +373,10 @@ class SourceAuthority:
             first["access"], grants=[g for item in observations for g in item["access"]["grants"]]
         )
         with service.store.transaction() as db:
-            if self.revision(db) != m0 or self.coverage(db, scope, sources, profile) != selectors:
+            if (
+                self.revision(db) != m0
+                or self.coverage(db, scope, sources, profile, group_read) != selectors
+            ):
                 raise LocalRevisionChanged()
             viewer = access["viewer_context"]
             if viewer is not None:

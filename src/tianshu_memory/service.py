@@ -516,9 +516,10 @@ class MemoryService:
 
         return rank_groups(self, db, eligible, search_terms, query, fact_snapshot=fact_snapshot)
 
-    def _fit_groups(self, eligible, budget):
+    def _fit_groups(self, eligible, budget, *, requester_scope=None):
         units, dependencies, omissions = [], [], []
         used = {"tokens": 0, "bytes": 0}
+        owners = set() if requester_scope is None else {requester_scope["person_id"]}
         for group, rows, group_units in eligible:
             dependency = {
                 "semantic_group_id": group["id"],
@@ -539,6 +540,10 @@ class MemoryService:
                 len(proposed_units) > self.max_units
                 or cost > budget["bytes"]
                 or cost > budget["tokens"]
+                or (
+                    requester_scope is not None
+                    and len(owners | {unit["subject_person_id"] for unit in group_units}) > 17
+                )
             ):
                 omissions.append("budget")
                 continue
@@ -547,6 +552,8 @@ class MemoryService:
                 proposed_groups,
                 {"tokens": cost, "bytes": cost},
             )
+            if requester_scope is not None:
+                owners.update(unit["subject_person_id"] for unit in group_units)
         if not units and not omissions:
             omissions.append("no_match")
         return {

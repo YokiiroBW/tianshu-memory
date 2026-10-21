@@ -1,13 +1,13 @@
 """Bounded candidate retrieval preserving whole groups and their authorized scopes."""
 
-import json
-from contextlib import contextmanager
 from datetime import timedelta
 
 from ..domain import Fault, canonical, parse_time, query_terms, require, terms, utc
 from ..fact_migration import installed
-from ..recall_language import candidate_aliases, history_query
-from .migration import identity_version, ready
+from ..recall_language import candidate_aliases, history_query, self_reference
+from ..recall_relevance import named_owner
+from .migration import identity_version
+from .scopes import checks, group_candidates, group_read, verified_scopes
 from .times import filter_candidates, prepare
 
 
@@ -25,89 +25,11 @@ def keyword_candidates(scope, query, search_terms):
     )
 
 
-def authorized_scopes(service, db, scope, include_associated):
-    result = [(scope, None, 1)]
-    if not include_associated or scope["audience"] != "self_private":
-        return result
-    rows = db.execute(
-        "SELECT * FROM context_associations WHERE actor_id=? AND state='linked' AND (source_person=? OR target_person=?) "
-        "AND (json_extract(scopes,'$[0]')=? OR json_extract(scopes,'$[1]')=?) ORDER BY id LIMIT 17",
-        (
-            scope["actor_id"],
-            scope["person_id"],
-            scope["person_id"],
-            canonical(scope),
-            canonical(scope),
-        ),
-    ).fetchall()
-    if len(rows) > 16:
-        raise Fault("budget_exceeded", 429)
-    for row in rows:
-        scopes = json.loads(row["scopes"])
-        if scope not in scopes:
-            continue
-        bindings = [
-            service._binding(db, json.loads(row[key]))
-            for key in ("source_account", "target_account")
-        ]
-        if any(
-            binding is None
-            or binding["person_id"] != row[person]
-            or binding["version"] != row[version]
-            for binding, person, version in zip(
-                bindings,
-                ("source_person", "target_person"),
-                ("source_binding", "target_binding"),
-                strict=True,
-            )
-        ):
-            continue
-        other = scopes[1] if scopes[0] == scope else scopes[0]
-        if other not in [entry[0] for entry in result]:
-            result.append((other, row["id"], row["version"]))
-    return result
-
-
-def checks(service, db, scopes):
-    return [
-        dict(
-            scope=scope,
-            scope_version=service._scope_version(db, scope),
-            association_id=association,
-            association_version=version,
-        )
-        for scope, association, version in scopes
-    ]
-
-
-@contextmanager
-def verified_scopes(service, request, context):
-    """Use one snapshot for a single scope; independently verify associated scopes."""
-    scope = request["requested_scope"]
-    with service.operation(scope=scope, context=context) as db:
-        ready(db)
-        service._authorize(db, context, scope=scope)
-        scopes = authorized_scopes(service, db, scope, request["include_associated"])
-        if len(scopes) == 1:
-            yield db, scopes
-            return
-    # Memory's persisted, purpose-bound consent supplies access to these exact other scopes.
-    # The ordinary source-owner grants are still independently rechecked; no origin is forged.
-    for other, _, _ in scopes[1:]:
-        with service.operation(scope=other):
-            pass
-    with service.operation(scope=scope, context=context) as db:
-        ready(db)
-        service._authorize(db, context, scope=scope)
-        current_scopes = authorized_scopes(service, db, scope, request["include_associated"])
-        require(current_scopes == scopes, "scope_changed", 409)
-        yield db, scopes
-
-
 def execute(application, request, context):
     service = application.service
     settings = service.retrieval.settings_for(request) if service.retrieval else None
     scope = request["requested_scope"]
+    shared = group_read(service, scope)
     period = request["time_range"]
     if period is not None:
         require(parse_time(period["from"]) < parse_time(period["to"]), "invalid_input", 400)
@@ -157,8 +79,19 @@ def execute(application, request, context):
         if not exact and not search_terms and (not settings or settings["mode"] == "keyword"):
             result["omissions"] = ["no_match"]
             return result
-        candidates = []
-        for selected_scope, _, _ in scopes:
+        candidates, witnesses = [], []
+        ranking_query = request["query_text"]
+        if shared:
+            owners = [scope] if self_reference(ranking_query) else None
+            # Name uniqueness and target relevance share one window across categories;
+            # an unselected identity category must not hide a same-name other owner.
+            candidates, complete = group_candidates(service, db, scope, owners=owners)
+            result["coverage"]["complete"] &= complete
+            if exact:
+                candidates = [
+                    entry for entry in candidates if entry[0][exact_kind + "_key"] == exact_value
+                ]
+        for selected_scope, _, _ in [] if shared else scopes:
             parameters = [canonical(selected_scope), *request["selection"]]
             predicates = [
                 "g.scope=?",
@@ -212,34 +145,63 @@ def execute(application, request, context):
         from ..fact_queries import snapshot_for_groups
 
         fact_snapshot = snapshot_for_groups(db, candidates)
+        if shared and not exact and not self_reference(ranking_query):
+            candidates, witnesses, ranking_query = named_owner(
+                service,
+                db,
+                candidates,
+                ranking_query,
+                complete=result["coverage"]["complete"],
+                fact_snapshot=fact_snapshot,
+            )
+            search_terms = query_terms(ranking_query)
+        if shared:
+            candidates = [
+                entry for entry in candidates if entry[0]["category"] in request["selection"]
+            ]
+            if any(entry[0]["category"] not in request["selection"] for entry in witnesses):
+                candidates = []
         candidates = filter_current(
-            db, candidates, request["query_text"], service.clock, fact_snapshot=fact_snapshot
+            db, candidates, ranking_query, service.clock, fact_snapshot=fact_snapshot
         )
         lexical = (
             service._rank_groups(
-                db, candidates, search_terms, request["query_text"], fact_snapshot=fact_snapshot
+                db, candidates, search_terms, ranking_query, fact_snapshot=fact_snapshot
             )
             if not exact
             else candidates
         )
+        if witnesses:
+            witness_ids = {entry[0]["id"] for entry in witnesses}
+            matched_ids = {entry[0]["id"] for entry in lexical}
+            candidates = [
+                entry
+                for entry in candidates
+                if entry[0]["id"] not in witness_ids or entry[0]["id"] in matched_ids
+            ]
         remote_rank = settings is not None and not exact
         if not remote_rank:
             candidates = lexical
         if not remote_rank and (period is None or not candidates):
-            return finish(service, db, request, context, candidates, result)
-        prepared = prepare(db, candidates)
+            return finish(service, db, request, context, candidates, result, witnesses=witnesses)
+        prepared = prepare(db, together(witnesses, candidates))
     # Model and content I/O never hold the authority write transaction.
     missing = 0
     if period is not None and candidates:
-        candidates, missing = filter_candidates(
-            service, prepared, candidates, scope, context, period
+        ranged, missing = filter_candidates(
+            service, prepared, together(witnesses, candidates), scope, context, period
         )
-        allowed = {entry[0]["id"] for entry in candidates}
+        allowed = {entry[0]["id"] for entry in ranged}
+        candidates = [entry for entry in candidates if entry[0]["id"] in allowed]
+        if any(entry[0]["id"] not in allowed for entry in witnesses):
+            candidates = []
         lexical = [entry for entry in lexical if entry[0]["id"] in allowed]
+        if any(entry[0]["id"] not in allowed for entry in witnesses):
+            lexical = []
     if remote_rank:
         result["coverage"]["complete"] &= len(candidates) <= settings["candidates"]
-        candidates = service.retrieval.rank(request["query_text"], candidates, lexical, settings)
-    with service.operation(scope=scope, context=context) as db:
+        candidates = service.retrieval.rank(ranking_query, candidates, lexical, settings)
+    with verified_scopes(service, request, context) as (db, current_scopes):
         require(
             int(db.execute("SELECT value FROM metadata WHERE key='source_revision'").fetchone()[0])
             == prepared["revision"],
@@ -248,25 +210,57 @@ def execute(application, request, context):
         )
         service._authorize(db, context, scope=scope)
         require(
-            authorized_scopes(service, db, scope, request["include_associated"]) == scopes
-            and checks(service, db, scopes) == scope_checks,
+            current_scopes == scopes and checks(service, db, scopes) == scope_checks,
             "scope_changed",
             409,
         )
-        service._verify_retrieval(db, candidates)
+        service._verify_retrieval(db, together(witnesses, candidates))
         result["coverage"]["missing_source_times"] = missing
         result["coverage"]["complete"] &= not missing
-        return finish(service, db, request, context, candidates, result)
+        return finish(service, db, request, context, candidates, result, witnesses=witnesses)
 
 
-def finish(service, db, request, context, candidates, result):
-    result["coverage"]["matched_groups"] = len(candidates)
-    result.update(service._fit_groups(candidates[: request["limit"]], request["budget"]))
+def together(first, second):
+    identities = {entry[0]["id"] for entry in first}
+    return first + [entry for entry in second if entry[0]["id"] not in identities]
+
+
+def finish(service, db, request, context, candidates, result, *, witnesses=()):
+    scope = request["requested_scope"]
+    shared = group_read(service, scope)
+    required = list(witnesses) if candidates else []
+    ordered = together(required, candidates)
+    result["coverage"]["matched_groups"] = len(ordered)
+    fitted = service._fit_groups(
+        ordered[: request["limit"]],
+        request["budget"],
+        requester_scope=scope if shared else None,
+    )
+    returned = {entry["semantic_group_id"] for entry in fitted["dependency_groups"]}
+    if required and (
+        not all(entry[0]["id"] in returned for entry in required)
+        or not any(entry[0]["id"] in returned for entry in candidates)
+    ):
+        # No target-only precision when the name's original full witness did not fit.
+        fitted = dict(
+            selected_units=[],
+            dependency_groups=[],
+            budget_used={"tokens": 0, "bytes": 0},
+            omissions=["budget"],
+        )
+    result.update(fitted)
+    if shared:
+        selected = [scope]
+        for unit in result["selected_units"]:
+            owner = dict(scope, person_id=unit["subject_person_id"])
+            if owner not in selected:
+                selected.append(owner)
+        result["scope_checks"] = checks(service, db, [(owner, None, 1) for owner in selected])
     if result["coverage"]["missing_source_times"]:
         result["omissions"].append("source_time_unavailable")
     result["coverage"]["returned_groups"] = len(result["dependency_groups"])
     result["coverage"]["complete"] &= (
-        len(candidates) <= request["limit"] and "budget" not in result["omissions"]
+        len(ordered) <= request["limit"] and "budget" not in result["omissions"]
     )
     service._authorize(db, context, scope=request["requested_scope"])
     verified = service.clock()

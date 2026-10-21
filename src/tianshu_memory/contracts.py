@@ -16,8 +16,8 @@ MANIFEST_SHA256 = "90697e6ecbb587d3db8c8e4682f7f8f43a8b1a98f70d8835c8282b03828d2
 PROFILE_MANIFEST_SHA256 = "757b243a25945a75d55dafab9da94828e79a009a0a77ce2aeb43039e4c2565c9"
 SOURCE_MANIFEST_SHA256 = "6d5c417c2e407aaf055151c1a3639d3b4e2ce4ad7da999f95273b6fcbf487370"
 SOURCE_BATCH_MANIFEST_SHA256 = "ac6f39d1f0afe55677fbbb0ce2da1b212d22c49f18917d8fe2ed613d424c4327"
-CONTEXT_MANIFEST_SHA256 = "d44a23ac674d5fd3f8e9325c80884dc1426305055b873be1da239f126056e570"
-HISTORY_MANIFEST_SHA256 = "3b535e58c34eedba5589e45cc11ce44468f312251eb719cedd66368fdda02a2d"
+CONTEXT_MANIFEST_SHA256 = "aaf25b4446c3915d48e46c6f0f687a26b57f30ac1c4494085266a586f67953e8"
+HISTORY_MANIFEST_SHA256 = "5db7d9223a8c9bb69dd8046355ed0bc0fff1f963290adf43566b529493624e6e"
 CONTENT_MANIFEST_SHA256 = "beecd2f75b09df089f7d20c10c1ba39cdaa79c5ba78b8db702ef5005129e9199"
 LIFE_MANIFEST_SHA256 = "ff7cbaf5bb9cf1330a11821c0e5f0eefb728a934e9fb8698c9b644e09f43042c"
 
@@ -289,7 +289,7 @@ class Contracts:
         manifest = json.loads(manifest_bytes)
         if (
             manifest["package"] != "memory-context/v1"
-            or manifest["version"] != "1.0.0"
+            or manifest["version"] != "1.1.0"
             or manifest["dependencies"]
             != {"text-dialogue": MANIFEST_SHA256, "source-sync": SOURCE_MANIFEST_SHA256}
         ):
@@ -320,7 +320,7 @@ class Contracts:
         manifest = json.loads(raw)
         if (
             manifest["package"] != "context-history/v1"
-            or manifest["version"] != "1.0.0"
+            or manifest["version"] != "1.1.0"
             or manifest["dependencies"] != {"memory-context/v1": CONTEXT_MANIFEST_SHA256}
         ):
             raise ValueError("Unsupported history contract")

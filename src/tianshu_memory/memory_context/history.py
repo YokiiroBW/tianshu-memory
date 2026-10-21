@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from ..domain import canonical, fingerprint, parse_time, require, utc
 from .migration import identity_version
-from .query import checks, verified_scopes
+from .scopes import checks, verified_scopes
 
 
 def metadata_key(scope):

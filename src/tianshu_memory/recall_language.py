@@ -89,6 +89,32 @@ def clean_query(value):
     return "".join(parts)
 
 
+def self_reference(value):
+    """Explicit possessives outside quoted speech, not every occurrence of '我'."""
+    unquoted = " ".join(re.split(r"""([“「《"'‘].*?[”」》"'’])""", clean_query(value))[::2])
+    return bool(
+        re.search(
+            r"我的|我家(?:的)?|我(?:这|那)(?:只|支|个|本|张|台|辆|件)|本人(?:的)?|\bmy\s+",
+            unquoted,
+            re.I,
+        )
+    )
+
+
+def named_reference(value, name):
+    """An exact sourced name in an explicit possessive; no alias/identity guessing."""
+    body = clean_query(lexical_question_text(value)).strip()
+    body = re.sub(
+        r"^(?:(?:请问|你还记得|还记得|记得|我想问|我忘了|我记不清|群里|关于)\s*)+", "", body
+    )
+    match = re.match(
+        re.escape(name) + r"(?=\s*(?:的|那(?:一)?只|这(?:一)?只|家(?:的)?|['’]s\b))",
+        body,
+        re.I,
+    )
+    return None if match is None else body[match.end() :].lstrip("的 ")
+
+
 def lexical_question_text(value):
     """Remove question scaffolding for lexical coverage, not subject parsing."""
     parts = re.split(r"""([“「《"'‘].*?[”」》"'’])""", value)
