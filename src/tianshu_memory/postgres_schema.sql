@@ -230,7 +230,7 @@ CREATE INDEX IF NOT EXISTS automatic_fact_identity ON automatic_facts(scope,fact
 
 CREATE TABLE IF NOT EXISTS automatic_evidence (
  group_id TEXT NOT NULL REFERENCES groups(id) DEFERRABLE INITIALLY IMMEDIATE, source_key TEXT NOT NULL REFERENCES sources(key) DEFERRABLE INITIALLY IMMEDIATE,
- quote TEXT NOT NULL, PRIMARY KEY(group_id,source_key,quote));
+ quote TEXT NOT NULL, source_text TEXT, PRIMARY KEY(group_id,source_key,quote));
 
 CREATE TABLE IF NOT EXISTS context_operations (
  service TEXT NOT NULL, scope TEXT NOT NULL, operation_id TEXT NOT NULL,

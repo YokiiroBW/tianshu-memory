@@ -442,11 +442,19 @@ class MemoryService:
                     self, db, scope, request["selection"], exact_kind, exact_value
                 )
             else:
+                from .fact_names import field_values
+
                 placeholders = ",".join("?" for _ in request["selection"])
-                exact_filter = f" AND {exact_kind}_key=?" if exact else ""
+                values = field_values(exact_kind, exact_value) if exact else ()
+                exact_filter = (
+                    f" AND {exact_kind}_key"
+                    + ("=?" if len(values) == 1 else " IN (" + ",".join("?" for _ in values) + ")")
+                    if exact
+                    else ""
+                )
                 parameters = [canonical(scope), *request["selection"]]
                 if exact:
-                    parameters.append(exact_value)
+                    parameters.extend(values)
                 groups = db.execute(
                     f"SELECT * FROM groups WHERE scope=? AND state='active' AND category IN ({placeholders}){exact_filter} ORDER BY id",
                     parameters,
@@ -455,7 +463,17 @@ class MemoryService:
                 from .recall_index import eligible_groups
 
                 eligible = eligible_groups(self, db, groups, scope)
-                fact_snapshot = snapshot_for_groups(db, eligible)
+                fact_snapshot = snapshot_for_groups(db, eligible, service=self)
+            if exact:
+                eligible = [
+                    entry
+                    for entry in eligible
+                    if (
+                        fact_snapshot.names.field_matches(entry[0], exact_kind, exact_value)
+                        if fact_snapshot is not None and fact_snapshot.names is not None
+                        else entry[0][exact_kind + "_key"] == exact_value
+                    )
+                ]
 
             from .automatic_facts import filter_current
 
@@ -477,6 +495,22 @@ class MemoryService:
             self._authorize(db, context, scope=scope)
             require(self._scope_version(db, scope) == version, "scope_changed", 409)
             self._verify_retrieval(db, ranked)
+            if (
+                fact_snapshot is not None
+                and fact_snapshot.names is not None
+                and any(group["id"] in fact_snapshot.names.entries for group, _, _ in ranked)
+            ):
+                from .fact_queries import snapshot_for_groups
+
+                fresh = snapshot_for_groups(db, ranked, service=self)
+                current = filter_current(
+                    db, ranked, request["query_text"], self.clock, fact_snapshot=fresh
+                )
+                require(
+                    {entry[0]["id"] for entry in current} == {entry[0]["id"] for entry in ranked},
+                    "scope_changed",
+                    409,
+                )
             response.update(self._fit_groups(ranked, request["budget"]))
             verified = self.clock()
             response.update(

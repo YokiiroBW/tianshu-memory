@@ -1,9 +1,8 @@
 """One parsed lexical query, reused across its authorized candidate groups."""
 
-import json
 import re
 
-from .domain import parse_time, query_terms, terms
+from .domain import query_terms, terms
 from .fact_migration import installed
 from .recall_constraints import Constraints
 from .recall_language import (
@@ -83,41 +82,57 @@ class LexicalQuery:
 def named_owner(service, db, candidates, query, *, complete, fact_snapshot=None):
     """Resolve relevance only inside already authorized original group candidates.
 
-    A current exact identity.name supplies the connection, including evidence-category
-    records. Its complete original group must travel with any selected target group.
+    A current source-proven canonical name supplies the connection, including
+    legacy predicates and evidence-category records. Its complete original group
+    must travel with any selected target group.
     A truncated window cannot establish uniqueness, even if its prefix has one match.
     """
     if not (installed(db) if fact_snapshot is None else fact_snapshot.installed):
         return candidates, [], query
-    matches = []
+    from .automatic_facts import normalize
+    from .fact_names import candidate
+    from .fact_queries import snapshot_for_groups
+
+    if fact_snapshot is None or fact_snapshot.names is None:
+        fact_snapshot = snapshot_for_groups(
+            db, candidates, service=service, domain_complete=complete
+        )
+    names = fact_snapshot.names
+    current_names = names.current(service.clock, normalize)
+    matches, uncertain = [], set()
     for entry in candidates:
         identity = entry[0]["id"]
-        row = (
-            db.execute(
-                "SELECT payload,superseded_by FROM automatic_facts WHERE group_id=?", (identity,)
-            ).fetchone()
-            if fact_snapshot is None
-            else fact_snapshot.rows.get(identity)
-        )
-        if row is None or row["superseded_by"]:
+        name = names.entries.get(identity)
+        if name is None:
+            row, fact = fact_snapshot.rows.get(identity), fact_snapshot.decoded.get(identity)
+            if (
+                row is not None
+                and fact is not None
+                and row["scope"] == entry[0]["scope"]
+                and len(entry[2]) == 1
+                and candidate(fact)
+                and named_reference(query, fact["value"].strip()) is not None
+            ):
+                uncertain.add(entry[0]["scope"])
+        if name is None or identity not in current_names:
             continue
-        fact = (
-            json.loads(row["payload"]) if fact_snapshot is None else fact_snapshot.decoded[identity]
-        )
-        if (
-            fact["key"] != "identity.name"
-            or fact["state"] != "current"
-            or (fact["valid_from"] and parse_time(fact["valid_from"]) > service.clock())
-            or (fact["valid_to"] and parse_time(fact["valid_to"]) <= service.clock())
-        ):
-            continue
+        fact = name.fact
         remaining = named_reference(query, fact["value"].strip())
         if remaining is not None:
             matches.append((entry, remaining))
     if not matches:
+        # A visible sourced name is not a current unique connection when its
+        # family/window is incomplete, conflicted, expired or not yet effective.
+        # Do not silently turn that explicit name question into ordinary group
+        # recall merely because the current-name set is empty.
+        if uncertain or any(
+            named_reference(query, entry.fact["value"].strip()) is not None
+            for entry in names.entries.values()
+        ):
+            return [], [], query
         return candidates, [], query
     owners = {entry[0]["scope"] for entry, _ in matches}
-    if not complete or len(owners) != 1:
+    if not complete or len(owners) != 1 or uncertain - owners:
         return [], [], query
     witness, remaining = matches[0]
     return (

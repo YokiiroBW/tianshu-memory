@@ -352,7 +352,7 @@ def prepare(db, source, *, files, recovery_path, state_directory, epoch):
             "local_users_schema": "1",
             "observation_schema": "1",
             "observation_instance": uuid4().hex,
-            "automatic_fact_schema": "1",
+            "automatic_fact_schema": "2",
             "memory_context_schema": "1",
             "qq_alias_schema": "1",
             "relationships_schema": "1",

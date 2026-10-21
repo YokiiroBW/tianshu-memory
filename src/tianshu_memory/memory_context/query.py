@@ -89,10 +89,6 @@ def execute(application, request, context):
             candidates, complete = group_candidates(service, db, scope, owners=owners)
             authorized_group_ids = frozenset(entry[0]["id"] for entry in candidates)
             result["coverage"]["complete"] &= complete
-            if exact:
-                candidates = [
-                    entry for entry in candidates if entry[0][exact_kind + "_key"] == exact_value
-                ]
         for selected_scope, _, _ in [] if shared else scopes:
             parameters = [canonical(selected_scope), *request["selection"]]
             predicates = [
@@ -101,8 +97,14 @@ def execute(application, request, context):
                 "g.category IN (" + ",".join("?" for _ in request["selection"]) + ")",
             ]
             if exact:
-                predicates.append(f"g.{exact_kind}_key=?")
-                parameters.append(exact_value)
+                from ..fact_names import field_values
+
+                values = field_values(exact_kind, exact_value)
+                predicates.append(
+                    f"g.{exact_kind}_key"
+                    + ("=?" if len(values) == 1 else " IN (" + ",".join("?" for _ in values) + ")")
+                )
+                parameters.extend(values)
             elif settings is None or settings["mode"] == "keyword":
                 query_sql, query_parameters = keyword_candidates(
                     canonical(selected_scope), request["query_text"], search_terms
@@ -146,7 +148,24 @@ def execute(application, request, context):
         from ..automatic_facts import filter_current
         from ..fact_queries import snapshot_for_groups
 
-        fact_snapshot = snapshot_for_groups(db, candidates)
+        fact_snapshot = snapshot_for_groups(
+            db,
+            candidates,
+            service=service,
+            domain_complete=result["coverage"]["complete"] if shared else None,
+        )
+        if fact_snapshot is not None and fact_snapshot.names is not None:
+            result["coverage"]["complete"] &= not fact_snapshot.names.incomplete
+        if exact:
+            candidates = [
+                entry
+                for entry in candidates
+                if (
+                    fact_snapshot.names.field_matches(entry[0], exact_kind, exact_value)
+                    if fact_snapshot is not None and fact_snapshot.names is not None
+                    else entry[0][exact_kind + "_key"] == exact_value
+                )
+            ]
         if shared and not exact and not self_reference(ranking_query):
             candidates, witnesses, ranking_query = named_owner(
                 service,
@@ -220,7 +239,9 @@ def execute(application, request, context):
             # Reuse the same bounded authorized domain to reprove both this witness
             # and uniqueness against all other owners, not just the returned owner.
             fresh, complete = group_candidates(service, db, scope)
-            fresh_snapshot = snapshot_for_groups(db, fresh)
+            fresh_snapshot = snapshot_for_groups(
+                db, fresh, service=service, domain_complete=complete
+            )
             _, current_witnesses, current_query = named_owner(
                 service,
                 db,

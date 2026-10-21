@@ -2,6 +2,7 @@
 
 import json
 
+from .fact_names import KEY, KEYS
 from .fact_queries import families as read_families
 from .recall_language import topic_tokens
 
@@ -14,20 +15,27 @@ def expand_candidates(query_sql, parameters, scope):
     # relation, with the exact same owner scope and property/entity identity.
     return (
         "WITH RECURSIVE matched(group_id) AS (" + query_sql + "), "
+        "name_family(group_id) AS (SELECT n.group_id FROM automatic_facts n "
+        "JOIN automatic_facts m ON m.scope=n.scope JOIN matched hit ON hit.group_id=m.group_id "
+        "WHERE n.scope=? AND m.fact_key IN (?,?,?,?) AND n.fact_key IN (?,?,?,?)), "
         "fact_chain(group_id,scope,fact_key,depth) AS ("
         "SELECT f.group_id,f.scope,f.fact_key,0 FROM automatic_facts f "
         "JOIN matched m ON m.group_id=f.group_id WHERE f.scope=? UNION ALL "
         "SELECT n.group_id,n.scope,n.fact_key,c.depth+1 FROM fact_chain c "
         "JOIN automatic_facts p ON p.group_id=c.group_id "
         "JOIN automatic_facts n ON n.group_id=p.superseded_by "
-        "AND n.scope=c.scope AND n.fact_key=c.fact_key "
+        "AND n.scope=c.scope AND (n.fact_key=c.fact_key OR "
+        "(n.fact_key IN (?,?,?,?) AND c.fact_key IN (?,?,?,?))) "
         f"WHERE c.depth<{MAX_DEPTH}) "
-        "SELECT group_id FROM matched UNION SELECT group_id FROM fact_chain",
-        [*parameters, scope],
+        "SELECT group_id FROM matched UNION SELECT group_id FROM fact_chain "
+        "UNION SELECT group_id FROM name_family",
+        [*parameters, scope, *KEYS, *KEYS, scope, *KEYS, *KEYS],
     )
 
 
-def reference_terms(service, db, eligible, indexed, *, facts=None, authorized_group_ids=None):
+def reference_terms(
+    service, db, eligible, indexed, *, facts=None, authorized_group_ids=None, names=None
+):
     """Validate old groups before any of their tokens affect current ranking.
 
     The caller has already verified the current scope and eligible output units.
@@ -38,7 +46,10 @@ def reference_terms(service, db, eligible, indexed, *, facts=None, authorized_gr
         read_families(
             db,
             {
-                (fact["scope"], fact["fact_key"])
+                (
+                    fact["scope"],
+                    KEY if names is not None and group["id"] in names.entries else fact["fact_key"],
+                )
                 for group, _, _ in eligible
                 if (fact := facts.get(group["id"])) is not None
                 and fact["superseded_by"] is None
@@ -50,8 +61,8 @@ def reference_terms(service, db, eligible, indexed, *, facts=None, authorized_gr
         else None
     )
 
-    def valid_terms(group_id, scope):
-        key = group_id, scope
+    def valid_terms(group_id, scope, name_family):
+        key = group_id, scope, name_family
         if key in checked:
             return checked[key]
         checked[key] = None
@@ -59,6 +70,20 @@ def reference_terms(service, db, eligible, indexed, *, facts=None, authorized_gr
         # lineage passed this operation's viewer/source barrier and bounded window.
         if authorized_group_ids is not None and group_id not in authorized_group_ids:
             return None
+        if name_family and (names is None or group_id not in names.entries):
+            return None
+        if name_family:
+            # The name view already contains the freshly approved original whole
+            # group. Reuse it instead of re-reading each historical name's body,
+            # sources and projection in a per-group SQL loop.
+            entry = names.entries[group_id]
+            unit = entry.unit
+            record = unit["record_id"], unit["record_version"]
+            if entry.group["scope"] != scope or record not in indexed:
+                return None
+            value = indexed[record] + " " + " ".join(topic_tokens(unit["statement"]))
+            checked[key] = value
+            return value
         group = db.execute("SELECT * FROM groups WHERE id=?", (group_id,)).fetchone()
         if (
             not group
@@ -97,12 +122,15 @@ def reference_terms(service, db, eligible, indexed, *, facts=None, authorized_gr
         )
         if fact is None or fact["superseded_by"] is not None or fact["scope"] != group["scope"]:
             continue
-        key = fact["scope"], fact["fact_key"]
+        name_family = names is not None and group["id"] in names.entries
+        key = fact["scope"], KEY if name_family else fact["fact_key"]
         if key not in families:
             rows = (
                 db.execute(
-                    "SELECT group_id,superseded_by FROM automatic_facts WHERE scope=? AND fact_key=? LIMIT ?",
-                    (*key, MAX_FAMILY + 1),
+                    "SELECT group_id,superseded_by FROM automatic_facts WHERE scope=? AND fact_key "
+                    + ("IN (?,?,?,?)" if name_family else "=?")
+                    + " LIMIT ?",
+                    [key[0], *(KEYS if name_family else [key[1]]), MAX_FAMILY + 1],
                 ).fetchall()
                 if family_rows is None
                 else family_rows.get(key, [])
@@ -121,7 +149,7 @@ def reference_terms(service, db, eligible, indexed, *, facts=None, authorized_gr
                 if old in seen:
                     continue
                 seen.add(old)
-                value = valid_terms(old, group["scope"])
+                value = valid_terms(old, group["scope"], name_family)
                 if value is not None:
                     hints.append(value)
                     stack.append((old, depth + 1))

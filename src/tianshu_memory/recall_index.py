@@ -81,13 +81,21 @@ def exact_groups(service, db, scope, selection, kind, value):
     if service.source_authority is None:
         raise Fault("dependency_unavailable", 503)
     scope_key = canonical(scope)
+    from .fact_names import field_values
+
     placeholders = ",".join("?" for _ in selection)
     field = {"field": "field_key", "item": "item_key"}[kind]
+    values = field_values(kind, value)
+    predicate = field + (
+        "=?" if len(values) == 1 else " IN (" + ",".join("?" for _ in values) + ")"
+    )
     rows = db.native(
         "WITH candidates AS MATERIALIZED ("
         "SELECT * FROM groups WHERE scope=? AND state='active' AND category IN ("
         + placeholders
-        + f") AND {field}=?),"
+        + ") AND "
+        + predicate
+        + "),"
         "candidate_count AS MATERIALIZED (SELECT count(*) AS total FROM candidates),"
         "lineage_rows AS MATERIALIZED ("
         "SELECT l.group_id,l.revision AS required_revision,l.epoch AS required_epoch,"
@@ -100,7 +108,7 @@ def exact_groups(service, db, scope, selection, kind, value):
         "l.revision AS exact_revision,l.epoch AS exact_epoch "
         "FROM candidates g CROSS JOIN candidate_count n "
         "LEFT JOIN lineage_rows l ON l.group_id=g.id ORDER BY g.id",
-        [scope_key, *selection, value, GROUP_READ_BATCH],
+        [scope_key, *selection, *values, GROUP_READ_BATCH],
     ).fetchall()
     groups, lineage = [], defaultdict(list)
     group_fields = ("id", "scope", "state", "members", "category", "field_key", "item_key")
@@ -114,12 +122,12 @@ def exact_groups(service, db, scope, selection, kind, value):
         # The oversized metadata query emits no lineage rows. Retain the original
         # 512-group reads and complete candidate set, with no LIMIT/truncation.
         eligible = eligible_groups(service, db, groups, scope)
-        return eligible, snapshot_for_groups(db, eligible)
+        return eligible, snapshot_for_groups(db, eligible, service=service)
 
     current = _current_groups(service, db, [group["id"] for group in groups], lineage)
     selected = [group["id"] for group in groups if group["id"] in current]
     if not selected:
-        return [], snapshot_for_groups(db, [])
+        return [], snapshot_for_groups(db, [], service=service)
     # Never queue record bodies before current_many/current has accepted every
     # source in the group. This batch contains no admission or suppression reads.
     record_rows, marker_rows = db.read_batch(
@@ -142,7 +150,7 @@ def exact_groups(service, db, scope, selection, kind, value):
         if group["id"] in current
     }
     marker = marker_rows.fetchone()
-    fact_installed = marker is not None and marker[0] == "1"
+    fact_installed = marker is not None and marker[0] in {"1", "2"}
     projection_queries = list(_projection_queries(units))
     valid_keys = [key for key, value in units.items() if value is not None]
     requests = projection_queries + (list(group_queries(valid_keys)) if fact_installed else [])
@@ -166,7 +174,9 @@ def exact_groups(service, db, scope, selection, kind, value):
         if row["group_id"] in valid_keys
     }
     return eligible, (
-        FactSnapshot.from_rows(facts) if fact_installed else FactSnapshot(False, {}, {})
+        FactSnapshot.from_rows(facts, service=service, db=db, candidates=eligible)
+        if fact_installed
+        else FactSnapshot(False, {}, {})
     )
 
 
@@ -262,7 +272,13 @@ def rank_groups(
     )
     references = (
         reference_terms(
-            service, db, eligible, indexed, facts=facts, authorized_group_ids=authorized_group_ids
+            service,
+            db,
+            eligible,
+            indexed,
+            facts=facts,
+            authorized_group_ids=authorized_group_ids,
+            names=None if fact_snapshot is None else fact_snapshot.names,
         )
         if facts_installed and not history_query(query)
         else {}

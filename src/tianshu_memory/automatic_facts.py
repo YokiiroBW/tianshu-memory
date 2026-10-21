@@ -8,10 +8,10 @@ import json
 import re
 import unicodedata
 
-from . import fact_entities
+from . import fact_entities, fact_names
 from .domain import canonical, fingerprint, parse_time, require
-from .fact_migration import installed
-from .fact_queries import for_groups
+from .fact_migration import installed, source_text_installed
+from .fact_queries import for_groups, snapshot_for_groups
 from .fact_updates import may_replace
 
 FIELDS = {"key", "value", "state", "valid_from", "valid_to", "keywords"}
@@ -63,30 +63,42 @@ def validate(value):
 def known(service, db, scope):
     if not installed(db):
         return []
-    result = []
-    for row in db.execute(
-        "SELECT * FROM automatic_facts WHERE scope=? ORDER BY observed_at DESC LIMIT 128",
+    from .recall_index import eligible_groups
+
+    groups = db.execute(
+        "SELECT g.* FROM automatic_facts f JOIN groups g ON g.id=f.group_id "
+        "WHERE f.scope=? ORDER BY f.observed_at DESC LIMIT 128",
         (canonical(scope),),
-    ).fetchall():
-        if service._group_current(db, row["group_id"]):
-            value = json.loads(row["payload"])
-            record = db.execute(
-                "SELECT payload FROM records WHERE group_id=? AND state='active'",
-                (row["group_id"],),
-            ).fetchone()
-            if record is None:
-                continue
-            unit = json.loads(record[0])
-            result.append(
-                dict(
-                    value,
-                    statement=unit["statement"],
-                    conditions=unit["conditions"],
-                    negations=unit["negations"],
-                    group_id=row["group_id"],
-                    superseded=row["superseded_by"] is not None,
-                )
+    ).fetchall()
+    approved = eligible_groups(service, db, groups, scope)
+    snapshot = snapshot_for_groups(db, approved, service=service)
+    current_names = snapshot.names.current(service.clock, normalize)
+    result = []
+    for group, _, units in approved:
+        identity = group["id"]
+        row, value = snapshot.rows[identity], snapshot.decoded[identity]
+        name = snapshot.names.entries.get(identity)
+        if value["key"] == fact_names.KEY and name is None:
+            continue
+        if name is not None:
+            value = name.fact
+        unit = units[0]
+        applicable = (
+            value["state"] == "current"
+            and (not value["valid_from"] or parse_time(value["valid_from"]) <= service.clock())
+            and (not value["valid_to"] or parse_time(value["valid_to"]) > service.clock())
+        )
+        result.append(
+            dict(
+                value,
+                statement=unit["statement"],
+                conditions=unit["conditions"],
+                negations=unit["negations"],
+                group_id=identity,
+                superseded=row["superseded_by"] is not None
+                or (name is not None and applicable and identity not in current_names),
             )
+        )
     # The material is untrusted matching context, not new evidence or permission.
     while len(canonical(result).encode()) > 32768:
         result.pop()
@@ -139,6 +151,15 @@ def _supersede(writer, db, scope, group_id, successor, effective, fact):
         _replace_unit(writer, db, record, value, scope, "automatic." + fact["key"], None)
 
 
+def _prior_unit(db, identity, names):
+    if names is not None:
+        return names.entries[identity].unit
+    row = db.execute(
+        "SELECT payload FROM records WHERE group_id=? AND state='active'", (identity,)
+    ).fetchone()
+    return json.loads(row[0]) if row is not None else None
+
+
 def commit(writer, db, draft, event, source_map):
     """Merge a semantic duplicate or append an auditable fact, never a bare DB injection."""
     require(installed(db), "dependency_unavailable", 503)
@@ -146,19 +167,41 @@ def commit(writer, db, draft, event, source_map):
     fact = validate(draft["fact"])
     require(len(draft["units"]) == 1, "invalid_input", 400)
     unit = draft["units"][0]
+    names = None
+    if fact_names.candidate(fact):
+        require(source_text_installed(db), "dependency_unavailable", 503)
+        require(
+            fact["key"] == fact_names.KEY and fact_names.grounded(fact, unit, draft["quotes"]),
+            "invalid_input",
+            400,
+        )
+        names = fact_names.family(service, db, draft["scope"])
+        require(not names.incomplete, "invalid_input", 400)
     value_key = _semantic(fact, unit)
     scope = canonical(draft["scope"])
     fact = fact_entities.resolve(service, db, scope, fact, draft["quotes"])
     identity_key = fact_entities.fact_key(fact)
     observed = draft["observed_at"]
     require(parse_time(observed).tzinfo is not None, "invalid_input", 400)
-    existing = db.execute(
-        "SELECT f.*,g.members FROM automatic_facts f JOIN groups g ON g.id=f.group_id "
-        "WHERE f.scope=? AND f.fact_key=? AND f.value_key=? AND g.state='active' "
-        "AND f.superseded_by IS NULL ORDER BY f.observed_at DESC",
-        (scope, identity_key, value_key),
-    ).fetchall()
-    duplicate = next((r for r in existing if service._group_current(db, r["group_id"])), None)
+    existing = (
+        db.execute(
+            "SELECT f.*,g.members FROM automatic_facts f JOIN groups g ON g.id=f.group_id "
+            "WHERE f.scope=? AND f.fact_key=? AND f.value_key=? AND g.state='active' "
+            "AND f.superseded_by IS NULL ORDER BY f.observed_at DESC",
+            (scope, identity_key, value_key),
+        ).fetchall()
+        if names is None
+        else [
+            dict(entry.row, members=entry.group["members"])
+            for entry in names.entries.values()
+            if entry.row["value_key"] == value_key and entry.row["superseded_by"] is None
+        ]
+    )
+    existing = sorted(existing, key=lambda row: parse_time(row["observed_at"]), reverse=True)
+    duplicate = next(
+        (r for r in existing if names is not None or service._group_current(db, r["group_id"])),
+        None,
+    )
     if (
         duplicate is None
         and fact["state"] == "current"
@@ -167,30 +210,39 @@ def commit(writer, db, draft, event, source_map):
     ):
         # A new undated confirmation may reinforce an explicitly dated current fact.
         # Retain that original interval and its evidence instead of erasing or splitting it.
-        for prior_row in db.execute(
-            "SELECT f.*,g.members FROM automatic_facts f JOIN groups g ON g.id=f.group_id "
-            "WHERE f.scope=? AND f.fact_key=? AND g.state='active' AND f.superseded_by IS NULL "
-            "ORDER BY f.observed_at DESC",
-            (scope, identity_key),
-        ).fetchall():
-            prior = json.loads(prior_row["payload"])
+        prior_rows = (
+            db.execute(
+                "SELECT f.*,g.members FROM automatic_facts f JOIN groups g ON g.id=f.group_id "
+                "WHERE f.scope=? AND f.fact_key=? AND g.state='active' AND f.superseded_by IS NULL "
+                "ORDER BY f.observed_at DESC",
+                (scope, identity_key),
+            ).fetchall()
+            if names is None
+            else [
+                dict(entry.row, members=entry.group["members"])
+                for entry in names.entries.values()
+                if entry.row["superseded_by"] is None
+            ]
+        )
+        for prior_row in sorted(
+            prior_rows, key=lambda row: parse_time(row["observed_at"]), reverse=True
+        ):
+            prior = (
+                json.loads(prior_row["payload"])
+                if names is None
+                else names.entries[prior_row["group_id"]].fact
+            )
             if (
                 prior["state"] != "current"
                 or (prior["valid_from"] and parse_time(prior["valid_from"]) > service.clock())
                 or (prior["valid_to"] and parse_time(prior["valid_to"]) <= service.clock())
-                or not service._group_current(db, prior_row["group_id"])
+                or (names is None and not service._group_current(db, prior_row["group_id"]))
             ):
                 continue
-            prior_record = db.execute(
-                "SELECT payload FROM records WHERE group_id=? AND state='active'",
-                (prior_row["group_id"],),
-            ).fetchone()
+            prior_unit = _prior_unit(db, prior_row["group_id"], names)
             if (
-                prior_record
-                and _semantic(
-                    dict(prior, valid_from=None, valid_to=None), json.loads(prior_record[0])
-                )
-                == value_key
+                prior_unit
+                and _semantic(dict(prior, valid_from=None, valid_to=None), prior_unit) == value_key
             ):
                 duplicate = prior_row
                 break
@@ -231,10 +283,17 @@ def commit(writer, db, draft, event, source_map):
         )
     for quote in draft["quotes"]:
         require(quote["source_key"] in source_map, "invalid_input", 400)
-        db.execute(
-            "INSERT OR IGNORE INTO automatic_evidence VALUES (?,?,?)",
-            (group_id, quote["source_key"], quote["quote"]),
-        )
+        if names is None:
+            db.execute(
+                "INSERT OR IGNORE INTO automatic_evidence(group_id,source_key,quote) VALUES (?,?,?)",
+                (group_id, quote["source_key"], quote["quote"]),
+            )
+        else:
+            db.execute(
+                "INSERT OR IGNORE INTO automatic_evidence(group_id,source_key,quote,source_text) "
+                "VALUES (?,?,?,?)",
+                (group_id, quote["source_key"], quote["quote"], quote["source_text"]),
+            )
     if duplicate:
         _replace_unit(writer, db, row, saved, draft["scope"], draft["field_key"], draft["item_key"])
     else:
@@ -249,7 +308,7 @@ def commit(writer, db, draft, event, source_map):
             )
     # A past report cannot supersede the current value. A future-effective fact waits for its date.
     if duplicate:
-        fact, unit = merged, saved
+        fact, unit = (dict(merged, key=fact_names.KEY) if names is not None else merged), saved
         observed = max(observed, duplicate["observed_at"], key=parse_time)
     effective = fact["valid_from"] or observed
     if (
@@ -257,27 +316,34 @@ def commit(writer, db, draft, event, source_map):
         and parse_time(effective) <= service.clock()
         and (fact["valid_to"] is None or parse_time(fact["valid_to"]) > service.clock())
     ):
-        previous = db.execute(
-            "SELECT * FROM automatic_facts WHERE scope=? AND fact_key=? "
-            "AND group_id!=? AND superseded_by IS NULL",
-            (scope, identity_key, group_id),
-        ).fetchall()
+        previous = (
+            db.execute(
+                "SELECT * FROM automatic_facts WHERE scope=? AND fact_key=? "
+                "AND group_id!=? AND superseded_by IS NULL",
+                (scope, identity_key, group_id),
+            ).fetchall()
+            if names is None
+            else [
+                entry.row
+                for entry in names.entries.values()
+                if entry.row["group_id"] != group_id and entry.row["superseded_by"] is None
+            ]
+        )
         eligible = []
         for old in previous:
-            prior = json.loads(old["payload"])
+            prior = (
+                json.loads(old["payload"]) if names is None else names.entries[old["group_id"]].fact
+            )
             if (
                 prior["state"] != "current"
                 or parse_time(prior["valid_from"] or old["observed_at"]) > service.clock()
                 or (prior["valid_to"] and parse_time(prior["valid_to"]) <= service.clock())
-                or not service._group_current(db, old["group_id"])
+                or (names is None and not service._group_current(db, old["group_id"]))
             ):
                 continue
-            prior_record = db.execute(
-                "SELECT payload FROM records WHERE group_id=? AND state='active'",
-                (old["group_id"],),
-            ).fetchone()
-            if prior_record:
-                eligible.append((old, prior, json.loads(prior_record[0])))
+            prior_unit = _prior_unit(db, old["group_id"], names)
+            if prior_unit:
+                eligible.append((old, prior, prior_unit))
         # A queued older proposal is evidence of the past, even if it finishes last.
         # Decide this before retiring any previously current group.
         newer = [
@@ -346,6 +412,8 @@ def filter_current(db, candidates, query, clock, *, fact_snapshot=None):
     history = history_query(query)
     facts = for_groups(db, candidates) if fact_snapshot is None else fact_snapshot.rows
     decoded = None if fact_snapshot is None else fact_snapshot.decoded
+    names = None if fact_snapshot is None else fact_snapshot.names
+    current_names = names.current(clock, normalize) if names is not None else set()
     result = []
     for entry in candidates:
         row = (
@@ -358,6 +426,12 @@ def filter_current(db, candidates, query, clock, *, fact_snapshot=None):
         )
         if row:
             fact = json.loads(row["payload"]) if decoded is None else decoded[entry[0]["id"]]
+            if names is not None:
+                name = names.entries.get(entry[0]["id"])
+                if (fact["key"] == fact_names.KEY and name is None) or (
+                    name is not None and not history and entry[0]["id"] not in current_names
+                ):
+                    continue
             if row["superseded_by"] and not history:
                 continue
             if fact["valid_from"] and parse_time(fact["valid_from"]) > clock():

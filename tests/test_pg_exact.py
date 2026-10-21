@@ -252,7 +252,7 @@ def test_incomplete_groups_and_projections_are_omitted_before_bad_fact_json(h, m
         assert actual[1].installed and actual[1].rows == actual[1].decoded == {}
 
 
-@pytest.mark.parametrize("marker", [None, "0", "2"])
+@pytest.mark.parametrize("marker", [None, "0", "3"])
 def test_disabled_fact_schema_never_touches_the_missing_fact_table(h, monkeypatch, marker):
     h.seed()
     with h.store.transaction() as db:
