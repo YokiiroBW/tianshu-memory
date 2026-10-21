@@ -143,6 +143,9 @@ def test_native_pg_bump_rereads_after_dml_and_rollback():
             remote.native("INSERT INTO scopes VALUES (?,7)", (canonical(SCOPE),))
             history = '{"scope_version":7,"history_version":3,"source_history_version":4}'
             remote.native("INSERT INTO metadata VALUES (?,?)", (metadata_key(SCOPE), history))
+            # The wrapper opens an implicit write transaction even though the
+            # raw driver is autocommit. Keep the seed outside both rollbacks.
+            remote.commit()
             for _ in range(2):
                 remote.native("BEGIN")
                 check_bump_freshness_and_rollback(remote)
