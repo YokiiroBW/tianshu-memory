@@ -17,6 +17,7 @@ def eligible_groups(service, db, groups, scope, *, scopes_by_group=None):
         raise Fault("dependency_unavailable", 503)
     if not groups:
         return []
+    scope_key = canonical(scope) if scopes_by_group is None else None
     if not is_postgres(db):
         # Local SQLite keeps its inexpensive, lazy reads. In particular, a revoked
         # source must short-circuit before any record payload/projection is read.
@@ -28,7 +29,8 @@ def eligible_groups(service, db, groups, scope, *, scopes_by_group=None):
                 "SELECT * FROM records WHERE group_id=? ORDER BY id", (group["id"],)
             ).fetchall()
             owner = scope if scopes_by_group is None else scopes_by_group[group["id"]]
-            units = _units(group, rows, owner, canonical(owner))
+            owner_key = scope_key if scopes_by_group is None else canonical(owner)
+            units = _units(group, rows, owner, owner_key)
             if units is not None and service._projections_current(db, units):
                 result.append((group, rows, units))
         return result
@@ -59,7 +61,8 @@ def eligible_groups(service, db, groups, scope, *, scopes_by_group=None):
         for group in batch:
             if group["id"] in current:
                 owner = scope if scopes_by_group is None else scopes_by_group[group["id"]]
-                units[group["id"]] = _units(group, records[group["id"]], owner, canonical(owner))
+                owner_key = scope_key if scopes_by_group is None else canonical(owner)
+                units[group["id"]] = _units(group, records[group["id"]], owner, owner_key)
         projections = {}
         for sql, parameters in _projection_queries(units):
             for row in db.execute(sql, parameters):
