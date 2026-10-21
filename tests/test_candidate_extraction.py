@@ -1,6 +1,7 @@
 """Real Memory and TLS source owners with explicitly synthetic source/model content."""
 
 import copy
+import json
 from contextlib import contextmanager
 
 import pytest
@@ -221,3 +222,50 @@ def test_existing_consume_grant_does_not_authorize_another_actor(sync):
     sync.save()
     assert sync.post(PATH, dict(job_id=job, output=None)).status_code == 403
     assert sync.post(PATH, dict(job_id=job, output=output())).status_code == 403
+
+
+@pytest.mark.parametrize("lookup", [False, True])
+def test_completed_job_wins_when_an_older_request_commits_during_content(sync, monkeypatch, lookup):
+    from test_automatic_facts import initialize
+
+    from tianshu_memory.candidate_extraction import CandidateExtraction
+
+    initialize(sync)
+    job = prepare(sync)
+    extractor = CandidateExtraction(sync.service)
+    with sync.store.transaction() as db:
+        event = json.loads(db.execute("SELECT event FROM jobs WHERE id=?", (job,)).fetchone()[0])
+    # The older request has already validated its own exact output, but its
+    # transaction/ack has not completed when the receipt returns pending.
+    drafts = extractor._drafts(event, extractor._content(event), output())
+    assert sync.post(PATH, dict(job_id=job, output=None)).json()["state"] == "pending"
+    original_content = CandidateExtraction._content
+    completed = []
+
+    def finish_old_request_before_content(current, current_event):
+        completed.append(
+            TrustedWorkflow(current.service).commit_extracted(dict(job_id=job, drafts=drafts))
+        )
+        content = original_content(current, current_event)
+        # Context applications mask already-consumed source content. Without a
+        # fresh ledger read this used to return rejected or misleading pending.
+        assert all(source["text"] == "" for source in content)
+        return content
+
+    monkeypatch.setattr(CandidateExtraction, "_content", finish_old_request_before_content)
+    response = sync.post(PATH, dict(job_id=job, output=None if lookup else output()))
+    assert response.status_code == 200, response.text
+    assert response.json() == dict(state="completed", result=completed[0], content=[])
+    assert completed[0]["state"] == "committed"
+    assert len(completed) == 1
+    with sync.store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 1
+        assert (
+            db.execute("SELECT COUNT(*) FROM write_ledger WHERE job_id=?", (job,)).fetchone()[0]
+            == 1
+        )
+    assert sync.post(PATH, dict(job_id=job, output=None)).json() == response.json()
+    # Receipt ownership still comes from the ordinary publisher boundary.
+    sync.config["callers"]["companion"]["event_scopes"] = [sync.scope(1)]
+    sync.save()
+    assert sync.post(PATH, dict(job_id=job, output=None)).status_code == 403
