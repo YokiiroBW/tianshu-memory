@@ -110,6 +110,49 @@ def self_reference(entity, quotes):
     return anchor(dict(entity, mention=match[1])) if match else None
 
 
+def grounded_color(entity, quotes):
+    """A neighboring named cup may ground a literal color-only list subject."""
+    color = re.fullmatch(r"([红蓝绿黑白黄紫棕灰橙])色?的", normalize_mention(entity["mention"]))
+    if entity["kind"] != "cup" or not color:
+        return None
+    cup = (
+        r"(?:我的|我家(?:的)?|本人的)?"
+        r"(?:第[一二三四五六七八九十百零两0-9]+(?:只|个)?)?"
+        r"[红蓝绿黑白黄紫棕灰橙](?:色)?(?:的)?"
+        r"(?:玻璃|陶瓷|不锈钢|塑料)?(?:水杯|杯子)"
+    )
+    naming = (
+        r"(?:(?:现在|目前|后来)?(?:改叫|叫|名叫|叫作|名字是|名称是)|还是|仍(?:然)?叫|依(?:然|旧)叫)"
+    )
+    value = r"[^，,。！？!?；;：:\r\n]{1,80}"
+    pattern = cup + naming + value + r"[，,]\s*" + re.escape(entity["mention"]) + naming + value
+    if any(re.fullmatch(pattern + r"[。.]?", proof["quote"].strip()) for proof in quotes):
+        return color[1]
+    return None
+
+
+def color_matches(entity, color):
+    """Return possible and grounded matches without guessing an unfamiliar descriptor."""
+    if entity["kind"] != "cup":
+        return False, False
+    label = normalize_mention(entity["mention"])
+    noun = re.search(r"(?:水杯|杯子)$", label)
+    if noun is None:
+        return False, False
+    descriptor = label[: noun.start()]
+    if re.search(r"水杯|杯子|[，,。！？!?；;：:\"“”「」《》]", descriptor):
+        return False, False
+    # Explicit 色 also covers an unfamiliar material/finish or qualifier order;
+    # excluding it would make two same-color cups look falsely unique.
+    grounded = bool(
+        re.search(re.escape(color) + r"色", descriptor)
+        or re.search(re.escape(color) + r"的?(?:玻璃|陶瓷|不锈钢|塑料)?$", descriptor)
+    )
+    # An unknown bare descriptor can hide a second same-color object. Count it
+    # as a possible conflict, but '红茶杯子' alone cannot ground the color red.
+    return color in descriptor, grounded
+
+
 def compatible(left, right):
     if left == right:
         return True
@@ -167,17 +210,30 @@ def resolve(service, db, scope, fact, quotes):
     )
     requested = anchor(entity)
     reference = self_reference(entity, quotes)
+    elliptical = re.fullmatch(r"[红蓝绿黑白黄紫棕灰橙]色?的", normalize_mention(entity["mention"]))
+    color = grounded_color(entity, quotes) if elliptical else None
+    require(not elliptical or color is not None, "invalid_input", 400)
 
-    def matches_label(label):
+    def matches_label(prior):
+        label = anchor(prior)
         return compatible(requested, label) or bool(
             reference and reference[0] == label[0] and label[1].endswith(reference[1])
         )
 
-    matches = set()
+    matches, grounded = set(), set()
     for row in db.execute("SELECT group_id,payload FROM automatic_facts WHERE scope=?", (scope,)):
         prior = json.loads(row["payload"]).get("entity")
-        if prior and matches_label(anchor(prior)) and service._group_current(db, row["group_id"]):
+        if not prior:
+            continue
+        possible, supported = (
+            color_matches(prior, color) if elliptical else (matches_label(prior), True)
+        )
+        if possible and service._group_current(db, row["group_id"]):
             matches.add(prior["id"])
+            if supported:
+                grounded.add(prior["id"])
+    # A grounded color ellipse may reuse an object, never create a nounless one.
+    require(not elliptical or (len(matches) == 1 and matches <= grounded), "invalid_input", 400)
     # A reference cannot silently rename another object or bind a foreign/revoked object.
     # The model must quote a distinguishing source mention, including for corrections.
     if entity["id"] is not None:

@@ -34,16 +34,19 @@ class CandidateExtraction:
                 scope in publisher["allowed_scopes"]
                 or scope["actor_id"] in publisher.get("allowed_role_actors", [])
             )
-            receipt = db.execute(
-                "SELECT result FROM write_ledger WHERE job_id=?", (job["id"],)
-            ).fetchone()
-            if receipt:
-                return dict(state="completed", result=json.loads(receipt[0]), content=[])
+            completed = self._completed(db, job["id"])
+            if completed:
+                return completed
             if job["state"] != "pending":
                 return dict(state="invalidated", result=None, content=[])
         content = self._content(event)
         if request["output"] is None:
             with service.operation(scope=scope, sources=event["sources"], event=event) as db:
+                # Another same-job request can finish while _content reads its
+                # sources. Its committed receipt outranks a new pending snapshot.
+                completed = self._completed(db, job["id"])
+                if completed:
+                    return completed
                 hints = facts.known(service, db, scope)
                 version = 3 if facts.installed(db) else 1
             result = dict(state="pending", result=None, content=content)
@@ -52,17 +55,31 @@ class CandidateExtraction:
             return result
         try:
             drafts = self._drafts(event, content, request["output"])
-            # The workflow rolls its entire transaction back before raising. An
-            # invalid entity/derived fact is therefore a definite rejection too,
-            # allowing a fresh extraction instead of replaying an invalid proposal.
+            # The workflow rolls this proposal's entire transaction back before
+            # raising. A rejected proposal can be extracted again; another older
+            # same-job request may still be committing its own valid proposal.
             result = TrustedWorkflow(service).commit_extracted(
                 dict(job_id=job["id"], drafts=drafts)
             )
         except Fault as error:
             if error.code != "invalid_input":
                 raise
+            # The current proposal rolled back, but an older same-job request
+            # may already have committed after our initial receipt read. Reuse
+            # that result before reporting a semantic rejection to the caller.
+            with service.store.transaction() as db:
+                completed = self._completed(db, job["id"])
+            if completed:
+                return completed
             return dict(state="rejected", result={"error_code": "invalid_input"}, content=[])
         return dict(state="completed", result=result, content=[])
+
+    @staticmethod
+    def _completed(db, job_id):
+        receipt = db.execute("SELECT result FROM write_ledger WHERE job_id=?", (job_id,)).fetchone()
+        return (
+            dict(state="completed", result=json.loads(receipt[0]), content=[]) if receipt else None
+        )
 
     def _content(self, event):
         service = self.service

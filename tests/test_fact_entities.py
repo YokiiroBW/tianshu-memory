@@ -1,5 +1,6 @@
 """Object discrimination through native sourced candidate commits and retrieval."""
 
+import copy
 import json
 
 import pytest
@@ -414,5 +415,298 @@ def test_ordinal_only_reference_cannot_choose_between_numbered_subtypes(sync):
         "红色",
         second=3,
         entity=entity("第一支", saved_entity(sync, one)["id"]),
+        expected_state="rejected",
+    )
+
+
+def _cup_memory(text, value, mention, identity, *, kind="cup", quote=None):
+    return dict(
+        statement=text,
+        conditions=[],
+        negations=[],
+        valid_time="未说明有效时间",
+        evidence=[dict(source_index=0, quote=text if quote is None else quote)],
+        fact=dict(
+            key="object.cup.name",
+            value=value,
+            state="current",
+            valid_from=None,
+            valid_to=None,
+            keywords=["水杯", value],
+            entity=entity(mention, identity, kind),
+        ),
+    )
+
+
+def _cup_pair(h, red_mention="红色水杯"):
+    blue, _ = add(
+        h, "我的蓝色水杯叫雨点", "object.cup.name", "雨点", entity=entity("蓝色水杯", kind="cup")
+    )
+    red, _ = add(
+        h,
+        "我的" + red_mention + "叫晚霞",
+        "object.cup.name",
+        "晚霞",
+        second=2,
+        entity=entity(red_mention, kind="cup"),
+    )
+    return blue, red
+
+
+@pytest.mark.parametrize("null_id", [False, True])
+def test_grounded_color_ellipsis_commits_correction_and_reaffirmation_atomically(sync, null_id):
+    initialize(sync)
+    blue, red = _cup_pair(sync)
+    blue_id, red_id = saved_entity(sync, blue)["id"], saved_entity(sync, red)["id"]
+    text = "蓝杯子现在改叫细雨，红色的还是晚霞。"
+    memories = [
+        _cup_memory(text, "细雨", "蓝杯子", blue_id),
+        _cup_memory(text, "晚霞", "红色的", None if null_id else red_id),
+    ]
+    memories[0].update(statement="作者的蓝色水杯现在改叫细雨。")
+    memories[1].update(statement="作者的红色水杯仍然叫晚霞。")
+    memories[0]["fact"]["keywords"] = ["水杯", "细雨", "蓝色", "名字", "改名"]
+    memories[1]["fact"]["keywords"] = ["水杯", "晚霞", "红色", "名字"]
+    original = copy.deepcopy(memories)
+    result, job = add(sync, text, "object.cup.name", second=3, memories=memories)
+    assert result["state"] == "committed"
+    assert memories == original
+    with sync.store.transaction() as db:
+        rows = db.execute("SELECT group_id,payload FROM automatic_facts").fetchall()
+        renamed = next(row for row in rows if json.loads(row["payload"])["value"] == "细雨")
+        assert json.loads(renamed["payload"])["entity"]["id"] == blue_id
+        assert set(result["group_ids"]) == {renamed["group_id"], red["group_ids"][0]}
+        red_fact = db.execute(
+            "SELECT payload,observed_at FROM automatic_facts WHERE group_id=?",
+            (red["group_ids"][0],),
+        ).fetchone()
+        assert json.loads(red_fact["payload"])["entity"] == entity("红色水杯", red_id, "cup")
+        assert red_fact["observed_at"] == "2026-10-11T00:00:03Z"
+        for table in ("lineage", "automatic_evidence"):
+            assert (
+                db.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE group_id=?", (red["group_ids"][0],)
+                ).fetchone()[0]
+                == 2
+            )
+        assert db.execute(
+            "SELECT 1 FROM automatic_evidence WHERE group_id=? AND quote=?",
+            (red["group_ids"][0], text),
+        ).fetchone()
+        renamed_ids = {
+            row[0]
+            for row in db.execute("SELECT id FROM records WHERE group_id=?", (renamed["group_id"],))
+        }
+        assert (
+            db.execute("SELECT COUNT(*) FROM write_ledger WHERE job_id=?", (job,)).fetchone()[0]
+            == 1
+        )
+    assert {unit["record_id"] for unit in recall(sync, "蓝杯子现在叫什么")} == renamed_ids
+    assert {unit["record_id"] for unit in recall(sync, "红色杯子现在叫什么")} == set(
+        red["record_ids"]
+    )
+    assert set(blue["record_ids"]) <= {
+        unit["record_id"] for unit in recall(sync, "蓝杯子以前叫什么")
+    }
+    replay = sync.post("memory/candidates/process", dict(job_id=job, output=None)).json()
+    assert replay["state"] == "completed" and replay["result"] == result
+    assert (
+        sync.post(
+            "memory/candidates/process", dict(job_id=job, output=dict(memories=original))
+        ).json()
+        == replay
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "short_quote",
+        "split_quotes",
+        "separate_sentence",
+        "unrelated_cup",
+        "wrong_kind",
+        "book_context",
+        "third_party",
+        "third_party_owner",
+        "question",
+        "hypothetical",
+        "wrong_id",
+        "forged_mention",
+    ],
+)
+def test_unproven_color_ellipse_rejects_the_whole_proposal(sync, case):
+    initialize(sync)
+    blue, red = _cup_pair(sync)
+    text = {
+        "separate_sentence": "蓝杯子现在改叫细雨。红色的还是晚霞。",
+        "unrelated_cup": "我今天洗了蓝杯子，红色的还是晚霞。",
+        "book_context": "蓝书现在改叫细雨，红色的还是晚霞。",
+        "third_party": "朋友说：蓝杯子现在改叫细雨，红色的还是晚霞。",
+        "third_party_owner": "姐姐的蓝杯子现在改叫细雨，红色的还是晚霞。",
+        "question": "蓝杯子现在改叫细雨，红色的还是晚霞吗？",
+        "hypothetical": "如果蓝杯子现在改叫细雨，红色的还是晚霞。",
+    }.get(case, "蓝杯子现在改叫细雨，红色的还是晚霞。")
+    blue_mention = "蓝书" if case == "book_context" else "蓝杯子"
+    memories = [
+        _cup_memory(text, "细雨", blue_mention, saved_entity(sync, blue)["id"]),
+        _cup_memory(text, "晚霞", "红色的", saved_entity(sync, red)["id"]),
+    ]
+    red_proposal = memories[1]
+    if case == "book_context":
+        memories = [red_proposal]
+    if case == "short_quote":
+        red_proposal["evidence"][0]["quote"] = "红色的还是晚霞"
+    elif case == "split_quotes":
+        red_proposal["evidence"] = [
+            dict(source_index=0, quote=part) for part in text.rstrip("。").split("，")
+        ]
+    elif case == "wrong_kind":
+        red_proposal["fact"]["entity"].update(kind="book", id=None)
+    elif case == "wrong_id":
+        red_proposal["fact"]["entity"]["id"] = saved_entity(sync, blue)["id"]
+    elif case == "forged_mention":
+        red_proposal["fact"]["entity"]["mention"] = "红色水杯"
+    _, job = add(
+        sync, text, "object.cup.name", second=3, memories=memories, expected_state="rejected"
+    )
+    with sync.store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM automatic_facts").fetchone()[0] == 2
+        assert (
+            db.execute("SELECT COUNT(*) FROM write_ledger WHERE job_id=?", (job,)).fetchone()[0]
+            == 0
+        )
+    assert {unit["record_id"] for unit in recall(sync, "蓝色杯子现在叫什么")} == set(
+        blue["record_ids"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mentions",
+    [
+        ("红色玻璃水杯", "红色陶瓷水杯"),
+        ("第一只红色玻璃水杯", "第二只红色玻璃水杯"),
+        ("红色玻璃水杯", "红色磨砂水杯"),
+        ("红玻璃水杯", "红磨砂水杯"),
+        ("第一只红玻璃水杯", "第二只红磨砂水杯"),
+        ("红色水杯", "红茶杯子"),
+    ],
+)
+@pytest.mark.parametrize("null_id", [False, True])
+def test_color_ellipse_does_not_choose_a_material_or_ordinal(sync, mentions, null_id):
+    initialize(sync)
+    blue, red = _cup_pair(sync, mentions[0])
+    add(
+        sync,
+        mentions[1] + "叫朝霞",
+        "object.cup.name",
+        "朝霞",
+        second=3,
+        entity=entity(mentions[1], kind="cup"),
+    )
+    text = "蓝杯子现在改叫细雨，红色的还是晚霞。"
+    memories = [
+        _cup_memory(text, "细雨", "蓝杯子", saved_entity(sync, blue)["id"]),
+        _cup_memory(text, "晚霞", "红色的", None if null_id else saved_entity(sync, red)["id"]),
+    ]
+    add(sync, text, "object.cup.name", second=4, memories=memories, expected_state="rejected")
+    with sync.store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM automatic_facts").fetchone()[0] == 3
+
+
+def test_color_ellipse_cannot_create_a_new_nounless_object(sync):
+    initialize(sync)
+    add(
+        sync, "我的蓝色水杯叫雨点", "object.cup.name", "雨点", entity=entity("蓝色水杯", kind="cup")
+    )
+    text = "蓝杯子现在改叫细雨，红色的还是晚霞。"
+    add(
+        sync,
+        text,
+        "object.cup.name",
+        "晚霞",
+        second=2,
+        entity=entity("红色的", kind="cup"),
+        expected_state="rejected",
+    )
+
+
+def test_color_ellipse_does_not_revive_a_forgotten_target(sync):
+    initialize(sync)
+    blue, red = _cup_pair(sync)
+    red_id = saved_entity(sync, red)["id"]
+    assert sync.post("memory/revise", sync.revision(red["record_ids"][0])).status_code == 200
+    text = "蓝杯子现在改叫细雨，红色的还是晚霞。"
+    memories = [
+        _cup_memory(text, "细雨", "蓝杯子", saved_entity(sync, blue)["id"]),
+        _cup_memory(text, "晚霞", "红色的", red_id),
+    ]
+    add(sync, text, "object.cup.name", second=3, memories=memories, expected_state="rejected")
+    assert recall(sync, "红色杯子叫什么") == []
+
+
+@pytest.mark.parametrize("null_id", [False, True])
+def test_color_ellipse_cannot_bind_an_existing_cup_in_another_scope(sync, null_id):
+    initialize(sync)
+    add(
+        sync, "我的蓝色水杯叫雨点", "object.cup.name", "雨点", entity=entity("蓝色水杯", kind="cup")
+    )
+    foreign, _ = add(
+        sync,
+        "我的红色水杯叫晚霞",
+        "object.cup.name",
+        "晚霞",
+        second=2,
+        actor=1,
+        entity=entity("红色水杯", kind="cup"),
+    )
+    text = "蓝杯子现在改叫细雨，红色的还是晚霞。"
+    identity = None if null_id else saved_entity(sync, foreign)["id"]
+    add(
+        sync,
+        text,
+        "object.cup.name",
+        "晚霞",
+        second=3,
+        entity=entity("红色的", identity, "cup"),
+        expected_state="rejected",
+    )
+
+
+@pytest.mark.parametrize("mention", ["红色水杯", "第一只红色玻璃水杯", "红色磨砂水杯"])
+def test_unique_qualified_cup_with_multiple_attributes_is_one_color_target(sync, mention):
+    initialize(sync)
+    _, red = _cup_pair(sync, mention)
+    red_id = saved_entity(sync, red)["id"]
+    add(
+        sync,
+        mention + "放在抽屉",
+        "object.cup.location",
+        "抽屉",
+        second=3,
+        entity=entity(mention, red_id, "cup"),
+    )
+    text = "蓝杯子还是雨点，红色的还是晚霞。"
+    repeated, _ = add(
+        sync, text, "object.cup.name", "晚霞", second=4, entity=entity("红色的", red_id, "cup")
+    )
+    assert repeated["record_ids"] == red["record_ids"]
+    assert saved_entity(sync, repeated) == entity(mention, red_id, "cup")
+
+
+@pytest.mark.parametrize("mention", ["红茶杯子", "红磨砂水杯"])
+@pytest.mark.parametrize("null_id", [False, True])
+def test_unknown_bare_cup_descriptor_cannot_ground_color_by_itself(sync, mention, null_id):
+    initialize(sync)
+    _, red = _cup_pair(sync, mention)
+    identity = None if null_id else saved_entity(sync, red)["id"]
+    text = "蓝杯子还是雨点，红色的还是晚霞。"
+    add(
+        sync,
+        text,
+        "object.cup.name",
+        "晚霞",
+        second=3,
+        entity=entity("红色的", identity, "cup"),
         expected_state="rejected",
     )

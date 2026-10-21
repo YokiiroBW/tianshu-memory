@@ -48,9 +48,11 @@ def add(
     entity=None,
     expected_status=200,
     expected_state="completed",
+    memories=None,
+    actor=0,
 ):
     physical, admission, grant = [
-        copy.deepcopy(items[0]) for items in (h.physicals, h.admissions, h.grants)
+        copy.deepcopy(items[actor]) for items in (h.physicals, h.admissions, h.grants)
     ]
     message_id = f"quality-source:{second}"
     physical.update(
@@ -76,7 +78,7 @@ def add(
     h.physicals.append(physical)
     h.admissions.append(admission)
     h.grants.append(grant)
-    turn = copy.deepcopy(h.turns[0])
+    turn = copy.deepcopy(h.turns[actor])
     old_id = turn["turn_id"]
     new_id = f"quality-turn:{second}"
     turn = json.loads(canonical(turn).replace(old_id, new_id))
@@ -84,7 +86,7 @@ def add(
     event = turn["committed_event"]
     event.update(event_id=f"quality-event:{second}", sources=[admission["source"]])
     with h.store.transaction() as db:
-        event["scope_version"] = h.service._scope_version(db, h.scope())
+        event["scope_version"] = h.service._scope_version(db, h.scope(actor))
     # Turn and committed event assert the same owner state.
     if "scope_version" in turn:
         turn["scope_version"] = event["scope_version"]
@@ -96,8 +98,8 @@ def add(
 
         h.service.contracts.load_context()
         proposal = dict(
-            command=h.command(),
-            scope=h.scope(),
+            command=h.command(actor),
+            scope=h.scope(actor),
             batch_ref=None,
             item_id="explicit:1",
             kind="upsert",
@@ -123,11 +125,13 @@ def add(
             proof_ref=None,
         )
         h.service.contracts.validate("memory-context#proposal_request", proposal)
-        receipt = MemoryContext(h.service).propose(proposal, h.contexts["synthetic-viewer:0"])
+        receipt = MemoryContext(h.service).propose(
+            proposal, h.contexts[f"synthetic-viewer:{actor}"]
+        )
         assert receipt["state"] == "committed"
         # In a real turn the tool commits before the delivered-turn event is published.
         with h.store.transaction() as db:
-            event["scope_version"] = h.service._scope_version(db, h.scope())
+            event["scope_version"] = h.service._scope_version(db, h.scope(actor))
         if "scope_version" in turn:
             turn["scope_version"] = event["scope_version"]
         h.core_head["sequence"] += 1
@@ -169,6 +173,8 @@ def add(
     )
     if entity is not None:
         proposed["memories"][0]["fact"]["entity"] = entity
+    if memories is not None:
+        proposed["memories"] = copy.deepcopy(memories)
     committed = h.post(PATH, dict(job_id=job, output=proposed))
     assert committed.status_code == expected_status, committed.text
     if expected_status != 200:
@@ -405,3 +411,124 @@ def test_malformed_fact_state_is_rejected_as_input():
             )
         )
     assert rejected.value.status == 400
+
+
+@pytest.mark.parametrize("newer_first", [False, True])
+def test_color_reaffirmation_keeps_newer_observation_in_both_commit_orders(
+    sync, monkeypatch, newer_first
+):
+    from test_fact_entities import entity, saved_entity
+
+    initialize(sync)
+    blue, _ = add(
+        sync, "我的蓝色水杯叫雨点", "object.cup.name", "雨点", entity=entity("蓝色水杯", kind="cup")
+    )
+    original, _ = add(
+        sync,
+        "我的红色水杯叫晚霞",
+        "object.cup.name",
+        "晚霞",
+        second=2,
+        entity=entity("红色水杯", kind="cup"),
+    )
+    red_id = saved_entity(sync, original)["id"]
+    quote = "蓝杯子还是雨点，红色的还是晚霞。"
+    original_post = sync.post
+    latest = latest_job = None
+
+    def reaffirm():
+        return add(
+            sync, quote, "object.cup.name", "晚霞", second=4, entity=entity("红色的", red_id, "cup")
+        )
+
+    def complete_newer_first(path, body):
+        nonlocal latest, latest_job
+        if path == PATH and body.get("output") is not None and latest is None:
+            latest = {}
+            latest, latest_job = reaffirm()
+        return original_post(path, body)
+
+    if newer_first:
+        monkeypatch.setattr(sync, "post", complete_newer_first)
+    older, _ = add(
+        sync,
+        "红色水杯改叫朝霞",
+        "object.cup.name",
+        "朝霞",
+        second=3,
+        entity=entity("红色水杯", red_id, "cup"),
+    )
+    if not newer_first:
+        latest, latest_job = reaffirm()
+    assert older["state"] == latest["state"] == "committed"
+    with sync.store.transaction() as db:
+        facts = [
+            (row, json.loads(row["payload"])) for row in db.execute("SELECT * FROM automatic_facts")
+        ]
+        current = next(
+            row for row, fact in facts if fact["value"] == "晚霞" and row["superseded_by"] is None
+        )
+        assert current["observed_at"] == "2026-10-11T00:00:04Z"
+        assert json.loads(current["payload"])["entity"]["id"] == red_id
+        changed = next(row for row, fact in facts if fact["value"] == "朝霞")
+        assert changed["superseded_by"] == current["group_id"]
+        assert db.execute(
+            "SELECT 1 FROM automatic_evidence WHERE group_id=? AND quote=?",
+            (current["group_id"], quote),
+        ).fetchone()
+        current_ids = {
+            row[0]
+            for row in db.execute("SELECT id FROM records WHERE group_id=?", (current["group_id"],))
+        }
+    assert {unit["record_id"] for unit in recall(sync, "红色杯子现在叫什么")} == current_ids
+    assert {unit["record_id"] for unit in recall(sync, "蓝色杯子现在叫什么")} == set(
+        blue["record_ids"]
+    )
+    assert sync.post(PATH, dict(job_id=latest_job, output=None)).json()["result"] == latest
+
+
+def test_undated_color_reaffirmation_preserves_effective_interval_and_new_evidence(sync):
+    from test_fact_entities import entity, saved_entity
+
+    initialize(sync)
+    add(
+        sync, "我的蓝色水杯叫雨点", "object.cup.name", "雨点", entity=entity("蓝色水杯", kind="cup")
+    )
+    start, end = "2026-10-10T00:00:00Z", "2027-10-10T00:00:00Z"
+    original, _ = add(
+        sync,
+        f"我的红色水杯在{start}至{end}期间叫晚霞",
+        "object.cup.name",
+        "晚霞",
+        second=2,
+        valid_from=start,
+        valid_to=end,
+        entity=entity("红色水杯", kind="cup"),
+    )
+    quote = "蓝杯子还是雨点，红色的还是晚霞。"
+    repeated, _ = add(
+        sync,
+        quote,
+        "object.cup.name",
+        "晚霞",
+        second=3,
+        entity=entity("红色的", saved_entity(sync, original)["id"], "cup"),
+    )
+    assert repeated["group_ids"] == original["group_ids"]
+    with sync.store.transaction() as db:
+        row = db.execute(
+            "SELECT * FROM automatic_facts WHERE group_id=?", (original["group_ids"][0],)
+        ).fetchone()
+        fact = json.loads(row["payload"])
+        assert (fact["valid_from"], fact["valid_to"]) == (start, end)
+        assert row["observed_at"] == "2026-10-11T00:00:03Z"
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM lineage WHERE group_id=?", (row["group_id"],)
+            ).fetchone()[0]
+            == 2
+        )
+        assert db.execute(
+            "SELECT 1 FROM automatic_evidence WHERE group_id=? AND quote=?",
+            (row["group_id"], quote),
+        ).fetchone()
