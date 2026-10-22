@@ -24,9 +24,10 @@ NAMING = re.compile(
     r"\b(?:is named|is called|name is|title is|renamed to)\s+",
     re.I,
 )
+NEGATIVE_WORDS = r"不是|并非|并没有|没有|并未|不曾|不再|从不|不要|别|没|不|未"
 NEGATIVE_END = re.compile(
-    r"^(?:不要|别)(?:再)?(?:把|将)|"
-    r"(?:不是|并非|并没有|没有|并未|不曾|不再|从不|不要|别|没|不|未)(?:再|改|重新)*$"
+    rf"(?:{NEGATIVE_WORDS})(?:再|改|重新)*(?:把|将)|"
+    rf"(?:{NEGATIVE_WORDS})(?:再|改|重新)*$"
 )
 UNSAFE = re.compile(r"如果|假如|假设|要是|可能|也许|或许|万一|\b(?:if|maybe|perhaps)\b", re.I)
 PAST = re.compile(r"以前|之前|原来|过去|曾经|旧名|原名")
@@ -128,7 +129,7 @@ def _apposition(text, value):
     else:
         # A naming/denial clause is not the noun apposition 狗豆包. Its
         # assertion must be checked by the ordinary naming path instead.
-        if NAMING.search(text) or re.match(r"^(?:不是|并非|不|没|未)", text):
+        if NAMING.search(text) or re.match(rf"^(?:{NEGATIVE_WORDS})", text):
             return False
         action = ACTION.search(text)
         label = text[: action.start()] if action else text
