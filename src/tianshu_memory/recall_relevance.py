@@ -131,6 +131,10 @@ def named_owner(service, db, candidates, query, *, complete, fact_snapshot=None)
         ):
             return [], [], query
         return candidates, [], query
+    if any(not remaining for _, remaining in matches):
+        # A recognized source-speaker question with an unproved object/possessor
+        # must not lose that qualifier and become ordinary group-topic recall.
+        return [], [], query
     owners = {entry[0]["scope"] for entry, _ in matches}
     if not complete or len(owners) != 1 or uncertain - owners:
         return [], [], query

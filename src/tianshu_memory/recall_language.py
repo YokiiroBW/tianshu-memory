@@ -102,17 +102,62 @@ def self_reference(value):
 
 
 def named_reference(value, name):
-    """An exact sourced name in an explicit possessive; no alias/identity guessing."""
+    """An exact sourced name in a possessive or a bounded source-speaker reference.
+
+    None is not a reference. An empty reference is a recognized but unsupported
+    source question, which must not fall back to another owner's topic matches.
+    A speaker reference restricts whose source to recall, not an object's owner.
+    """
+    preamble = r"^(?:(?:请问|你还记得|还记得|记得|我想问|我忘了|我记不清|群里|关于)\s*)+"
     body = clean_query(lexical_question_text(value)).strip()
-    body = re.sub(
-        r"^(?:(?:请问|你还记得|还记得|记得|我想问|我忘了|我记不清|群里|关于)\s*)+", "", body
-    )
+    body = re.sub(preamble, "", body)
     match = re.match(
         re.escape(name) + r"(?=\s*(?:的|那(?:一)?只|这(?:一)?只|家(?:的)?|['’]s\b))",
         body,
         re.I,
     )
-    return None if match is None else body[match.end() :].lstrip("的 ")
+    if match is not None:
+        return body[match.end() :].lstrip("的 ")
+    # Unlike lexical scaffolding, an object's own historical/current qualifiers
+    # remain literal. Only the time attached to the reporting verb is consumed.
+    body = re.sub(preamble, "", clean_query(value).strip())
+    speaker = re.escape(name) + r"\s*"
+    when = r"(?:(?:上次|之前|以前|刚才|前面)\s*)?"
+    report = r"(?:提到过|说起过|提过|说过)"
+    match = re.match(speaker + when + report + r"的\s*(.+)$", body, re.I)
+    if match is not None:
+        target = match[1].strip()
+        # A second possessor, reported quotation or extra clause needs evidence
+        # this bounded grammar does not establish. Do not erase that qualifier.
+        head = re.sub(r"^(?:(?:以前|之前|原来|现在|目前)(?:的)?\s*)+", "", target)
+        plain = re.sub(r"的(?:名字|名称|位置|原名|旧名)", "", head).rstrip("？?。.!！")
+        if re.search(
+            r"[，,。；;：:.!?！？\n\r\"'“”‘’「」『』《》`（）()【】\[\]]|的|家(?:那|这)|和|与|跟|还有|没|不|未|别",
+            plain,
+        ):
+            return ""
+        head = _object_focus(head)
+        if head is None:
+            return ""
+        head = head.casefold()
+        aliases = topic_aliases(head) | set(query_aliases(head))
+        if not any(
+            re.match(re.escape(alias.casefold()) + (r"(?![a-z])" if alias.isascii() else ""), head)
+            for alias in aliases
+        ):
+            return ""
+        return target
+    # Negated/conditional/joint reports are not a positive source connection.
+    # Exact name boundaries keep a short name from shadowing a longer one.
+    unsafe = (
+        r"(?:(?:不是|并非|如果|假如)\s*)?"
+        + speaker
+        + when
+        + r"(?:并没有|没有|并未|不曾|没|未)?"
+        + report
+    )
+    joint = speaker + r"(?:和|与|跟|替|帮)[^，,。；;：:\n\r]{1,32}" + report
+    return "" if re.match(unsafe, body, re.I) or re.match(joint, body, re.I) else None
 
 
 def lexical_question_text(value):

@@ -15,7 +15,7 @@ from test_storage_backends import postgres_store
 
 from tianshu_memory.domain import canonical, utc
 from tianshu_memory.postgres import is_postgres
-from tianshu_memory.recall_language import self_reference
+from tianshu_memory.recall_language import history_query, named_reference, self_reference
 
 
 @pytest.fixture(params=["sqlite", "postgresql"])
@@ -277,6 +277,91 @@ def test_names_use_unique_current_identity_witness_and_keep_self_topics(room):
     assert not self_reference("阿川说‘我的猫’，群里那只猫叫什么")
 
 
+def test_source_speaker_uses_the_current_exact_name_and_original_owner(room):
+    h = room
+    a, _ = named_cats(h)
+    for text in (
+        "阿川上次提过的那只猫叫什么来着？",
+        "阿川之前提到过的猫叫什么？",
+        "请问阿川说起过的那只猫叫什么？",
+    ):
+        selected = recalled(h, query(h, text))
+        assert {unit["statement"] for unit in selected["selected_units"]} == {
+            "我叫阿川",
+            "我的猫叫栗团",
+        }
+        assert {unit["subject_person_id"] for unit in selected["selected_units"]} == {
+            h.scope(a)["person_id"]
+        }
+        assert len(selected["dependency_groups"]) == 2
+
+
+def test_source_reporting_time_and_object_history_remain_distinct(room):
+    h = room
+    a, _ = named_cats(h)
+    cat(h, a, "栗饼", second=5)
+    current = recalled(h, query(h, "阿川以前提过的猫现在叫什么"))
+    assert {unit["statement"] for unit in current["selected_units"]} == {
+        "我叫阿川",
+        "我的猫叫栗饼",
+    }
+    for text in (
+        "阿川上次提过的猫以前叫什么？",
+        "阿川说起过的猫原名是什么？",
+        "阿川上次提过的以前那只猫现在叫什么？",
+        "阿川提过的以前的那只猫原名是什么？",
+    ):
+        selected = recalled(h, query(h, text))
+        statements = {unit["statement"] for unit in selected["selected_units"]}
+        assert {"我叫阿川", "我的猫叫栗团"} <= statements
+        assert not {"我叫小禾", "我的猫叫栗糖"} & statements
+        assert {unit["subject_person_id"] for unit in selected["selected_units"]} == {
+            h.scope(a)["person_id"]
+        }
+
+
+def test_source_reference_does_not_erase_another_possessor_or_clause(room):
+    h = room
+    named_cats(h)
+    for text in (
+        "阿川提过的小禾家的猫叫什么？",
+        "阿川提过的别人家那只猫叫什么？",
+        "阿川提过小禾家的猫叫什么？",
+        "阿川并没有提过的猫叫什么？",
+        "如果阿川提过的猫叫什么？",
+        "阿川和小禾提过的猫叫什么？",
+        "阿川提过的猫叫什么？小禾的呢",
+        "阿川提过的猫！小禾的猫叫什么",
+        "阿川提过的“猫”叫什么？",
+        "阿川提过的那只",
+    ):
+        selected = recalled(h, query(h, text))
+        assert selected["selected_units"] == [], text
+        assert selected["dependency_groups"] == [], text
+    cat(h, 0, "雪球", second=5)
+    mine = recalled(h, query(h, "阿川提过的我家的猫叫什么？"))
+    # Existing explicit-self routing is not a proof that a reporter owns the pet.
+    assert [unit["statement"] for unit in mine["selected_units"]] == ["我的猫叫雪球"]
+    assert {unit["subject_person_id"] for unit in mine["selected_units"]} == {h.person}
+
+
+def test_source_reference_does_not_match_a_longer_canonical_name(room):
+    h = room
+    a, b = owner(h), owner(h)
+    add(h, "我叫阿", "identity.name", "阿", actor=a, second=1)
+    cat(h, a, "栗团", second=2)
+    add(h, "我叫阿川", "identity.name", "阿川", actor=b, second=3)
+    cat(h, b, "栗糖", second=4)
+    selected = recalled(h, query(h, "阿川上次提过的那只猫叫什么？"))
+    assert {unit["statement"] for unit in selected["selected_units"]} == {
+        "我叫阿川",
+        "我的猫叫栗糖",
+    }
+    assert {unit["subject_person_id"] for unit in selected["selected_units"]} == {
+        h.scope(b)["person_id"]
+    }
+
+
 def test_multiple_owner_payloads_and_rank_index_use_bounded_batches(room, monkeypatch):
     h = room
     named_cats(h)
@@ -313,15 +398,18 @@ def test_multiple_owner_payloads_and_rank_index_use_bounded_batches(room, monkey
         assert len(bodies) == 1 and "group_id IN (" in bodies[0]
 
 
-def test_duplicate_name_and_truncated_window_do_not_claim_unique_owner(room, monkeypatch):
+@pytest.mark.parametrize("reference", ["那只猫叫什么", "上次提过的那只猫叫什么"])
+def test_duplicate_name_and_truncated_window_do_not_claim_unique_owner(
+    room, monkeypatch, reference
+):
     h = room
     a, b = named_cats(h)
     monkeypatch.setattr("tianshu_memory.memory_context.scopes.GROUP_WINDOW", 3)
-    truncated = recalled(h, query(h, "小禾那只猫叫什么"))
+    truncated = recalled(h, query(h, "小禾" + reference))
     assert not truncated["selected_units"] and truncated["coverage"]["complete"] is False
     monkeypatch.setattr("tianshu_memory.memory_context.scopes.GROUP_WINDOW", 4096)
     add(h, "我叫阿川", "identity.name", "阿川", actor=b, second=5)
-    assert recalled(h, query(h, "阿川那只猫叫什么"))["selected_units"] == []
+    assert recalled(h, query(h, "阿川" + reference))["selected_units"] == []
     assert {unit["subject_person_id"] for unit in recalled(h)["selected_units"]} == {
         h.scope(a)["person_id"],
         h.scope(b)["person_id"],
@@ -390,14 +478,15 @@ def test_group_read_is_not_a_wire_flag_or_a_write_permission(room):
     assert response.status_code == 403, response.text
 
 
-def test_name_witness_and_target_must_fit_together(room):
+@pytest.mark.parametrize("text", ["阿川那只猫叫什么", "阿川上次提过的那只猫叫什么"])
+def test_name_witness_and_target_must_fit_together(room, text):
     h = room
     named_cats(h)
-    full = recalled(h, query(h, "阿川那只猫叫什么"))
-    one_group = recalled(h, query(h, "阿川那只猫叫什么", limit=1))
+    full = recalled(h, query(h, text))
+    one_group = recalled(h, query(h, text, limit=1))
     assert one_group["selected_units"] == [] and "budget" in one_group["omissions"]
     budget = full["budget_used"]["bytes"] - 1
-    short = recalled(h, query(h, "阿川那只猫叫什么", budget={"tokens": budget, "bytes": budget}))
+    short = recalled(h, query(h, text, budget={"tokens": budget, "bytes": budget}))
     assert short["selected_units"] == [] and short["coverage"]["complete"] is False
     assert len(short["scope_checks"]) == 1
 
@@ -469,7 +558,8 @@ def test_old_alias_hints_require_the_same_fresh_whole_group_domain(room):
 
 
 @pytest.mark.parametrize("change", ["none", "source", "grant", "witness"])
-def test_external_rank_rechecks_group_sources_owners_and_witness(room, change):
+@pytest.mark.parametrize("text", ["阿川那只猫叫什么", "阿川上次提过的那只猫叫什么"])
+def test_external_rank_rechecks_group_sources_owners_and_witness(room, change, text):
     h = room
     named_cats(h)
 
@@ -493,7 +583,7 @@ def test_external_rank_rechecks_group_sources_owners_and_witness(room, change):
             return lexical
 
     h.service.retrieval = Ranker()
-    response = h.post("memory/context/query", query(h, "阿川那只猫叫什么"))
+    response = h.post("memory/context/query", query(h, text))
     if change == "none":
         assert response.status_code == 200, response.text
         assert len(response.json()["selected_units"]) == 2
@@ -569,7 +659,8 @@ def test_current_name_witness_can_predate_the_target_time_window(room):
 
 
 @pytest.mark.parametrize("change", ["expiry", "same-name-start", "new-name-write"])
-def test_external_io_reproves_current_name_and_room_uniqueness(room, change):
+@pytest.mark.parametrize("text", ["阿川那只猫叫什么", "阿川之前提到过的那只猫叫什么"])
+def test_external_io_reproves_current_name_and_room_uniqueness(room, change, text):
     h = room
     moment = [datetime(2026, 10, 21, tzinfo=UTC)]
     h.service.clock = lambda: moment[0]
@@ -597,7 +688,7 @@ def test_external_io_reproves_current_name_and_room_uniqueness(room, change):
     else:
         add(h, "我叫小禾", "identity.name", "小禾", actor=b, second=3)
     cat(h, b, "栗糖", second=4)
-    assert len(recalled(h, query(h, "阿川那只猫叫什么"))["selected_units"]) == 2
+    assert len(recalled(h, query(h, text))["selected_units"]) == 2
 
     class Ranker:
         def settings_for(self, request):
@@ -618,5 +709,65 @@ def test_external_io_reproves_current_name_and_room_uniqueness(room, change):
             return lexical
 
     h.service.retrieval = Ranker()
-    response = h.post("memory/context/query", query(h, "阿川那只猫叫什么"))
+    response = h.post("memory/context/query", query(h, text))
     assert response.status_code in {409, 503}, response.text
+
+
+@pytest.mark.parametrize(
+    ("text", "name", "remaining", "historical"),
+    [
+        ("阿川以前提过的猫现在叫什么", "阿川", "猫现在叫什么", False),
+        ("阿川上次提过的猫以前叫什么", "阿川", "猫以前叫什么", True),
+        ("阿川说起过的猫原名是什么", "阿川", "猫原名是什么", True),
+        ("阿川上次提过的以前那只猫现在叫什么", "阿川", "以前那只猫现在叫什么", True),
+        ("阿川提过的以前的那只猫原名是什么", "阿川", "以前的那只猫原名是什么", True),
+        ("阿川提过的现在的那只猫叫什么", "阿川", "现在的那只猫叫什么", False),
+        ("阿川的红皮本子叫什么", "阿川", "红皮本子叫什么", False),
+    ],
+)
+def test_literal_source_object_qualifiers_are_not_reporting_scaffolding(
+    text, name, remaining, historical
+):
+    assert named_reference(text, name) == remaining
+    assert history_query(remaining) is historical
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "阿川提过的那只",
+        "阿川提过的以前",
+        "阿川提过的小禾家的猫叫什么",
+        "阿川提过的我家猫叫什么",
+        "阿川提过的别人家那只猫叫什么",
+        "阿川提过小禾家的猫叫什么",
+        "阿川上次没提过的猫叫什么",
+        "阿川并没有提过的猫叫什么",
+        "阿川并未提过的猫叫什么",
+        "不是阿川提过的猫叫什么",
+        "如果阿川提过的猫叫什么",
+        "阿川和小禾提过的猫叫什么",
+        "阿川替小禾提过的猫叫什么",
+        "阿川提过的猫叫什么？小禾的呢",
+        "阿川提过的猫!小禾的猫叫什么",
+        "阿川提过的猫！小禾的猫叫什么",
+        "阿川提过的猫?小禾的猫叫什么",
+        "阿川提过的“猫”叫什么",
+        "阿川提过的猫\n小禾的猫叫什么",
+    ],
+)
+def test_recognized_unsupported_source_questions_do_not_become_topic_fallback(text):
+    assert named_reference(text, "阿川") == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "name"),
+    [
+        ("阿川上次提过的猫叫什么", "阿"),
+        ("Anna提过的cat叫什么", "Ann"),
+        ("“阿川提过的猫”叫什么", "阿川"),
+        ("有人说阿川提过的猫叫什么", "阿川"),
+    ],
+)
+def test_source_bridge_has_an_exact_unquoted_leading_name(text, name):
+    assert named_reference(text, name) is None
