@@ -101,6 +101,55 @@ def self_reference(value):
     )
 
 
+_NAME_PREAMBLE = r"^(?:(?:请问|你还记得|还记得|记得|我想问|我忘了|我记不清|群里|关于)\s*)+"
+_REPORT_WHEN = r"(?:(?:上次|之前|以前|刚才|前面)\s*)?"
+_REPORT_VERB = r"(?:提到过|说起过|提过|说过)"
+_REPORT_PREFIX = r"(?:(?:不是|并非|如果|假如)\s*)?"
+_REPORT_NEGATION = r"(?:并没有|没有|并未|不曾|没|未)?"
+
+
+def _reference_body(value, *, lexical=False):
+    if lexical:
+        value = lexical_question_text(value)
+    return re.sub(_NAME_PREAMBLE, "", clean_query(value).strip())
+
+
+def explicit_named_reference(value):
+    """Recognize bounded person wording without resolving or inventing a person.
+
+    An unknown plain 'X的' can also describe an object or location. Only a
+    home/deictic possessive, English possessive or the existing reporting frame
+    establishes an unresolved name constraint. Known names still use the exact
+    sourced-name grammar below, including names outside these lexical bounds.
+    """
+    label = r"(?P<label>[\u3400-\u9fff]{1,32}?|[A-Za-z][\w-]*(?:[ \t]+[A-Za-z][\w-]*){0,3})"
+    possessive = re.match(
+        label + r"\s*(?:家(?:的)?|那(?:一)?只|这(?:一)?只|['’]s\b)",
+        _reference_body(value, lexical=True),
+        re.I,
+    )
+    report = re.match(
+        _REPORT_PREFIX + label + r"\s*" + _REPORT_WHEN + _REPORT_NEGATION + _REPORT_VERB,
+        _reference_body(value),
+        re.I,
+    )
+    for match in (possessive, report):
+        if match is None:
+            continue
+        name = match["label"]
+        # These unbound forms also have ordinary deictic, place or object
+        # readings: 这家/大家/厂家/作家, 桌上那只猫, 猫咪家, etc. This is not
+        # a name blacklist; an actual sourced canonical name is handled first.
+        if re.fullmatch(r"我|你|他|她|咱|这|那|大|哪|每|各|全|厂|作", name):
+            continue
+        if re.search(r"有人|说|问|写|告诉|转述", name):
+            continue
+        if re.search(r"[家上下旁里外边]$", name) or topic_tokens(name) or query_aliases(name):
+            continue
+        return True
+    return False
+
+
 def named_reference(value, name):
     """An exact sourced name in a possessive or a bounded source-speaker reference.
 
@@ -108,9 +157,7 @@ def named_reference(value, name):
     source question, which must not fall back to another owner's topic matches.
     A speaker reference restricts whose source to recall, not an object's owner.
     """
-    preamble = r"^(?:(?:请问|你还记得|还记得|记得|我想问|我忘了|我记不清|群里|关于)\s*)+"
-    body = clean_query(lexical_question_text(value)).strip()
-    body = re.sub(preamble, "", body)
+    body = _reference_body(value, lexical=True)
     match = re.match(
         re.escape(name) + r"(?=\s*(?:的|那(?:一)?只|这(?:一)?只|家(?:的)?|['’]s\b))",
         body,
@@ -120,11 +167,9 @@ def named_reference(value, name):
         return body[match.end() :].lstrip("的 ")
     # Unlike lexical scaffolding, an object's own historical/current qualifiers
     # remain literal. Only the time attached to the reporting verb is consumed.
-    body = re.sub(preamble, "", clean_query(value).strip())
+    body = _reference_body(value)
     speaker = re.escape(name) + r"\s*"
-    when = r"(?:(?:上次|之前|以前|刚才|前面)\s*)?"
-    report = r"(?:提到过|说起过|提过|说过)"
-    match = re.match(speaker + when + report + r"的\s*(.+)$", body, re.I)
+    match = re.match(speaker + _REPORT_WHEN + _REPORT_VERB + r"的\s*(.+)$", body, re.I)
     if match is not None:
         target = match[1].strip()
         # A second possessor, reported quotation or extra clause needs evidence
@@ -149,14 +194,8 @@ def named_reference(value, name):
         return target
     # Negated/conditional/joint reports are not a positive source connection.
     # Exact name boundaries keep a short name from shadowing a longer one.
-    unsafe = (
-        r"(?:(?:不是|并非|如果|假如)\s*)?"
-        + speaker
-        + when
-        + r"(?:并没有|没有|并未|不曾|没|未)?"
-        + report
-    )
-    joint = speaker + r"(?:和|与|跟|替|帮)[^，,。；;：:\n\r]{1,32}" + report
+    unsafe = _REPORT_PREFIX + speaker + _REPORT_WHEN + _REPORT_NEGATION + _REPORT_VERB
+    joint = speaker + r"(?:和|与|跟|替|帮)[^，,。；;：:\n\r]{1,32}" + _REPORT_VERB
     return "" if re.match(unsafe, body, re.I) or re.match(joint, body, re.I) else None
 
 

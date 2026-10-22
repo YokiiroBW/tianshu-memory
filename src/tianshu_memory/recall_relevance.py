@@ -7,6 +7,7 @@ from .fact_migration import installed
 from .recall_constraints import Constraints
 from .recall_language import (
     correction_target,
+    explicit_named_reference,
     named_reference,
     normalize_objects,
     query_aliases,
@@ -87,8 +88,9 @@ def named_owner(service, db, candidates, query, *, complete, fact_snapshot=None)
     must travel with any selected target group.
     A truncated window cannot establish uniqueness, even if its prefix has one match.
     """
+    explicit = explicit_named_reference(query)
     if not (installed(db) if fact_snapshot is None else fact_snapshot.installed):
-        return candidates, [], query
+        return ([] if explicit else candidates), [], query
     from .automatic_facts import normalize
     from .fact_names import candidate
     from .fact_queries import snapshot_for_groups
@@ -125,9 +127,13 @@ def named_owner(service, db, candidates, query, *, complete, fact_snapshot=None)
         # family/window is incomplete, conflicted, expired or not yet effective.
         # Do not silently turn that explicit name question into ordinary group
         # recall merely because the current-name set is empty.
-        if uncertain or any(
-            named_reference(query, entry.fact["value"].strip()) is not None
-            for entry in names.entries.values()
+        if (
+            explicit
+            or uncertain
+            or any(
+                named_reference(query, entry.fact["value"].strip()) is not None
+                for entry in names.entries.values()
+            )
         ):
             return [], [], query
         return candidates, [], query
