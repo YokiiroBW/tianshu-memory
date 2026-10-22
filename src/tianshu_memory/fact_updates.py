@@ -6,6 +6,8 @@ value of the predicate. Ambiguous denials remain evidence without retiring facts
 
 import re
 
+from . import fact_labels
+
 NEGATIVE = re.compile(
     r"(?:不再|没有|没|不|很少|从未|从不)(?:再|太|怎么|跟着|重新|换回去|换回)*"
     r"(?:喝|吃|碰|选|点|用|住|喜欢|爱|养|去|是|叫|换回)|"
@@ -37,9 +39,15 @@ def positive_clauses(fact, unit):
     return [part for part in parts if not NEGATIVE.search(part) and not UNCHANGED.search(part)]
 
 
-def may_replace(prior, prior_unit, current, current_unit):
+def may_replace(prior, prior_unit, current, current_unit, *, current_quotes=None):
     """Called only after entity, source, scope and effective-time checks."""
-    # Attribute names/titles can themselves look like negative sentences.
+    if fact_labels.candidate(current):
+        # A new affirmation may carry additional denial evidence without
+        # declaring the unchanged literal itself to be a historical label.
+        if current["value"].strip().casefold() == prior["value"].strip().casefold():
+            return False
+        return bool(current_quotes) and fact_labels.positive_source(current, current_quotes)
+    # Author-name families retain their separately source-proven behavior.
     if current["key"].split(".")[-1] in {"name", "title"}:
         return True
     positive = positive_clauses(current, current_unit)

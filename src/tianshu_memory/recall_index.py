@@ -255,7 +255,7 @@ def rank_groups(
             batch,
         ):
             indexed.setdefault((row["record_id"], row["record_version"]), row["text"])
-    from .fact_entities import historical_title_groups
+    from .fact_entities import OBJECT_NOUNS, historical_title_groups
     from .fact_references import reference_terms
     from .recall_language import history_query
 
@@ -286,6 +286,29 @@ def rank_groups(
     raw_text = {
         group["id"]: " ".join(u["statement"] for u in units) for group, _, units in eligible
     }
+    constraint_text = dict(raw_text)
+    if fact_snapshot is not None:
+        from .fact_labels import candidate as object_label
+
+        for group, _, units in eligible:
+            row = fact_snapshot.rows.get(group["id"])
+            fact = fact_snapshot.decoded.get(group["id"])
+            if (
+                row is not None
+                and row["scope"] == group["scope"]
+                and len(units) == 1
+                and fact is not None
+                and object_label(fact)
+                and fact.get("entity") is not None
+                and units[0]["statement"] == fact["value"]
+            ):
+                # A literal label can itself contain 狗/妹妹/否定. It is not an
+                # object assertion; constrain only by its already bound entity,
+                # without borrowing another object's words from the source quote.
+                entity = fact["entity"]
+                nouns = OBJECT_NOUNS.get(entity["kind"], (None, ()))[1]
+                mention = entity["mention"] if entity["mention"] != fact["value"] else ""
+                constraint_text[group["id"]] = " ".join([mention, *nouns])
 
     def document(group, rows):
         if any((row["id"], row["version"]) not in indexed for row in rows):
@@ -321,7 +344,7 @@ def rank_groups(
     best_time = {}
     for match in ranked:
         identity = match["group_id"]
-        clauses = query_plan.match(set(match["text"].split()), raw_text[identity])
+        clauses = query_plan.match(set(match["text"].split()), constraint_text[identity])
         if identity not in historical and not clauses:
             continue
         clauses_by_group[identity] = clauses

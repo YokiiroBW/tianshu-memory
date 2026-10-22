@@ -8,11 +8,12 @@ import json
 import re
 import unicodedata
 
-from . import fact_entities, fact_names
+from . import fact_entities, fact_labels, fact_names
 from .domain import canonical, fingerprint, parse_time, require
 from .fact_migration import installed, source_text_installed
 from .fact_queries import for_groups, snapshot_for_groups
 from .fact_updates import may_replace
+from .postgres import GROUP_READ_BATCH
 
 FIELDS = {"key", "value", "state", "valid_from", "valid_to", "keywords"}
 
@@ -344,13 +345,38 @@ def commit(writer, db, draft, event, source_map):
             prior_unit = _prior_unit(db, old["group_id"], names)
             if prior_unit:
                 eligible.append((old, prior, prior_unit))
+        label_quotes = {}
+        if fact_labels.candidate(fact):
+            # The two replacement directions must each use their current
+            # group's own source evidence. Reuse incoming quotes when possible;
+            # older/newer retained groups are fetched together, never per row.
+            label_quotes[group_id] = [proof["quote"] for proof in draft["quotes"]]
+            needed = {
+                old["group_id"]
+                for old, prior, _ in eligible
+                if parse_time(prior["valid_from"] or old["observed_at"]) > parse_time(effective)
+            }
+            if not fact_labels.positive_source(fact, label_quotes[group_id]):
+                needed.add(group_id)
+            keys = sorted(needed)
+            for offset in range(0, len(keys), GROUP_READ_BATCH):
+                batch = keys[offset : offset + GROUP_READ_BATCH]
+                for row in db.execute(
+                    "SELECT group_id,quote FROM automatic_evidence WHERE group_id IN ("
+                    + ",".join("?" for _ in batch)
+                    + ")",
+                    batch,
+                ):
+                    label_quotes.setdefault(row["group_id"], []).append(row["quote"])
         # A queued older proposal is evidence of the past, even if it finishes last.
         # Decide this before retiring any previously current group.
         newer = [
             (old, prior, prior_unit)
             for old, prior, prior_unit in eligible
             if parse_time(prior["valid_from"] or old["observed_at"]) > parse_time(effective)
-            and may_replace(fact, unit, prior, prior_unit)
+            and may_replace(
+                fact, unit, prior, prior_unit, current_quotes=label_quotes.get(old["group_id"])
+            )
         ]
         if newer:
             old, prior, _ = max(
@@ -369,7 +395,9 @@ def commit(writer, db, draft, event, source_map):
         for old, prior, prior_unit in eligible:
             if parse_time(prior["valid_from"] or old["observed_at"]) >= parse_time(
                 effective
-            ) or not may_replace(prior, prior_unit, fact, unit):
+            ) or not may_replace(
+                prior, prior_unit, fact, unit, current_quotes=label_quotes.get(group_id)
+            ):
                 continue
             _supersede(
                 writer,

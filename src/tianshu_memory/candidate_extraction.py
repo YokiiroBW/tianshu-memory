@@ -202,11 +202,13 @@ class CandidateExtraction:
                 )
             )
             if "fact" in memory:
+                from .fact_labels import prepare as prepare_label
                 from .fact_names import candidate, prepare
                 from .temporal_facts import sourced_times
 
                 fact = sourced_times(facts.validate(memory["fact"]), evidence, content)
                 fact = prepare(fact, unit, evidence, content)
+                fact = prepare_label(fact, evidence, content)
                 # Scope/subject/reality come only from the authenticated source event.
                 require(event["reality"] == "real", "invalid_input", 400)
                 drafts[-1].update(
