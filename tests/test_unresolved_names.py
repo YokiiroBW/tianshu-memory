@@ -1,5 +1,7 @@
 """Unresolved explicit people do not borrow another authorized owner's animal."""
 
+from collections import Counter
+
 import pytest
 from test_automatic_facts import add
 from test_group_context import cat, named_cats, owner, query, recalled
@@ -8,7 +10,80 @@ from test_source_sync import certificates as certificates
 from test_source_sync import source_contracts as source_contracts
 from test_source_sync import source_examples as source_examples
 
-from tianshu_memory.recall_language import explicit_named_reference, named_reference
+from tianshu_memory import recall_language
+from tianshu_memory.domain import Fault
+from tianshu_memory.recall_language import (
+    NamedReferenceQuery,
+    explicit_named_reference,
+    named_reference,
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "explicit", "remaining"),
+    [
+        ("请问阿川之前提到过的那只猫现在叫什么", True, "那只猫现在叫什么"),
+        ("阿川的红皮本子叫什么", False, "红皮本子叫什么"),
+        ("阿川提过的小禾家的猫叫什么", True, ""),
+        ("请问", False, None),
+        ("有人说阿川提过的猫叫什么", False, None),
+    ],
+)
+def test_prepared_reference_keeps_grammar_and_reuses_even_empty_query_bodies(
+    monkeypatch, text, explicit, remaining
+):
+    original = recall_language._reference_body
+    calls = Counter()
+
+    def counted(value, *, lexical=False):
+        calls[lexical] += 1
+        return original(value, lexical=lexical)
+
+    monkeypatch.setattr(recall_language, "_reference_body", counted)
+    query = NamedReferenceQuery(text)
+    names = ["阿", "阿川", "Ann Marie", "小禾"]
+    for _ in range(2):
+        assert query.explicit() is explicit
+        assert [query.for_name(name) for name in names] == [None, remaining, None, None]
+    assert calls == {False: 1, True: 1}
+
+
+@pytest.mark.parametrize("operation", ["explicit_hearsay", "known_possessive"])
+def test_prepared_reference_only_computes_the_body_reached_by_original_short_circuit(
+    monkeypatch, operation
+):
+    original = recall_language._reference_body
+
+    def restricted(value, *, lexical=False):
+        if lexical == (operation == "explicit_hearsay"):
+            raise AssertionError("the original grammar short-circuits before this body")
+        return original(value, lexical=lexical)
+
+    monkeypatch.setattr(recall_language, "_reference_body", restricted)
+    if operation == "explicit_hearsay":
+        assert not NamedReferenceQuery("有人说阿川提过的猫叫什么").explicit()
+    else:
+        assert NamedReferenceQuery("阿川的猫叫什么").for_name("阿川") == "猫叫什么"
+
+
+def test_prepared_reference_retries_exceptions_and_new_queries_recompute(monkeypatch):
+    original = recall_language._reference_body
+    calls = 0
+
+    def retry(value, *, lexical=False):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise Fault("dependency_unavailable", 503)
+        return original(value, lexical=lexical)
+
+    monkeypatch.setattr(recall_language, "_reference_body", retry)
+    query = NamedReferenceQuery("阿川的猫叫什么")
+    with pytest.raises(Fault, match="dependency_unavailable"):
+        query.for_name("阿川")
+    assert query.for_name("阿川") == "猫叫什么"
+    assert NamedReferenceQuery("阿川的猫叫什么").for_name("阿川") == "猫叫什么"
+    assert calls == 3
 
 
 @pytest.mark.parametrize(

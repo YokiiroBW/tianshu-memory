@@ -114,100 +114,125 @@ def _reference_body(value, *, lexical=False):
     return re.sub(_NAME_PREAMBLE, "", clean_query(value).strip())
 
 
-def explicit_named_reference(value):
-    """Recognize bounded person wording without resolving or inventing a person.
+class NamedReferenceQuery:
+    """Lazy pure text preparation for one named-owner resolution, never its proofs."""
 
-    An unknown plain 'X的' can also describe an object or location. Only a
-    home/deictic possessive, English possessive or the existing reporting frame
-    establishes an unresolved name constraint. Known names still use the exact
-    sourced-name grammar below, including names outside these lexical bounds.
-    """
-    body = _reference_body(value)
-    if re.match(r"有人(?:说|问|提到|写道)|听说|据说", body):
+    def __init__(self, value):
+        self.value = value
+        self._bodies = {}
+
+    def _body(self, *, lexical=False):
+        if lexical not in self._bodies:
+            self._bodies[lexical] = _reference_body(self.value, lexical=lexical)
+        return self._bodies[lexical]
+
+    def explicit(self):
+        """Recognize bounded person wording without resolving or inventing a person.
+
+        An unknown plain 'X的' can also describe an object or location. Only a
+        home/deictic possessive, English possessive or the existing reporting frame
+        establishes an unresolved name constraint. Known names still use the exact
+        sourced-name grammar below, including names outside these lexical bounds.
+        """
+        body = self._body()
+        if re.match(r"有人(?:说|问|提到|写道)|听说|据说", body):
+            return False
+        label = r"(?P<label>[\u3400-\u9fff]{1,32}?|[A-Za-z][\w-]*(?:[ \t]+[A-Za-z][\w-]*){0,3})"
+        possessive = re.match(
+            label + r"\s*(?:家(?:的|(?=那(?:一)?只|这(?:一)?只))|['’]s\b)",
+            self._body(lexical=True),
+            re.I,
+        )
+        deictic = re.match(
+            label + r"\s*(?:那(?:一)?只|这(?:一)?只)",
+            self._body(lexical=True),
+            re.I,
+        )
+        report = re.match(
+            _REPORT_PREFIX + label + r"\s*" + _REPORT_WHEN + _REPORT_NEGATION + _REPORT_VERB,
+            body,
+            re.I,
+        )
+        for match, strong in ((possessive, True), (report, True), (deictic, False)):
+            if match is None:
+                continue
+            name = match["label"]
+            # These unbound forms also have ordinary deictic, place or object
+            # readings: 这家/大家/厂家/作家, 桌上那只猫, 猫咪家, etc. This is not
+            # a name blacklist; an actual sourced canonical name is handled first.
+            if re.match(r"我|你|他|她|咱|这|那", name) or re.fullmatch(
+                r"大|哪|每|各|全|厂|作", name
+            ):
+                continue
+            if re.search(r"[家上下旁里外边]$", name):
+                continue
+            # Object/location words disambiguate only the weak 'X那只' frame.
+            # A nickname such as 小猫/咖啡/说说 still constrains a strong home or
+            # reporting frame; no visible name witness must mean no owner match.
+            if not strong and (topic_tokens(name) or query_aliases(name)):
+                continue
+            return True
         return False
-    label = r"(?P<label>[\u3400-\u9fff]{1,32}?|[A-Za-z][\w-]*(?:[ \t]+[A-Za-z][\w-]*){0,3})"
-    possessive = re.match(
-        label + r"\s*(?:家(?:的|(?=那(?:一)?只|这(?:一)?只))|['’]s\b)",
-        _reference_body(value, lexical=True),
-        re.I,
-    )
-    deictic = re.match(
-        label + r"\s*(?:那(?:一)?只|这(?:一)?只)",
-        _reference_body(value, lexical=True),
-        re.I,
-    )
-    report = re.match(
-        _REPORT_PREFIX + label + r"\s*" + _REPORT_WHEN + _REPORT_NEGATION + _REPORT_VERB,
-        body,
-        re.I,
-    )
-    for match, strong in ((possessive, True), (report, True), (deictic, False)):
-        if match is None:
-            continue
-        name = match["label"]
-        # These unbound forms also have ordinary deictic, place or object
-        # readings: 这家/大家/厂家/作家, 桌上那只猫, 猫咪家, etc. This is not
-        # a name blacklist; an actual sourced canonical name is handled first.
-        if re.match(r"我|你|他|她|咱|这|那", name) or re.fullmatch(r"大|哪|每|各|全|厂|作", name):
-            continue
-        if re.search(r"[家上下旁里外边]$", name):
-            continue
-        # Object/location words disambiguate only the weak 'X那只' frame.
-        # A nickname such as 小猫/咖啡/说说 still constrains a strong home or
-        # reporting frame; no visible name witness must mean no owner match.
-        if not strong and (topic_tokens(name) or query_aliases(name)):
-            continue
-        return True
-    return False
+
+    def for_name(self, name):
+        """An exact sourced name in a possessive or a bounded source-speaker reference.
+
+        None is not a reference. An empty reference is a recognized but unsupported
+        source question, which must not fall back to another owner's topic matches.
+        A speaker reference restricts whose source to recall, not an object's owner.
+        """
+        body = self._body(lexical=True)
+        match = re.match(
+            re.escape(name) + r"(?=\s*(?:的|那(?:一)?只|这(?:一)?只|家(?:的)?|['’]s\b))",
+            body,
+            re.I,
+        )
+        if match is not None:
+            return body[match.end() :].lstrip("的 ")
+        # Unlike lexical scaffolding, an object's own historical/current qualifiers
+        # remain literal. Only the time attached to the reporting verb is consumed.
+        body = self._body()
+        speaker = re.escape(name) + r"\s*"
+        match = re.match(speaker + _REPORT_WHEN + _REPORT_VERB + r"的\s*(.+)$", body, re.I)
+        if match is not None:
+            target = match[1].strip()
+            # A second possessor, reported quotation or extra clause needs evidence
+            # this bounded grammar does not establish. Do not erase that qualifier.
+            head = re.sub(r"^(?:(?:以前|之前|原来|现在|目前)(?:的)?\s*)+", "", target)
+            plain = re.sub(r"的(?:名字|名称|位置|原名|旧名)", "", head).rstrip("？?。.!！")
+            if re.search(
+                r"[，,。；;：:.!?！？\n\r\"'“”‘’「」『』《》`（）()【】\[\]]|的|家(?:那|这)|和|与|跟|还有|没|不|未|别",
+                plain,
+            ):
+                return ""
+            head = _object_focus(head)
+            if head is None:
+                return ""
+            head = head.casefold()
+            aliases = topic_aliases(head) | set(query_aliases(head))
+            if not any(
+                re.match(
+                    re.escape(alias.casefold()) + (r"(?![a-z])" if alias.isascii() else ""), head
+                )
+                for alias in aliases
+            ):
+                return ""
+            return target
+        # Negated/conditional/joint reports are not a positive source connection.
+        # Exact name boundaries keep a short name from shadowing a longer one.
+        unsafe = _REPORT_PREFIX + speaker + _REPORT_WHEN + _REPORT_NEGATION + _REPORT_VERB
+        joint = speaker + r"(?:和|与|跟|替|帮)[^，,。；;：:\n\r]{1,32}" + _REPORT_VERB
+        return "" if re.match(unsafe, body, re.I) or re.match(joint, body, re.I) else None
+
+
+def explicit_named_reference(value):
+    """Recognize explicit person wording for one standalone query."""
+    return NamedReferenceQuery(value).explicit()
 
 
 def named_reference(value, name):
-    """An exact sourced name in a possessive or a bounded source-speaker reference.
-
-    None is not a reference. An empty reference is a recognized but unsupported
-    source question, which must not fall back to another owner's topic matches.
-    A speaker reference restricts whose source to recall, not an object's owner.
-    """
-    body = _reference_body(value, lexical=True)
-    match = re.match(
-        re.escape(name) + r"(?=\s*(?:的|那(?:一)?只|这(?:一)?只|家(?:的)?|['’]s\b))",
-        body,
-        re.I,
-    )
-    if match is not None:
-        return body[match.end() :].lstrip("的 ")
-    # Unlike lexical scaffolding, an object's own historical/current qualifiers
-    # remain literal. Only the time attached to the reporting verb is consumed.
-    body = _reference_body(value)
-    speaker = re.escape(name) + r"\s*"
-    match = re.match(speaker + _REPORT_WHEN + _REPORT_VERB + r"的\s*(.+)$", body, re.I)
-    if match is not None:
-        target = match[1].strip()
-        # A second possessor, reported quotation or extra clause needs evidence
-        # this bounded grammar does not establish. Do not erase that qualifier.
-        head = re.sub(r"^(?:(?:以前|之前|原来|现在|目前)(?:的)?\s*)+", "", target)
-        plain = re.sub(r"的(?:名字|名称|位置|原名|旧名)", "", head).rstrip("？?。.!！")
-        if re.search(
-            r"[，,。；;：:.!?！？\n\r\"'“”‘’「」『』《》`（）()【】\[\]]|的|家(?:那|这)|和|与|跟|还有|没|不|未|别",
-            plain,
-        ):
-            return ""
-        head = _object_focus(head)
-        if head is None:
-            return ""
-        head = head.casefold()
-        aliases = topic_aliases(head) | set(query_aliases(head))
-        if not any(
-            re.match(re.escape(alias.casefold()) + (r"(?![a-z])" if alias.isascii() else ""), head)
-            for alias in aliases
-        ):
-            return ""
-        return target
-    # Negated/conditional/joint reports are not a positive source connection.
-    # Exact name boundaries keep a short name from shadowing a longer one.
-    unsafe = _REPORT_PREFIX + speaker + _REPORT_WHEN + _REPORT_NEGATION + _REPORT_VERB
-    joint = speaker + r"(?:和|与|跟|替|帮)[^，,。；;：:\n\r]{1,32}" + _REPORT_VERB
-    return "" if re.match(unsafe, body, re.I) or re.match(joint, body, re.I) else None
+    """Return one sourced name's target, an unsupported target, or no reference."""
+    return NamedReferenceQuery(value).for_name(name)
 
 
 def lexical_question_text(value):

@@ -6,9 +6,8 @@ from .domain import query_terms, terms
 from .fact_migration import installed
 from .recall_constraints import Constraints
 from .recall_language import (
+    NamedReferenceQuery,
     correction_target,
-    explicit_named_reference,
-    named_reference,
     normalize_objects,
     query_aliases,
     query_clauses,
@@ -88,7 +87,8 @@ def named_owner(service, db, candidates, query, *, complete, fact_snapshot=None)
     must travel with any selected target group.
     A truncated window cannot establish uniqueness, even if its prefix has one match.
     """
-    explicit = explicit_named_reference(query)
+    references = NamedReferenceQuery(query)
+    explicit = references.explicit()
     if not (installed(db) if fact_snapshot is None else fact_snapshot.installed):
         return ([] if explicit else candidates), [], query
     from .automatic_facts import normalize
@@ -113,13 +113,13 @@ def named_owner(service, db, candidates, query, *, complete, fact_snapshot=None)
                 and row["scope"] == entry[0]["scope"]
                 and len(entry[2]) == 1
                 and candidate(fact)
-                and named_reference(query, fact["value"].strip()) is not None
+                and references.for_name(fact["value"].strip()) is not None
             ):
                 uncertain.add(entry[0]["scope"])
         if name is None or identity not in current_names:
             continue
         fact = name.fact
-        remaining = named_reference(query, fact["value"].strip())
+        remaining = references.for_name(fact["value"].strip())
         if remaining is not None:
             matches.append((entry, remaining))
     if not matches:
@@ -131,7 +131,7 @@ def named_owner(service, db, candidates, query, *, complete, fact_snapshot=None)
             explicit
             or uncertain
             or any(
-                named_reference(query, entry.fact["value"].strip()) is not None
+                references.for_name(entry.fact["value"].strip()) is not None
                 for entry in names.entries.values()
             )
         ):
