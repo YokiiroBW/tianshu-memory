@@ -30,6 +30,27 @@ from test_knowledge_directories import catalog as catalog
 from test_knowledge_directories import (
     test_apply_imports_the_previewed_content_and_a_rescan_is_unchanged as directory_case,
 )
+from test_knowledge_references import (
+    test_collection_check_keeps_early_failure_before_later_malformed_block as reference_check_case,
+)
+from test_knowledge_references import (
+    test_collection_file_change_between_hash_reads_is_still_rejected as reference_file_case,
+)
+from test_knowledge_references import (
+    test_collection_matches_scalar_order_and_body_admission as reference_admission_case,
+)
+from test_knowledge_references import (
+    test_collection_repeats_source_checks_and_reloads_rows_in_each_phase as reference_phase_case,
+)
+from test_knowledge_references import (
+    test_collection_state_recovery_check_budget_and_project_isolation as reference_workflow_case,
+)
+from test_knowledge_references import (
+    test_collection_url_allowlist_remains_a_body_gate as reference_url_case,
+)
+from test_knowledge_references import (
+    test_corrupt_early_evidence_keeps_original_failure_before_later_capture as reference_corrupt_case,
+)
 from test_lessons import lessons as lessons
 from test_lessons import (
     test_global_retrieval_never_leaks_unauthorized_projects as experience_case,
@@ -214,6 +235,56 @@ def test_postgres_knowledge_complete_groups_and_live_file_authority(knowledge):
         path.write_text(canonical(denied), encoding="utf-8")
         with pytest.raises(Fault):
             query(run)
+
+
+@pytest.fixture
+def pg_knowledge_references(knowledge):
+    run, root, old, path, config = knowledge
+    old.close()
+    with postgres_store(old.path, settings=config, service="knowledge") as (store, settings):
+        config["storage_backends"] = settings["storage_backends"]
+        path.write_text(canonical(config), encoding="utf-8")
+        yield run, root, store, path, config
+
+
+@pytest.mark.parametrize(
+    "case", ["valid", "missing_document", "version", "hash", "missing_block", "withdrawn", "file"]
+)
+def test_postgres_knowledge_reference_collection_admission(pg_knowledge_references, case):
+    reference_admission_case(pg_knowledge_references, case)
+
+
+@pytest.mark.parametrize("corruption", ["body", "provenance", "file_ref"])
+@pytest.mark.parametrize("later", ["valid", "malformed", "nul", "surrogate"])
+def test_postgres_knowledge_reference_collection_failure_order(
+    pg_knowledge_references, corruption, later
+):
+    reference_corrupt_case(pg_knowledge_references, corruption, later)
+
+
+@pytest.mark.parametrize(
+    "case", [reference_phase_case, reference_workflow_case], ids=["phase", "state"]
+)
+def test_postgres_knowledge_reference_collection_phases_and_state(pg_knowledge_references, case):
+    case(pg_knowledge_references)
+
+
+@pytest.mark.parametrize("operation", ["write_state", "recover", "check"])
+def test_postgres_knowledge_reference_collection_file_freshness(
+    pg_knowledge_references, monkeypatch, operation
+):
+    reference_file_case(pg_knowledge_references, monkeypatch, operation)
+
+
+def test_postgres_knowledge_reference_collection_url_allowlist(
+    pg_knowledge_references, monkeypatch
+):
+    reference_url_case(pg_knowledge_references, monkeypatch)
+
+
+@pytest.mark.parametrize("first", ["stale", "corrupt"])
+def test_postgres_knowledge_reference_collection_malformed_package(pg_knowledge_references, first):
+    reference_check_case(pg_knowledge_references, first)
 
 
 @pytest.mark.parametrize("case", [lesson_case, experience_case], ids=["lessons", "experience"])

@@ -1041,11 +1041,15 @@ class KnowledgeApplication:
         db.execute("UPDATE knowledge_projects SET revision=revision+1 WHERE id=?", (project_id,))
 
     @staticmethod
-    def _document(db, project_id, document_id):
-        row = db.execute(
-            "SELECT * FROM knowledge_documents WHERE id=? AND project_id=?",
-            (document_id, project_id),
-        ).fetchone()
+    def _document(db, project_id, document_id, *, documents=None):
+        row = (
+            db.execute(
+                "SELECT * FROM knowledge_documents WHERE id=? AND project_id=?",
+                (document_id, project_id),
+            ).fetchone()
+            if documents is None
+            else documents.get(document_id)
+        )
         require(row is not None, "not_found", 404)
         return row
 
@@ -1192,23 +1196,50 @@ class KnowledgeApplication:
             expected_hash = version["hash"]
         return read(document, expected_hash)
 
-    def _reference(self, db, project_id, project, reference, read):
+    def _reference(self, db, project_id, project, reference, read, *, rows=None):
         exact(reference, "block_id document_id version hash")
-        document = self._document(db, project_id, reference["document_id"])
+        document = self._document(
+            db,
+            project_id,
+            reference["document_id"],
+            documents=None if rows is None else rows.documents,
+        )
         require(
             document["version"] == reference["version"]
-            and self._current(db, project, document, read),
+            and self._current(
+                db,
+                project,
+                document,
+                read,
+                expected_hash=None if rows is None else document["reference_hash"],
+            ),
             "stale_evidence",
             409,
         )
-        row = db.execute(
-            "SELECT b.payload,v.hash,v.provenance FROM knowledge_blocks b "
-            "JOIN knowledge_versions v ON v.document_id=b.document_id "
-            "AND v.version=b.version WHERE b.id=? AND b.document_id=? AND b.version=?",
-            (reference["block_id"], document["id"], document["version"]),
-        ).fetchone()
+        row = (
+            db.execute(
+                "SELECT b.payload,v.hash,v.provenance FROM knowledge_blocks b "
+                "JOIN knowledge_versions v ON v.document_id=b.document_id "
+                "AND v.version=b.version WHERE b.id=? AND b.document_id=? AND b.version=?",
+                (reference["block_id"], document["id"], document["version"]),
+            ).fetchone()
+            if rows is None
+            else rows.block(document, reference)
+        )
         require(row is not None and row["hash"] == reference["hash"], "stale_evidence", 409)
         return self._evidence(db, document, reference, row)
+
+    def _references(self, db, project_id, project, references, read):
+        from .knowledge_references import resolve
+
+        return resolve(
+            db,
+            project_id,
+            project,
+            references,
+            read,
+            one=self._reference,
+        )
 
     @staticmethod
     def _evidence(db, document, reference, row):
@@ -1388,8 +1419,8 @@ class KnowledgeApplication:
             "evidence_required",
             400,
         )
-        for reference in state["evidence"]:
-            self._reference(db, project_id, project, reference, read)
+        for _ in self._references(db, project_id, project, state["evidence"], read):
+            pass
         require(
             isinstance(state["pitfalls"], list) and len(state["pitfalls"]) <= 8,
             "invalid_input",
@@ -1464,9 +1495,9 @@ class KnowledgeApplication:
         if state:
             payload = json.loads(state["payload"])
             try:
-                evidence = [
-                    self._reference(db, project_id, project, r, read) for r in payload["evidence"]
-                ]
+                evidence = list(
+                    self._references(db, project_id, project, payload["evidence"], read)
+                )
                 candidate = dict(
                     result, state={"version": state["version"], **payload}, blocks=evidence
                 )
@@ -1513,8 +1544,17 @@ class KnowledgeApplication:
         )
         if valid:
             try:
-                for block in package["blocks"]:
-                    self._reference(db, project_id, project, block["reference"], read)
+                blocks = package["blocks"]
+                if type(blocks) is list and all(
+                    type(block) is dict and "reference" in block for block in blocks
+                ):
+                    for _ in self._references(
+                        db, project_id, project, [block["reference"] for block in blocks], read
+                    ):
+                        pass
+                else:
+                    for block in blocks:
+                        self._reference(db, project_id, project, block["reference"], read)
             except Fault:
                 valid = False
         return {"valid": bool(valid), "reason": "current" if valid else "stale_or_tampered"}
