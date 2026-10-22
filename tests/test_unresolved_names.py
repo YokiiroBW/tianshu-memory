@@ -26,6 +26,12 @@ from tianshu_memory.recall_language import explicit_named_reference, named_refer
         "如果阿宁提过的猫叫什么？",
         "阿宁和小雨提过的猫叫什么？",
         "阿宁和小雨家的猫叫什么？",
+        "小猫家那只猫叫什么？",
+        "小猫提过的猫叫什么？",
+        "咖啡家的猫叫什么？",
+        "咖啡提过的猫叫什么？",
+        "说说家那只猫叫什么？",
+        "说说提过的猫叫什么？",
     ],
 )
 def test_explicit_person_wording_does_not_require_a_private_name_lookup(text):
@@ -48,6 +54,9 @@ def test_explicit_person_wording_does_not_require_a_private_name_lookup(text):
         "红杯子那只猫叫什么？",
         "红色的杯子叫什么？",
         "桌上的猫叫什么？",
+        "我妹妹那只猫叫什么？",
+        "那只家猫叫什么？",
+        "普通家猫叫什么？",
         "《阿宁家的猫》叫什么？",
         "‘阿宁提过的猫’叫什么？",
         "有人说阿宁提过的猫叫什么？",
@@ -150,6 +159,37 @@ def test_unknown_source_reference_is_not_another_owner_or_a_quoted_title(room):
     quoted = recalled(h, query(h, "《阿宁家的猫》叫什么？"))
     assert {unit["record_id"] for unit in quoted["selected_units"]} == set(title["record_ids"])
     assert a != b
+
+
+def test_topic_bearing_nicknames_need_a_current_witness_in_strong_frames(room):
+    h = room
+    public = owner(h)
+    star, _ = cat(h, public, "星渡", second=1)
+    for index, name in enumerate(("小猫", "咖啡", "说说")):
+        texts = (name + "家那只猫叫什么？", name + "提过的猫叫什么？")
+        for text in texts:
+            assert recalled(h, query(h, text))["selected_units"] == [], text
+        actor = owner(h)
+        witness, _ = add(h, "我叫" + name, "identity.name", name, actor=actor, second=2 + index * 2)
+        target, _ = cat(h, actor, f"栗团{index}", second=3 + index * 2)
+        for text in texts:
+            selected = recalled(h, query(h, text))
+            assert {unit["record_id"] for unit in selected["selected_units"]} == set(
+                witness["record_ids"] + target["record_ids"]
+            )
+            assert {unit["subject_person_id"] for unit in selected["selected_units"]} == {
+                h.scope(actor)["person_id"]
+            }
+    assert set(star["record_ids"]) <= {unit["record_id"] for unit in recalled(h)["selected_units"]}
+
+
+def test_deictic_relative_keeps_the_existing_object_owner_constraint(room):
+    h = room
+    public = owner(h)
+    cat(h, public, "星渡", second=1)
+    relative, _ = add(h, "我妹妹的猫叫白团", "pet.cat.name", "白团", second=2)
+    selected = recalled(h, query(h, "我妹妹那只猫叫什么？"))
+    assert {unit["record_id"] for unit in selected["selected_units"]} == set(relative["record_ids"])
 
 
 def test_zero_width_between_real_time_words_does_not_lose_the_complete_source_quote(room):

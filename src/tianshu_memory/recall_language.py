@@ -122,29 +122,40 @@ def explicit_named_reference(value):
     establishes an unresolved name constraint. Known names still use the exact
     sourced-name grammar below, including names outside these lexical bounds.
     """
+    body = _reference_body(value)
+    if re.match(r"有人(?:说|问|提到|写道)|听说|据说", body):
+        return False
     label = r"(?P<label>[\u3400-\u9fff]{1,32}?|[A-Za-z][\w-]*(?:[ \t]+[A-Za-z][\w-]*){0,3})"
     possessive = re.match(
-        label + r"\s*(?:家(?:的)?|那(?:一)?只|这(?:一)?只|['’]s\b)",
+        label + r"\s*(?:家(?:的|(?=那(?:一)?只|这(?:一)?只))|['’]s\b)",
+        _reference_body(value, lexical=True),
+        re.I,
+    )
+    deictic = re.match(
+        label + r"\s*(?:那(?:一)?只|这(?:一)?只)",
         _reference_body(value, lexical=True),
         re.I,
     )
     report = re.match(
         _REPORT_PREFIX + label + r"\s*" + _REPORT_WHEN + _REPORT_NEGATION + _REPORT_VERB,
-        _reference_body(value),
+        body,
         re.I,
     )
-    for match in (possessive, report):
+    for match, strong in ((possessive, True), (report, True), (deictic, False)):
         if match is None:
             continue
         name = match["label"]
         # These unbound forms also have ordinary deictic, place or object
         # readings: 这家/大家/厂家/作家, 桌上那只猫, 猫咪家, etc. This is not
         # a name blacklist; an actual sourced canonical name is handled first.
-        if re.fullmatch(r"我|你|他|她|咱|这|那|大|哪|每|各|全|厂|作", name):
+        if re.match(r"我|你|他|她|咱|这|那", name) or re.fullmatch(r"大|哪|每|各|全|厂|作", name):
             continue
-        if re.search(r"有人|说|问|写|告诉|转述", name):
+        if re.search(r"[家上下旁里外边]$", name):
             continue
-        if re.search(r"[家上下旁里外边]$", name) or topic_tokens(name) or query_aliases(name):
+        # Object/location words disambiguate only the weak 'X那只' frame.
+        # A nickname such as 小猫/咖啡/说说 still constrains a strong home or
+        # reporting frame; no visible name witness must mean no owner match.
+        if not strong and (topic_tokens(name) or query_aliases(name)):
             continue
         return True
     return False
