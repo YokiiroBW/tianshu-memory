@@ -289,6 +289,7 @@ def rank_groups(
     constraint_text = dict(raw_text)
     if fact_snapshot is not None:
         from .fact_labels import candidate as object_label
+        from .fact_labels import constraint_head
 
         for group, _, units in eligible:
             row = fact_snapshot.rows.get(group["id"])
@@ -307,7 +308,7 @@ def rank_groups(
                 # without borrowing another object's words from the source quote.
                 entity = fact["entity"]
                 nouns = OBJECT_NOUNS.get(entity["kind"], (None, ()))[1]
-                mention = entity["mention"] if entity["mention"] != fact["value"] else ""
+                mention = constraint_head(fact)
                 constraint_text[group["id"]] = " ".join([mention, *nouns])
 
     def document(group, rows):

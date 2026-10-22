@@ -90,7 +90,7 @@ def _nouns(fact):
     return tuple(noun for kind in kinds for noun in NOUNS.get(kind, ()))
 
 
-def _subject(fact, text):
+def _subject(fact, text, *, mention=None):
     text = _syntax(text)
     if SUBJECT_UNSAFE.search(text):
         return False
@@ -106,12 +106,14 @@ def _subject(fact, text):
     ]
     last = max((m.end() for m in nouns), default=0)
     last_start = min((m.start() for m in nouns if m.end() == last), default=0)
-    if entity and entity["mention"] != fact["value"]:
-        return any(m.end() >= last_start for m in re.finditer(re.escape(entity["mention"]), text))
+    mention = entity["mention"] if entity and mention is None else mention
+    if entity and mention != fact["value"]:
+        return any(m.end() >= last_start for m in re.finditer(re.escape(mention), text))
     return any(m.end() == last for noun in _nouns(fact) for m in re.finditer(re.escape(noun), text))
 
 
 def _apposition(text, value):
+    """Return the complete source-parsed label length, never a model-chosen cut."""
     if text and text[0] in PAIRS:
         quoted = _positions(text)
         end = next(
@@ -130,11 +132,56 @@ def _apposition(text, value):
         # A naming/denial clause is not the noun apposition 狗豆包. Its
         # assertion must be checked by the ordinary naming path instead.
         if NAMING.search(text) or re.match(rf"^(?:{NEGATIVE_WORDS})", text):
-            return False
+            return None
         action = ACTION.search(text)
         label = text[: action.start()] if action else text
     literal = _literal_end(label, value)
-    return bool(label) and literal == len(label)
+    return len(label) if label and literal == len(label) else None
+
+
+def _appositions(fact, text):
+    nouns = sorted(set(_nouns(fact)), key=len, reverse=True)
+    if not nouns:
+        return
+    quoted = _positions(text)
+    # Prefer complete vocabulary nouns: 猫咪糖球 cannot become 猫 + 咪糖球.
+    for match in re.finditer("|".join(re.escape(noun) for noun in nouns), text):
+        if quoted[match.start()]:
+            continue
+        tail_start = match.end()
+        while tail_start < len(text) and text[tail_start].isspace():
+            tail_start += 1
+        length = _apposition(text[tail_start:].strip(), fact["value"].strip())
+        if length is not None:
+            yield match.start(), match.end(), tail_start + length
+
+
+def _appositive_head(fact, text, noun_start, noun_end, label_end):
+    """Bind a whole composite mention, excluding the already parsed name from its head."""
+    entity = fact.get("entity")
+    if entity is None:
+        return None
+    mention = entity["mention"]
+    begin = label_end - len(mention)
+    if 0 <= begin <= noun_start and text[begin:label_end] == mention:
+        return text[begin:noun_end]
+    return None
+
+
+def constraint_head(fact):
+    """Only a relevance projection; this does not certify old source metadata."""
+    mention = fact["entity"]["mention"]
+    if mention == fact["value"]:
+        return ""
+    for noun_start, noun_end, label_end in _appositions(fact, mention):
+        head = _appositive_head(fact, mention, noun_start, noun_end, label_end)
+        if (
+            label_end == len(mention)
+            and head is not None
+            and _subject(fact, mention[:noun_end], mention=head)
+        ):
+            return head
+    return mention
 
 
 def _claims(text, fact, *, subject=True):
@@ -176,23 +223,22 @@ def _claims(text, fact, *, subject=True):
                 continue
             yield claim_start, end
         # Existing social input also uses the explicit apposition 我家狗豆包又… .
-        for noun in _nouns(fact):
-            for match in re.finditer(re.escape(noun) + r"\s*", clause):
-                position = start + match.start()
-                if quoted[position] or UNSAFE.search(syntax[sentence:position]):
-                    continue
-                tail = clause[match.end() :].strip()
-                if not _apposition(tail, value):
-                    continue
-                if subject and not _subject(fact, clause[: match.end()]):
-                    continue
-                if (
-                    NEGATIVE_END.search(grammar[: match.start()].strip())
-                    or fact["state"] != "current"
-                ):
-                    continue
-                if punctuation not in "？?" or not punctuation:
-                    yield start, end
+        for noun_start, noun_end, label_end in _appositions(fact, clause):
+            position = start + noun_start
+            if UNSAFE.search(syntax[sentence:position]):
+                continue
+            head = clause[:noun_end]
+            composite = _appositive_head(fact, clause, noun_start, noun_end, label_end)
+            if subject and not (
+                _subject(fact, head)
+                or composite is not None
+                and _subject(fact, head, mention=composite)
+            ):
+                continue
+            if NEGATIVE_END.search(grammar[:noun_start].strip()) or fact["state"] != "current":
+                continue
+            if punctuation not in "？?" or not punctuation:
+                yield start, end
         if punctuation in SENTENCE_ENDS:
             anchor = None
             sentence = end + 1
