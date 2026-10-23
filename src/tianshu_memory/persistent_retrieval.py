@@ -2,80 +2,118 @@
 
 import json
 import time
-from contextlib import closing
+from contextlib import closing, nullcontext
+from dataclasses import dataclass
 
 from .domain import Fault, canonical, require
 from .retrieval_vectors import vectors
 
 
+@dataclass
+class PreparedRanking:
+    by_id: dict
+    document_count: int
+    lexical_ids: list
+    settings: dict
+    available: dict
+    corrupted: list
+
+    @property
+    def external(self):
+        return bool(self.available or (self.settings["rerank"] and self.lexical_ids))
+
+
+def prepare(db, documents, lexical_ids, settings):
+    """Read the existing vectors without calling a backend or opening another transaction."""
+    by_id = {item["id"]: item for item in documents}
+    available, corrupted = {}, []
+    if settings["mode"] != "keyword" and documents:
+        for offset in range(0, len(documents), 256):
+            batch = documents[offset : offset + 256]
+            for row in db.execute(
+                "SELECT document_id,content_hash,vector FROM memory_vectors WHERE embedding_revision=? AND document_id IN ("
+                + ",".join("?" for _ in batch)
+                + ")",
+                [settings["embedding_revision"], *[item["id"] for item in batch]],
+            ):
+                if row["content_hash"] == by_id[row["document_id"]]["content_hash"]:
+                    try:
+                        available[row["document_id"]] = vectors([json.loads(row["vector"])], 1)[0]
+                    except (Fault, ValueError, TypeError):
+                        corrupted.append(
+                            (
+                                row["document_id"],
+                                row["content_hash"],
+                                settings["embedding_revision"],
+                                row["vector"],
+                            )
+                        )
+    return PreparedRanking(
+        by_id,
+        len(documents),
+        [identity for identity in lexical_ids if identity in by_id][: settings["candidates"]],
+        settings,
+        available,
+        corrupted,
+    )
+
+
+def discard_corrupt(db, plan):
+    if plan.corrupted:
+        db.executemany(
+            "DELETE FROM memory_vectors WHERE document_id=? AND content_hash=? AND embedding_revision=? AND vector=?",
+            plan.corrupted,
+        )
+
+
 def rank(retrieval, store, query, documents, lexical_ids, settings, *, deadline=None):
     deadline = deadline if deadline is not None else time.monotonic() + 8
-    by_id = {item["id"]: item for item in documents}
-    limit = settings["candidates"]
-    scores, available = {}, {}
-    complete = True
-    corrupted = []
-    if settings["mode"] != "keyword" and documents:
-        with closing(store.readonly()) as db:
-            for offset in range(0, len(documents), 256):
-                batch = documents[offset : offset + 256]
-                for row in db.execute(
-                    "SELECT document_id,content_hash,vector FROM memory_vectors WHERE embedding_revision=? AND document_id IN ("
-                    + ",".join("?" for _ in batch)
-                    + ")",
-                    [settings["embedding_revision"], *[item["id"] for item in batch]],
-                ):
-                    if row["content_hash"] == by_id[row["document_id"]]["content_hash"]:
-                        try:
-                            available[row["document_id"]] = vectors([json.loads(row["vector"])], 1)[
-                                0
-                            ]
-                        except (Fault, ValueError, TypeError):
-                            complete = False
-                            corrupted.append(
-                                (
-                                    row["document_id"],
-                                    row["content_hash"],
-                                    settings["embedding_revision"],
-                                    row["vector"],
-                                )
-                            )
-        if corrupted:
-            with store.transaction() as db:
-                db.executemany(
-                    "DELETE FROM memory_vectors WHERE document_id=? AND content_hash=? AND embedding_revision=? AND vector=?",
-                    corrupted,
+    reader = (
+        closing(store.readonly())
+        if settings["mode"] != "keyword" and documents
+        else nullcontext(None)
+    )
+    with reader as db:
+        plan = prepare(db, documents, lexical_ids, settings)
+    if plan.corrupted:
+        with store.transaction() as db:
+            discard_corrupt(db, plan)
+    return rank_prepared(retrieval, store, query, plan, deadline=deadline)
+
+
+def rank_prepared(retrieval, store, query, plan, *, deadline=None):
+    """Use one prepared snapshot; callers release their authority transaction for external work."""
+    deadline = deadline if deadline is not None else time.monotonic() + 8
+    by_id, available, settings = plan.by_id, plan.available, plan.settings
+    lexical_ids, limit = plan.lexical_ids, settings["candidates"]
+    scores = {}
+    if available:
+        try:
+            require(time.monotonic() < deadline, "dependency_unavailable", 503)
+            query_method = getattr(retrieval.backend, "embed_query", None)
+            bounded_query = getattr(retrieval.backend, "embed_query_before", None)
+            response = (
+                bounded_query(query, settings["revision"], deadline)
+                if bounded_query
+                else query_method(query, settings["revision"])
+                if query_method
+                else retrieval.backend.call(
+                    "embed", {"revision": settings["revision"], "texts": [query]}
                 )
-        if available:
-            try:
-                require(time.monotonic() < deadline, "dependency_unavailable", 503)
-                query_method = getattr(retrieval.backend, "embed_query", None)
-                bounded_query = getattr(retrieval.backend, "embed_query_before", None)
-                response = (
-                    bounded_query(query, settings["revision"], deadline)
-                    if bounded_query
-                    else query_method(query, settings["revision"])
-                    if query_method
-                    else retrieval.backend.call(
-                        "embed", {"revision": settings["revision"], "texts": [query]}
-                    )
-                )
-                value = vectors(response["vectors"], 1)[0]
-                require(
-                    all(len(vector) == len(value) for vector in available.values()),
-                    "dependency_unavailable",
-                    503,
-                )
-                scores = {
-                    identity: sum(left * right for left, right in zip(value, vector, strict=True))
-                    for identity, vector in available.items()
-                }
-            except (Fault, OSError, TimeoutError, ValueError, TypeError, KeyError):
-                return [
-                    by_id[identity] for identity in lexical_ids[:limit] if identity in by_id
-                ], False
+            )
+            value = vectors(response["vectors"], 1)[0]
+            require(
+                all(len(vector) == len(value) for vector in available.values()),
+                "dependency_unavailable",
+                503,
+            )
+            scores = {
+                identity: sum(left * right for left, right in zip(value, vector, strict=True))
+                for identity, vector in available.items()
+            }
+        except (Fault, OSError, TimeoutError, ValueError, TypeError, KeyError):
+            return [by_id[identity] for identity in lexical_ids], False
     semantic = sorted(scores, key=lambda identity: (-scores[identity], identity))[:limit]
-    lexical_ids = [identity for identity in lexical_ids if identity in by_id][:limit]
     if settings["mode"] == "vector":
         ranked = semantic or lexical_ids
     elif settings["mode"] == "hybrid":
@@ -116,8 +154,8 @@ def rank(retrieval, store, query, documents, lexical_ids, settings, *, deadline=
             ]
         except (Fault, OSError, TimeoutError, ValueError, TypeError, KeyError):
             return [by_id[identity] for identity in ranked], False
-    return [by_id[identity] for identity in ranked], complete and (
-        settings["mode"] == "keyword" or len(available) == len(documents)
+    return [by_id[identity] for identity in ranked], not plan.corrupted and (
+        settings["mode"] == "keyword" or len(available) == plan.document_count
     )
 
 

@@ -522,6 +522,8 @@ def verify(application, request, context, legacy_contexts):
 
 
 def execute(application, request, context):
+    from ..persistent_retrieval import discard_corrupt, prepare
+
     service = application.service
     require(
         len({query["query_id"] for query in request["queries"]}) == len(request["queries"]),
@@ -536,6 +538,12 @@ def execute(application, request, context):
                 400,
             )
     items = requirements(service, request, context)
+    settings, backend_failed = None, False
+    if service.retrieval is not None:
+        try:
+            settings = service.retrieval.settings()
+        except (Fault, OSError, TimeoutError):
+            backend_failed = True
     with operation(service, items) as db:
         frame = collect(service, db, request, context)
         if request["known_bundle"] is not None:
@@ -544,153 +552,161 @@ def execute(application, request, context):
             prepare_query(service, db, frame, query, request["selection"])
             for query in request["queries"]
         ]
-    settings, backend_failed = None, False
-    if service.retrieval is not None:
-        try:
-            settings = service.retrieval.settings()
-        except (Fault, OSError, TimeoutError):
-            backend_failed = True
+        for plan in prepared:
+            plan["ranking"] = (
+                prepare(db, plan["documents"], plan["lexical_ids"], settings) if settings else None
+            )
+            if plan["ranking"] is not None:
+                discard_corrupt(db, plan["ranking"])
+        if not any(plan["ranking"] is not None and plan["ranking"].external for plan in prepared):
+            # The evidence and its negative/selection proof are produced from this
+            # same fresh source boundary. Nothing outside the transaction ran.
+            rank_plans(service, prepared, backend_failed)
+            return assemble(service, db, request, context, frame, prepared)
+    rank_plans(service, prepared, backend_failed)
+    with operation(service, items) as db:
+        fresh = collect(service, db, request, context)
+        require(fresh["domain"] == frame["domain"], "scope_changed", 409)
+        return assemble(service, db, request, context, fresh, prepared)
+
+
+def rank_plans(service, prepared, backend_failed):
+    from ..persistent_retrieval import rank_prepared
+
     retrieval_deadline = time.monotonic() + 8
     for plan in prepared:
         by_id = {document["id"]: document for document in plan["documents"]}
         plan["ranked"] = [by_id[identity] for identity in plan["lexical_ids"] if identity in by_id]
         plan["index_complete"] = not backend_failed
-        if settings:
-            from ..persistent_retrieval import rank
-
-            plan["ranked"], plan["index_complete"] = rank(
+        if plan["ranking"] is not None:
+            plan["ranked"], plan["index_complete"] = rank_prepared(
                 service.retrieval,
                 service.store,
                 plan["subquery"]["text"],
-                plan["documents"],
-                plan["lexical_ids"],
-                settings,
+                plan["ranking"],
                 deadline=retrieval_deadline,
             )
-    with operation(service, items) as db:
-        fresh = collect(service, db, request, context)
-        require(fresh["domain"] == frame["domain"], "scope_changed", 409)
-        frame = fresh
-        evidence, results, constraints = [], [], []
-        included = set()
-        facts_count = episodes_count = 0
-        for plan in prepared:
-            query, resolution = plan["subquery"], plan["resolution"]
-            result_ids, omissions, missing_time = [], [], 0
-            witness_ids = [entry[0]["id"] for entry in plan["witnesses"]]
-            for document in plan["ranked"]:
-                batch = (
-                    fact_evidence(frame, document["group_id"])
-                    if document["kind"] == "fact"
-                    else [episode_evidence(db, document)]
-                )
-                if not batch:
-                    omissions.append("source_time_unavailable")
-                    continue
-                accepted = []
-                for item in batch:
-                    keep, missing = temporal(item, query["time_filter"])
-                    missing_time += missing
-                    if keep:
-                        accepted.append(item)
-                if len(accepted) != len(batch):
-                    continue
-                witnesses = [
-                    item for identity in witness_ids for item in fact_evidence(frame, identity)
-                ]
-                complete_batch = list(
-                    {item["evidence_id"]: item for item in [*witnesses, *accepted]}.values()
-                )
-                added = [item for item in complete_batch if item["evidence_id"] not in included]
-                new_facts = sum(item["kind"] != "episode" for item in added)
-                new_episodes = len(added) - new_facts
-                total = len(canonical([*evidence, *added]).encode())
-                owner_count = len(
-                    {
-                        canonical(frame["scope"]),
-                        *[canonical(item["owner_scope"]) for item in [*evidence, *added]],
-                    }
-                )
-                if (
-                    facts_count + new_facts > request["limits"]["facts"]
-                    or episodes_count + new_episodes > request["limits"]["episodes"]
-                    or total > request["budget"]["bytes"]
-                    or total > request["budget"]["tokens"]
-                    or owner_count > 17
-                ):
-                    omissions.append("budget")
-                    continue
-                evidence.extend(added)
-                included.update(item["evidence_id"] for item in added)
-                result_ids.extend(item["evidence_id"] for item in complete_batch)
-                facts_count += new_facts
-                episodes_count += new_episodes
-            unresolved = plan["reference_incomplete"] or any(
-                target["status"] != "resolved" for target in resolution["targets"]
+
+
+def assemble(service, db, request, context, frame, prepared):
+    evidence, results, constraints = [], [], []
+    included = set()
+    facts_count = episodes_count = 0
+    for plan in prepared:
+        query, resolution = plan["subquery"], plan["resolution"]
+        result_ids, omissions, missing_time = [], [], 0
+        witness_ids = [entry[0]["id"] for entry in plan["witnesses"]]
+        for document in plan["ranked"]:
+            batch = (
+                fact_evidence(frame, document["group_id"])
+                if document["kind"] == "fact"
+                else [episode_evidence(db, document)]
             )
-            if unresolved:
-                omissions.append("unresolved_reference")
-            if not plan["index_complete"]:
-                omissions.append("index_incomplete")
-            if missing_time:
+            if not batch:
                 omissions.append("source_time_unavailable")
-            incomplete = bool(omissions) or not frame["complete"]
-            status = "incomplete" if incomplete else "matched" if result_ids else "no_match"
-            if unresolved and not result_ids:
-                status = "unresolved"
-            proofs = ["positive_sources"]
-            if any(
-                target["kind"] == "named" and target["status"] == "resolved"
-                for target in resolution["targets"]
+                continue
+            accepted = []
+            for item in batch:
+                keep, missing = temporal(item, query["time_filter"])
+                missing_time += missing
+                if keep:
+                    accepted.append(item)
+            if len(accepted) != len(batch):
+                continue
+            witnesses = [
+                item for identity in witness_ids for item in fact_evidence(frame, identity)
+            ]
+            complete_batch = list(
+                {item["evidence_id"]: item for item in [*witnesses, *accepted]}.values()
+            )
+            added = [item for item in complete_batch if item["evidence_id"] not in included]
+            new_facts = sum(item["kind"] != "episode" for item in added)
+            new_episodes = len(added) - new_facts
+            total = len(canonical([*evidence, *added]).encode())
+            owner_count = len(
+                {
+                    canonical(frame["scope"]),
+                    *[canonical(item["owner_scope"]) for item in [*evidence, *added]],
+                }
+            )
+            if (
+                facts_count + new_facts > request["limits"]["facts"]
+                or episodes_count + new_episodes > request["limits"]["episodes"]
+                or total > request["budget"]["bytes"]
+                or total > request["budget"]["tokens"]
+                or owner_count > 17
             ):
-                proofs.append("unique_owner")
-            if query["intent"] == "current":
-                proofs.append("latest_values")
-            if status == "no_match":
-                omissions.append("no_match")
-                proofs.append("no_match")
-            selected = [item for item in evidence if item["evidence_id"] in result_ids]
-            results.append(
-                dict(
-                    query_id=query["query_id"],
-                    status=status,
-                    evidence_ids=list(dict.fromkeys(result_ids)),
-                    omissions=list(dict.fromkeys(omissions)),
-                    coverage=dict(
-                        matched_facts=sum(item["kind"] == "fact" for item in plan["ranked"]),
-                        returned_facts=sum(item["kind"] != "episode" for item in selected),
-                        matched_episodes=sum(item["kind"] == "episode" for item in plan["ranked"]),
-                        returned_episodes=sum(item["kind"] == "episode" for item in selected),
-                        candidate_complete=frame["complete"],
-                        index_complete=plan["index_complete"],
-                        history_complete=False,
-                        missing_source_times=missing_time,
-                    ),
-                )
-            )
-            constraints.append(
-                dict(
-                    query_id=query["query_id"],
-                    owner_resolution=resolution,
-                    proof_kinds=list(dict.fromkeys(proofs)),
-                    candidate_domain_hash=frame["domain"],
-                    candidate_count=len(frame["groups"]) + len(frame["episodes"]),
-                    candidate_domain_complete=frame["complete"],
-                    result_status=status,
-                )
-            )
-        bundle = make_bundle(service, db, request, context, frame, evidence, constraints)
-        size = len(canonical(evidence).encode()) if evidence else 0
-        return dict(
-            schema_version=2,
-            version_domain="memory-context/v2",
-            request_id=request["query"]["request_id"],
-            effective_scope=frame["scope"],
-            evidence=evidence,
-            query_results=results,
-            bundle=bundle,
-            budget_used=dict(tokens=size, bytes=size),
-            omissions=list(
-                dict.fromkeys(item for result in results for item in result["omissions"])
-            ),
+                omissions.append("budget")
+                continue
+            evidence.extend(added)
+            included.update(item["evidence_id"] for item in added)
+            result_ids.extend(item["evidence_id"] for item in complete_batch)
+            facts_count += new_facts
+            episodes_count += new_episodes
+        unresolved = plan["reference_incomplete"] or any(
+            target["status"] != "resolved" for target in resolution["targets"]
         )
+        if unresolved:
+            omissions.append("unresolved_reference")
+        if not plan["index_complete"]:
+            omissions.append("index_incomplete")
+        if missing_time:
+            omissions.append("source_time_unavailable")
+        incomplete = bool(omissions) or not frame["complete"]
+        status = "incomplete" if incomplete else "matched" if result_ids else "no_match"
+        if unresolved and not result_ids:
+            status = "unresolved"
+        proofs = ["positive_sources"]
+        if any(
+            target["kind"] == "named" and target["status"] == "resolved"
+            for target in resolution["targets"]
+        ):
+            proofs.append("unique_owner")
+        if query["intent"] == "current":
+            proofs.append("latest_values")
+        if status == "no_match":
+            omissions.append("no_match")
+            proofs.append("no_match")
+        selected = [item for item in evidence if item["evidence_id"] in result_ids]
+        results.append(
+            dict(
+                query_id=query["query_id"],
+                status=status,
+                evidence_ids=list(dict.fromkeys(result_ids)),
+                omissions=list(dict.fromkeys(omissions)),
+                coverage=dict(
+                    matched_facts=sum(item["kind"] == "fact" for item in plan["ranked"]),
+                    returned_facts=sum(item["kind"] != "episode" for item in selected),
+                    matched_episodes=sum(item["kind"] == "episode" for item in plan["ranked"]),
+                    returned_episodes=sum(item["kind"] == "episode" for item in selected),
+                    candidate_complete=frame["complete"],
+                    index_complete=plan["index_complete"],
+                    history_complete=False,
+                    missing_source_times=missing_time,
+                ),
+            )
+        )
+        constraints.append(
+            dict(
+                query_id=query["query_id"],
+                owner_resolution=resolution,
+                proof_kinds=list(dict.fromkeys(proofs)),
+                candidate_domain_hash=frame["domain"],
+                candidate_count=len(frame["groups"]) + len(frame["episodes"]),
+                candidate_domain_complete=frame["complete"],
+                result_status=status,
+            )
+        )
+    bundle = make_bundle(service, db, request, context, frame, evidence, constraints)
+    size = len(canonical(evidence).encode()) if evidence else 0
+    return dict(
+        schema_version=2,
+        version_domain="memory-context/v2",
+        request_id=request["query"]["request_id"],
+        effective_scope=frame["scope"],
+        evidence=evidence,
+        query_results=results,
+        bundle=bundle,
+        budget_used=dict(tokens=size, bytes=size),
+        omissions=list(dict.fromkeys(item for result in results for item in result["omissions"])),
+    )

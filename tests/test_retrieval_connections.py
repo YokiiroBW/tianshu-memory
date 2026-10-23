@@ -87,7 +87,9 @@ def test_idle_index_and_continuous_hybrid_queries_release_reads(sync, reads):
         assert all(handle.closed for handle in reads)
     assert backend.query_calls == 24
     assert sum(map(len, backend.document_batches)) == embedded
-    assert len(reads) >= 73
+    # V2 vector preparation now reuses its source transaction; only the
+    # initial index step and the 48 idle steps need separate read handles.
+    assert len(reads) == 49
 
 
 def test_legacy_rank_and_rerank_materialization_release_reads(sync, reads):
