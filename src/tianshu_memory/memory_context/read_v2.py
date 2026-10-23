@@ -202,6 +202,7 @@ def prepare_query(service, db, frame, subquery, selection):
         witnesses=witnesses,
         documents=documents,
         lexical_ids=lexical_ids,
+        reference_incomplete=targets.unresolved_reference(subquery["text"], resolution),
     )
 
 
@@ -624,7 +625,9 @@ def execute(application, request, context):
                 result_ids.extend(item["evidence_id"] for item in complete_batch)
                 facts_count += new_facts
                 episodes_count += new_episodes
-            unresolved = any(target["status"] != "resolved" for target in resolution["targets"])
+            unresolved = plan["reference_incomplete"] or any(
+                target["status"] != "resolved" for target in resolution["targets"]
+            )
             if unresolved:
                 omissions.append("unresolved_reference")
             if not plan["index_complete"]:

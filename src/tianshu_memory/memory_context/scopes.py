@@ -71,12 +71,13 @@ def checks(service, db, scopes):
     ]
 
 
-def group_rows(db, requester, *, owners=None, selection=None, after=None, limit=GROUP_WINDOW):
+def group_rows(db, requester, *, owners=None, selection=None, after=None, limit=None):
     """One bounded metadata window, with every lineage in its real original scope.
 
     No body is read until these origin checks and eligible_groups' current-source
     checks pass. An active projection alone cannot launder a private dependency.
     """
+    limit = GROUP_WINDOW if limit is None else limit
     predicates = [
         "g.state='active'",
         "json_extract(g.scope,'$.actor_id')=?",

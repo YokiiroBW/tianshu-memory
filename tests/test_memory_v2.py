@@ -436,9 +436,44 @@ def test_multiple_owners_and_unknown_does_not_expand_room(sync):
     } == {"团子", "豆包"}
     partial = query(sync, "我的猫和不存在的猫分别叫什么")
     assert partial["query_results"][0]["status"] == "incomplete"
+    assert "unresolved_reference" in partial["query_results"][0]["omissions"]
+    assert not any(
+        target["kind"] == "named"
+        for target in partial["bundle"]["selection_constraints"][0]["owner_resolution"]["targets"]
+    )
     assert {item["subject_person_id"] for item in partial["evidence"]} == {
         sync.scope()["person_id"]
     }
+
+
+def test_location_description_does_not_become_unknown_person_filter(sync):
+    from tianshu_memory.memory_reindex import MemoryReindexer
+    from tianshu_memory.retrieval import Retrieval
+
+    setup(sync)
+    text = "我的备用钥匙放在玄关右侧收纳盒。"
+    job, _ = candidate(sync, text)
+    written = commit(
+        sync,
+        job,
+        text,
+        fact(
+            "玄关右侧收纳盒",
+            predicate="object.location",
+            subject=dict(kind="entity", id=None, type="key", mention="备用钥匙"),
+        ),
+    )
+    assert written["state"] == "completed"
+    sync.service.retrieval = Retrieval(SyntheticVectors())
+    sync.service.retrieval.store = sync.store
+    assert MemoryReindexer(sync.service).index_step()["indexed"] == 2
+    result = query(sync, "家里进门的备用开锁东西收在哪儿？")
+    assert any(item.get("fact", {}).get("value") == "玄关右侧收纳盒" for item in result["evidence"])
+    assert result["query_results"][0]["status"] == "matched"
+    assert not any(
+        target["kind"] == "named"
+        for target in result["bundle"]["selection_constraints"][0]["owner_resolution"]["targets"]
+    )
 
 
 class SyntheticVectors:

@@ -4,7 +4,7 @@ import json
 import re
 
 from ..automatic_facts import normalize
-from ..recall_language import NamedReferenceQuery, self_reference, topic_tokens
+from ..recall_language import NamedReferenceQuery, query_focus, self_reference
 
 
 def resolve(service, snapshot, candidates, query, requester, *, complete):
@@ -65,33 +65,18 @@ def resolve(service, snapshot, candidates, query, requester, *, complete):
                 witness_group_ids=[],
             ),
         )
-    object_mentions = [
-        fact.get("entity", {}).get("mention", "")
-        for fact in snapshot.decoded.values()
-        if fact.get("entity")
-    ]
     for part in re.split(r"[，,；;]|(?:和|与|及|跟)", query):
         if self_reference(part) or any(
             NamedReferenceQuery(part).for_name(name) is not None for name in values
         ):
             continue
-        explicit = NamedReferenceQuery(part).explicit()
-        plain = re.match(r"\s*([\u3400-\u9fffA-Za-z][\w\u3400-\u9fff-]{0,20}?)的", part)
-        mention = plain[1] if plain else part.strip()
-        if any(target["kind"] == "named" and target["mention"] == mention for target in targets):
-            continue
-        object_target = any(
-            value and value.replace("的", "") in part.replace("的", "") for value in object_mentions
-        )
-        if not explicit and (plain is None or topic_tokens(mention) or object_target):
-            continue
-        if mention in {"我", "本人", "群里", "之前", "以前", "上次", "那次"}:
+        if not NamedReferenceQuery(part).explicit():
             continue
         targets.append(
             dict(
                 target_id="target:" + str(len(targets)),
                 kind="named",
-                mention=mention,
+                mention=part.strip(),
                 status="unknown",
                 person_id=None,
                 witness_group_ids=[],
@@ -120,3 +105,31 @@ def resolve(service, snapshot, candidates, query, requester, *, complete):
     return dict(mode=mode, targets=targets), list(
         {entry[0]["id"]: entry for entry in witnesses}.values()
     )
+
+
+def unresolved_reference(query, resolution):
+    """A parallel unresolved possessive is incomplete text, not a guessed person."""
+    parts = re.split(r"[，,；;]|(?:和|与|及|跟)", query)
+    if len(parts) < 2:
+        return False
+    labels = [
+        target["mention"] for target in resolution["targets"] if target["status"] == "resolved"
+    ]
+    objects, remaining = set(), []
+
+    def focus(text):
+        # Distributive wording is syntax here; quoted/literal object words are
+        # untouched because the marker must directly precede a question verb.
+        text = re.sub(r"(?:分别|各自)(?=叫|是|在|放|收|有|什么|哪)", "", text)
+        return query_focus(text) or text.strip()
+
+    for part in parts:
+        references = [NamedReferenceQuery(part).for_name(label) for label in labels]
+        anchors = [reference for reference in references if reference]
+        if anchors:
+            objects.update(focus(reference) for reference in anchors)
+        elif not self_reference(part) and not NamedReferenceQuery(part).explicit():
+            plain = re.match(r"\s*[^，,；;]+?的(.+)$", part)
+            if plain is not None:
+                remaining.append(focus(plain[1]))
+    return bool(objects.intersection(remaining))
