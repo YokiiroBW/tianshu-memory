@@ -7,6 +7,7 @@ import time
 from collections import OrderedDict
 
 from .domain import canonical, require
+from .retrieval_vectors import vectors
 
 
 def policy(value):
@@ -29,27 +30,6 @@ def policy(value):
     return value
 
 
-def vectors(value, count):
-    require(isinstance(value, list) and len(value) == count, "dependency_unavailable", 503)
-    result = []
-    dimension = None
-    for vector in value:
-        require(
-            isinstance(vector, list) and 1 <= len(vector) <= 8192, "dependency_unavailable", 503
-        )
-        require(
-            all(type(n) in (int, float) and math.isfinite(n) for n in vector),
-            "dependency_unavailable",
-            503,
-        )
-        length = math.hypot(*vector)
-        require(length > 0 and math.isfinite(length), "dependency_unavailable", 503)
-        dimension = dimension or len(vector)
-        require(len(vector) == dimension, "dependency_unavailable", 503)
-        result.append(tuple(n / length for n in vector))
-    return result
-
-
 class Retrieval:
     """Models never choose scope or factual authority; cache contains derived vectors only."""
 
@@ -58,6 +38,7 @@ class Retrieval:
         self.cache = OrderedDict()
         self.lock = threading.Lock()
         self.generation = 0
+        self.store = None
 
     def invalidate(self):
         with self.lock:
@@ -76,6 +57,37 @@ class Retrieval:
     def rank(self, query, eligible, lexical, settings):
         if not eligible:
             return []
+        if self.store is not None:
+            from .memory_migration import installed
+            from .persistent_retrieval import rank
+
+            with self.store.readonly() as db:
+                persistent = installed(db)
+                documents = []
+                if persistent:
+                    identities = [entry[0]["id"] for entry in eligible]
+                    for offset in range(0, len(identities), 256):
+                        batch = identities[offset : offset + 256]
+                        documents.extend(
+                            dict(row)
+                            for row in db.execute(
+                                "SELECT * FROM memory_documents WHERE group_id IN ("
+                                + ",".join("?" for _ in batch)
+                                + ")",
+                                batch,
+                            )
+                        )
+            if persistent:
+                by_group = {entry[0]["id"]: entry for entry in eligible}
+                ranked, _ = rank(
+                    self,
+                    self.store,
+                    query,
+                    documents,
+                    ["fact:" + entry[0]["id"] for entry in lexical],
+                    settings,
+                )
+                return [by_group[item["group_id"]] for item in ranked]
         with self.lock:
             generation = self.generation
         deadline = time.monotonic() + 10

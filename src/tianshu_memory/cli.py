@@ -81,6 +81,19 @@ def main():
         "migrate-facts", help="Stop writers; add sourced fact identity with a guarded backup"
     )
     migrate_facts.add_argument("--backup", required=True)
+    migrate_memory = sub.add_parser(
+        "migrate-memory",
+        help="Stop writers; upgrade typed facts, episodes and derived retrieval with backup",
+    )
+    migrate_memory.add_argument("--backup", required=True)
+    reindex_memory = sub.add_parser(
+        "reindex-memory",
+        help="Rebuild derived documents from currently authorized original sources",
+    )
+    reindex_memory.add_argument("--batch-size", type=int, default=32)
+    reindex_memory.add_argument("--max-batches", type=int, default=1)
+    reindex_memory.add_argument("--restart", action="store_true")
+    reindex_memory.add_argument("--vectors", action="store_true")
     sub.add_parser("jobs")
     sub.add_parser("rebuild-index")
     sub.add_parser("outbox")
@@ -117,6 +130,7 @@ def run_local_operation(args, parser):
         "migrate-observations",
         "migrate-source-lookup",
         "migrate-facts",
+        "migrate-memory",
     }:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
         with closing(Store.from_config(config)) as store:
@@ -134,6 +148,8 @@ def run_local_operation(args, parser):
                 result = store.migrate_users(args.backup)
             elif args.operation == "migrate-facts":
                 result = store.migrate_facts(args.backup)
+            elif args.operation == "migrate-memory":
+                result = store.migrate_memory(args.backup)
             elif args.operation == "migrate-context":
                 result = store.migrate_context(args.backup)
             elif args.operation == "migrate-qq-aliases":
@@ -144,6 +160,37 @@ def run_local_operation(args, parser):
         return
     os.environ["TIANSHU_MEMORY_CONFIG"] = args.config
     app = configured_app()
+    if args.operation == "reindex-memory":
+        from .memory_reindex import MemoryReindexer
+
+        if not 1 <= args.max_batches <= 10000:
+            parser.error("max-batches must be between 1 and 10000")
+        reindexer = MemoryReindexer(app.state.memory)
+        result = None
+        try:
+            for index in range(args.max_batches):
+                result = (
+                    reindexer.index_step(batch_size=min(args.batch_size, 32))
+                    if args.vectors
+                    else reindexer.step(
+                        batch_size=args.batch_size, restart=args.restart and index == 0
+                    )
+                )
+                if result.get("completed") or result.get("state") in {
+                    "complete",
+                    "keyword",
+                    "not_configured",
+                    "migration_required",
+                }:
+                    break
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        finally:
+            retrieval = app.state.memory.retrieval
+            close = getattr(retrieval.backend, "close", None) if retrieval is not None else None
+            if close is not None:
+                close()
+            app.state.memory.store.close()
+        return
     if args.operation == "user-action":
         try:
             raw = Path(args.file).read_bytes()

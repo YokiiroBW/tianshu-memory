@@ -1,5 +1,7 @@
 # 天枢记忆
 
+TS-306 将当前事实、原始来源片段和持久检索索引贯通：schema 4 明确区分计划、发生报告及单值/集合更新；v2 多子查询返回有归属的事实与原话，批量复验共用一次完整来源屏障。旧数据备份迁移、可恢复原文重建、episode 遗忘和可选离线 CPU 嵌入配置见 [规范事实与长期来源检索](docs/memory-v2.md)。
+
 TS-232 保留默认 SQLite，支持可选 PostgreSQL 和 Redis 客户端识别；Knowledge 原件、全文、完整块与上传内容改为文件引用。配置、首迁、独立检查点和备份边界见 [业务存储](docs/storage-backends.md)。
 
 C5 URL/真实上传、Knowledge 唯一原件、角色自主和精确读者授权、实际图片/视频帧/音频及文档范围读取见 [生活内容原件](docs/knowledge-content.md)。沿现有 Memory HTTP 服务与 Knowledge 版本库，无 Companion 正文副本；`migrate-content --backup` 是停写后的显式步骤。

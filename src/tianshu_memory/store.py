@@ -226,13 +226,13 @@ class Store:
                 reader.backup(target)
             return
         from .domain import canonical
-        from .postgres import TABLES
+        from .postgres import installed_tables
 
         if db is None:
             with self.transaction() as connection:
                 return self.backup(path, db=connection)
         snapshot = {"format": "tianshu-memory-postgresql-backup/v1", "tables": {}}
-        for table in TABLES:
+        for table in installed_tables(db):
             cursor = db.execute(f"SELECT * FROM {table}")
             names = [c[0] for c in cursor.description]
             snapshot["tables"][table] = {"columns": names, "rows": [list(r) for r in cursor]}
@@ -361,6 +361,11 @@ class Store:
 
     def migrate_facts(self, backup_path):
         from .fact_migration import migrate
+
+        return migrate(self, backup_path)
+
+    def migrate_memory(self, backup_path):
+        from .memory_migration import migrate
 
         return migrate(self, backup_path)
 

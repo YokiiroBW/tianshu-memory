@@ -13,9 +13,12 @@ class CandidateExtraction:
         self.service = service
 
     def execute(self, request, publisher):
-        require(
-            type(request) is dict and set(request) == {"job_id", "output"}, "invalid_input", 400
-        )
+        require(type(request) is dict, "invalid_input", 400)
+        negotiated = set(request) != {"job_id", "output"}
+        if negotiated:
+            if self.service.contracts.extraction_version is None:
+                self.service.contracts.load_memory_v2()
+            self.service.contracts.validate("memory-extraction#process_request", request)
         require(
             type(request["job_id"]) is str and 0 < len(request["job_id"]) <= 256,
             "invalid_input",
@@ -34,16 +37,39 @@ class CandidateExtraction:
                 scope in publisher["allowed_scopes"]
                 or scope["actor_id"] in publisher.get("allowed_role_actors", [])
             )
+            from .memory_migration import installed as typed_installed
+
+            protocol = 3
+            if typed_installed(db):
+                protocol = dict(job).get("extraction_schema")
+                advertised = request.get(
+                    "supported_extraction_schemas", [request.get("extraction_schema", 3)]
+                )
+                if protocol is None:
+                    protocol = max(advertised)
+                    db.execute(
+                        "UPDATE jobs SET extraction_schema=? WHERE id=? AND extraction_schema IS NULL",
+                        (protocol, job["id"]),
+                    )
+                require(protocol in advertised, "invalid_input", 400)
+            else:
+                require(not negotiated, "dependency_unavailable", 503)
             completed = self._completed(db, job["id"])
             if completed:
-                return completed
+                return dict(completed, extraction_schema=protocol) if negotiated else completed
             if job["state"] != "pending":
-                return dict(state="invalidated", result=None, content=[])
+                result = dict(state="invalidated", result=None, content=[])
+                return dict(result, extraction_schema=protocol) if negotiated else result
         if request["output"] is None:
-            return self._content(event, pending_job=job["id"])
+            result = self._content(event, pending_job=job["id"], protocol=protocol)
+            return dict(result, extraction_schema=protocol) if negotiated else result
         content = self._content(event)
         try:
-            drafts = self._drafts(event, content, request["output"])
+            drafts = (
+                self._typed_drafts(event, content, request["output"])
+                if protocol == 4
+                else self._drafts(event, content, request["output"])
+            )
             # The workflow rolls this proposal's entire transaction back before
             # raising. A rejected proposal can be extracted again; another older
             # same-job request may still be committing its own valid proposal.
@@ -59,9 +85,11 @@ class CandidateExtraction:
             with service.store.transaction() as db:
                 completed = self._completed(db, job["id"])
             if completed:
-                return completed
-            return dict(state="rejected", result={"error_code": "invalid_input"}, content=[])
-        return dict(state="completed", result=result, content=[])
+                return dict(completed, extraction_schema=protocol) if negotiated else completed
+            response = dict(state="rejected", result={"error_code": "invalid_input"}, content=[])
+            return dict(response, extraction_schema=protocol) if negotiated else response
+        response = dict(state="completed", result=result, content=[])
+        return dict(response, extraction_schema=protocol) if negotiated else response
 
     @staticmethod
     def _completed(db, job_id):
@@ -70,7 +98,7 @@ class CandidateExtraction:
             dict(state="completed", result=json.loads(receipt[0]), content=[]) if receipt else None
         )
 
-    def _content(self, event, *, pending_job=None):
+    def _content(self, event, *, pending_job=None, protocol=3):
         service = self.service
         scope, sources = event["scope"], event["sources"]
         with service.operation(scope=scope, sources=sources, event=event) as db:
@@ -117,6 +145,9 @@ class CandidateExtraction:
                 for index, source in enumerate(sources):
                     if service.source_identity(source, scope) in covered:
                         result[index]["text"] = ""
+            from .memory_documents import capture_sources
+
+            capture_sources(service, db, event, result, rows)
             if pending_job is not None:
                 # This fresh post-content transaction already owns the same
                 # source/event boundary. Read the ledger and matching hints
@@ -124,12 +155,86 @@ class CandidateExtraction:
                 completed = self._completed(db, pending_job)
                 if completed:
                     return completed
-                hints = facts.known(service, db, scope)
+                if protocol == 4:
+                    from .canonical_facts import known
+
+                    hints = known(
+                        service,
+                        db,
+                        scope,
+                        "\n".join(item["text"] for item in result),
+                        reality=event["reality"],
+                    )
+                else:
+                    hints = facts.known(service, db, scope)
                 pending = dict(state="pending", result=None, content=result)
                 if facts.installed(db):
-                    pending.update(extraction_schema=3, known_facts=hints)
+                    pending.update(extraction_schema=protocol, known_facts=hints)
                 return pending
         return result
+
+    def _typed_drafts(self, event, content, output):
+        from . import canonical_facts
+        from .fact_names import candidate
+        from .temporal_facts import sourced_times
+
+        self.service.contracts.validate("memory-extraction#output", output)
+        require(event["reality"] in {"real", "fictional"}, "invalid_input", 400)
+        drafts = []
+        for memory in output["memories"]:
+            evidence = memory["evidence"]
+            indexes = set()
+            for proof in evidence:
+                index, quote = proof["source_index"], proof["quote"]
+                require(
+                    0 <= index < len(content) and quote.strip() and quote in content[index]["text"],
+                    "invalid_input",
+                    400,
+                )
+                indexes.add(index)
+            fact = sourced_times(canonical_facts.prepare(memory["fact"]), evidence, content)
+            fact["reality"] = event["reality"]
+            # A repaired observation-as-effective date must also update the one
+            # canonical representation, never leave different dates in two fields.
+            fact["canonical"].update(valid_from=fact["valid_from"], valid_to=fact["valid_to"])
+            unit = dict(
+                statement=canonical_facts.render(
+                    fact["canonical"], operation=fact["update"]["operation"]
+                ),
+                conditions=memory["conditions"],
+                negations=memory["negations"],
+                valid_time=memory["valid_time"],
+                uncertainty="inferred",
+                reality=event["reality"],
+                sources=[event["sources"][i] for i in sorted(indexes)],
+            )
+            drafts.append(
+                dict(
+                    scope=event["scope"],
+                    category="evidence",
+                    field_key="automatic." + fact["key"],
+                    item_key=None,
+                    relationship_delta=None,
+                    units=[unit],
+                    fact=fact,
+                    observed_at=max((content[i]["sent_at"] for i in indexes), key=parse_time),
+                    quotes=[
+                        dict(
+                            source_key=self.service.source_identity(
+                                event["sources"][p["source_index"]], event["scope"]
+                            ),
+                            quote=p["quote"],
+                            **(
+                                {"source_text": content[p["source_index"]]["text"]}
+                                if candidate(fact)
+                                else {}
+                            ),
+                        )
+                        for p in evidence
+                    ],
+                )
+            )
+        return drafts
 
     def _drafts(self, event, content, output):
         require(type(output) is dict and set(output) == {"memories"}, "invalid_input", 400)

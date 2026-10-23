@@ -32,6 +32,7 @@ class SourceAuthority:
         # Serialize this owner's sync-and-business boundary, not SQLite across network I/O.
         # Otherwise independent readers repeatedly invalidate each other's global CAS.
         self._operation_lock = threading.RLock()
+        self._bundled = threading.local()
 
     @staticmethod
     def revision(db):
@@ -140,6 +141,7 @@ class SourceAuthority:
         group_read=False,
         event=None,
         check=None,
+        extra_selectors=(),
     ):
         require(
             not group_read
@@ -158,6 +160,9 @@ class SourceAuthority:
             with service.store.transaction() as db:
                 m0 = self.revision(db)
                 selectors = self.coverage(db, scope, sources, profile, group_read)
+                selectors = list(
+                    {canonical(value): value for value in (*selectors, *extra_selectors)}.values()
+                )
                 if context is not None:
                     service._authorize(db, context, scope=scope)
             turn_ids = [event["aggregate_id"]] if event else [check["turn_id"]] if check else []
@@ -232,6 +237,7 @@ class SourceAuthority:
                         sources=sources,
                         profile=profile,
                         group_read=group_read,
+                        extra_selectors=extra_selectors,
                     )
                 else:
                     result = self.sync_batches(
@@ -248,6 +254,7 @@ class SourceAuthority:
                         sources=sources,
                         profile=profile,
                         group_read=group_read,
+                        extra_selectors=extra_selectors,
                     )
             except LocalRevisionChanged:
                 continue
@@ -307,7 +314,18 @@ class SourceAuthority:
         observation["snapshot"] = after
         return True
 
-    def sync(self, service, observation, *, m0, scope, sources=(), profile=False, group_read=False):
+    def sync(
+        self,
+        service,
+        observation,
+        *,
+        m0,
+        scope,
+        sources=(),
+        profile=False,
+        group_read=False,
+        extra_selectors=(),
+    ):
         """Trusted source-sync port. m0 and scope are local state, never wire authority."""
         self.contracts.validate("sync-workflow#sync_input", observation)
         return self._commit_observations(
@@ -318,10 +336,20 @@ class SourceAuthority:
             sources=sources,
             profile=profile,
             group_read=group_read,
+            extra_selectors=extra_selectors,
         )
 
     def sync_batches(
-        self, service, observation, *, m0, scope, sources=(), profile=False, group_read=False
+        self,
+        service,
+        observation,
+        *,
+        m0,
+        scope,
+        sources=(),
+        profile=False,
+        group_read=False,
+        extra_selectors=(),
     ):
         self.contracts.validate("sync-batch#barrier", observation)
         try:
@@ -336,10 +364,20 @@ class SourceAuthority:
             sources=sources,
             profile=profile,
             group_read=group_read,
+            extra_selectors=extra_selectors,
         )
 
     def _commit_observations(
-        self, service, observations, *, m0, scope, sources, profile, group_read=False
+        self,
+        service,
+        observations,
+        *,
+        m0,
+        scope,
+        sources,
+        profile,
+        group_read=False,
+        extra_selectors=(),
     ):
         for observation in observations:
             self._relations("sync_barrier", dict(observation, now=utc(service.clock())))
@@ -375,7 +413,17 @@ class SourceAuthority:
         with service.store.transaction() as db:
             if (
                 self.revision(db) != m0
-                or self.coverage(db, scope, sources, profile, group_read) != selectors
+                or sorted(
+                    {
+                        canonical(value): value
+                        for value in (
+                            *self.coverage(db, scope, sources, profile, group_read),
+                            *extra_selectors,
+                        )
+                    }.values(),
+                    key=canonical,
+                )
+                != selectors
             ):
                 raise LocalRevisionChanged()
             viewer = access["viewer_context"]
@@ -387,9 +435,61 @@ class SourceAuthority:
 
     @contextmanager
     def operation(self, service, scope, **kwargs):
+        active = getattr(self._bundled, "active", None)
+        if active is not None:
+            key = (canonical(scope), bool(kwargs.get("profile")), bool(kwargs.get("group_read")))
+            require(
+                active["service"] is service
+                and key in active["domains"]
+                and not any(kwargs.get(name) for name in ("sources", "event", "check")),
+                "dependency_unavailable",
+                503,
+            )
+            if kwargs.get("context") is not None:
+                service._authorize(active["db"], kwargs["context"], scope=scope)
+            yield active["db"]
+            return
         with self._operation_lock:
             with self._operation(service, scope, **kwargs) as db:
                 yield db
+
+    @contextmanager
+    def bundle_operation(self, service, requirements):
+        """One full union barrier and transaction for a read-only verification bundle.
+
+        Requirements are assembled by the authenticated application, never accepted
+        from a model or interpreted as grants. Existing component rules still run.
+        """
+        require(
+            bool(requirements) and getattr(self._bundled, "active", None) is None,
+            "invalid_input",
+            400,
+        )
+        with self._operation_lock:
+            selectors, domains = {}, set()
+            with service.store.transaction() as db:
+                for item in requirements:
+                    scope = item["scope"]
+                    if item.get("context") is not None:
+                        service._authorize(db, item["context"], scope=scope)
+                    profile, shared = bool(item.get("profile")), bool(item.get("group_read"))
+                    domains.add((canonical(scope), profile, shared))
+                    for selected in self.coverage(db, scope, (), profile, shared):
+                        selectors[canonical(selected)] = selected
+            primary = requirements[0]
+            with self._operation(
+                service,
+                primary["scope"],
+                context=primary.get("context"),
+                profile=bool(primary.get("profile")),
+                group_read=bool(primary.get("group_read")),
+                extra_selectors=list(selectors.values()),
+            ) as db:
+                self._bundled.active = {"service": service, "domains": domains, "db": db}
+                try:
+                    yield db
+                finally:
+                    self._bundled.active = None
 
     @contextmanager
     def _operation(self, service, scope, **kwargs):
@@ -658,13 +758,7 @@ class SourceAuthority:
                     "payload=excluded.payload,verified=1 WHERE source_admissions.payload IS NOT excluded.payload OR source_admissions.verified != 1",
                     (key, pk, scope["actor_id"], canonical(admission["selector"]), payload),
                 )
-        groups = set()
-        for key in invalid_keys:
-            groups.update(
-                r[0] for r in db.execute("SELECT group_id FROM lineage WHERE source_key=?", (key,))
-            )
-        service._invalidate(db, groups)
-        service._invalidate_jobs(db, source_keys=invalid_keys)
+        service._invalidate_sources(db, invalid_keys)
         for owner, head in heads.items():
             old = batch.heads.get(owner) if batch is not None else None
             if (

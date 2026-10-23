@@ -18,12 +18,15 @@ from .domain import canonical
 
 SCHEMA = Path(__file__).with_name("postgres_schema.sql").read_text(encoding="utf-8")
 TABLES = tuple(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA))
+MEMORY_V3_TABLES = {"fact_subjects", "memory_documents", "memory_vectors", "memory_episode_index"}
+DERIVED_TABLES = {"memory_documents", "memory_vectors", "memory_episode_index"}
 SEARCH_TABLES = {
     "search_index",
     "knowledge_index",
     "lesson_index",
     "experience_index",
     "research_note_index",
+    "memory_episode_index",
 }
 ORDERED = {"groups", "jobs", "automatic_evidence", "relationship_events"}
 GROUP_READ_BATCH = 512
@@ -70,6 +73,14 @@ END $$;
 
 def is_postgres(db):
     return hasattr(db, "native")
+
+
+def installed_tables(db):
+    present = {
+        row[0]
+        for row in db.native("SELECT tablename FROM pg_tables WHERE schemaname=current_schema()")
+    }
+    return [table for table in TABLES if table in present]
 
 
 def _json_path(match):
@@ -284,7 +295,11 @@ def prepare(db, source, *, files, recovery_path, state_directory, epoch):
             r[0]
             for r in db.native("SELECT tablename FROM pg_tables WHERE schemaname=current_schema()")
         }
-        if not set(TABLES) <= installed:
+        marker = db.native(
+            "SELECT value FROM metadata WHERE key='automatic_fact_schema'"
+        ).fetchone()
+        required = set(TABLES) if marker and marker[0] == "3" else set(TABLES) - MEMORY_V3_TABLES
+        if not required <= installed:
             raise ValueError("PostgreSQL Memory schema is incomplete; authority tables missing")
         return
     if binding[0] == "ready":
@@ -376,7 +391,7 @@ def prepare(db, source, *, files, recovery_path, state_directory, epoch):
     # Import does not execute mutation triggers, so source heads, consumed receipts,
     # suppression and logical versions remain exactly the original authority snapshot.
     for table in TABLES:
-        if table not in {"metadata", "conflicts", *SEARCH_TABLES}:
+        if table not in {"metadata", "conflicts", *SEARCH_TABLES, *DERIVED_TABLES}:
             db.native(
                 f"CREATE TRIGGER source_revision_{table} AFTER INSERT OR UPDATE OR DELETE ON {table} FOR EACH ROW EXECUTE FUNCTION memory_source_revision()"
             )

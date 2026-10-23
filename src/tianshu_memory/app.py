@@ -245,7 +245,9 @@ def create_app(
                 )
                 if ready
                 else "unavailable",
-                "embedding": "not_configured",
+                "embedding": "configured_not_verified"
+                if service and service.retrieval is not None
+                else "not_configured",
                 "postgresql": service.store.runtime.status()["postgresql"]
                 if service
                 else "not_configured",
@@ -645,7 +647,12 @@ def configured_app():
         from .retrieval import Retrieval
         from .retrieval_transport import RetrievalTransport
 
-        retrieval = Retrieval(RetrievalTransport(config_path))
+        if config["retrieval"].get("backend") == "local_python":
+            from .local_embedding import LocalEmbeddingBackend
+
+            retrieval = Retrieval(LocalEmbeddingBackend(config["retrieval"]))
+        else:
+            retrieval = Retrieval(RetrievalTransport(config_path))
     service = MemoryService(store, contracts, source_authority=sources, retrieval=retrieval)
     if config.get("observation_source") is not None:
         from .observations import ObservationLedger, PlatformVerifier
@@ -661,6 +668,10 @@ def configured_app():
     relationships = Relationships(service, auth=auth, policy=Policy(**policy_config))
     app = create_app(service=service, auth=auth, relationships=relationships)
     app.state.auth = auth
+    if retrieval is not None:
+        from .memory_index_lifecycle import attach as attach_index
+
+        attach_index(app, service)
     from .storage_lifecycle import attach
 
     attach(app, store)

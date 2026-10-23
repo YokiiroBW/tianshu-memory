@@ -339,3 +339,22 @@ CREATE INDEX IF NOT EXISTS knowledge_blocks_document_version_id ON knowledge_blo
 CREATE INDEX IF NOT EXISTS admissions_receipt ON source_admissions((payload::jsonb #>> '{source,receipt_id}')) WHERE payload IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS sources_scope ON sources(scope);
+
+CREATE TABLE IF NOT EXISTS fact_subjects (
+ id TEXT PRIMARY KEY, scope TEXT NOT NULL, kind TEXT NOT NULL, type TEXT NOT NULL,
+ anchor TEXT NOT NULL, source_key TEXT NOT NULL REFERENCES sources(key) DEFERRABLE INITIALLY IMMEDIATE);
+CREATE INDEX IF NOT EXISTS fact_subject_anchor ON fact_subjects(scope,kind,type,anchor);
+CREATE TABLE IF NOT EXISTS memory_documents (
+ id TEXT PRIMARY KEY, kind TEXT NOT NULL, scope TEXT NOT NULL, group_id TEXT,
+ source_key TEXT, source_revision BIGINT, source_epoch BIGINT, content_hash TEXT NOT NULL,
+ text TEXT NOT NULL, observed_at TEXT, span_start BIGINT NOT NULL, span_end BIGINT NOT NULL);
+CREATE INDEX IF NOT EXISTS memory_document_scope ON memory_documents(scope,kind,id);
+CREATE INDEX IF NOT EXISTS memory_document_group ON memory_documents(group_id);
+CREATE INDEX IF NOT EXISTS memory_document_source ON memory_documents(source_key);
+CREATE TABLE IF NOT EXISTS memory_vectors (
+ document_id TEXT NOT NULL, content_hash TEXT NOT NULL, embedding_revision TEXT NOT NULL,
+ dimension BIGINT NOT NULL, vector TEXT NOT NULL,
+ PRIMARY KEY(document_id,content_hash,embedding_revision));
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS extraction_schema BIGINT;
+CREATE TABLE IF NOT EXISTS memory_episode_index (document_id TEXT,scope TEXT,text TEXT);
+CREATE INDEX IF NOT EXISTS memory_episode_index_terms ON memory_episode_index USING gin(to_tsvector('simple',text));

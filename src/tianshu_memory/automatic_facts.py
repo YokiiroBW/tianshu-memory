@@ -10,7 +10,7 @@ import unicodedata
 
 from . import fact_entities, fact_labels, fact_names
 from .domain import canonical, fingerprint, parse_time, require
-from .fact_migration import installed, source_text_installed
+from .fact_migration import SUPPORTED_VERSIONS, installed, source_text_installed
 from .fact_queries import for_groups, snapshot_for_groups
 from .fact_updates import may_replace
 from .postgres import GROUP_READ_BATCH
@@ -24,7 +24,11 @@ def normalize(value):
 
 def validate(value):
     require(
-        type(value) is dict and set(value) in (FIELDS, FIELDS | {"entity"}), "invalid_input", 400
+        type(value) is dict
+        and set(value)
+        in (FIELDS, FIELDS | {"entity"}, FIELDS | {"entity", "canonical", "update", "reality"}),
+        "invalid_input",
+        400,
     )
     fact_entities.validate(value.get("entity"))
     require(
@@ -33,7 +37,10 @@ def validate(value):
         400,
     )
     require(
-        type(value["value"]) is str and 0 < len(value["value"].strip()) <= 600, "invalid_input", 400
+        type(value["value"]) is str
+        and 0 < len(value["value"].strip()) <= (1200 if "canonical" in value else 600),
+        "invalid_input",
+        400,
     )
     require(
         type(value["state"]) is str and value["state"] in {"current", "historical"},
@@ -83,6 +90,7 @@ def known(service, db, scope):
             continue
         if name is not None:
             value = name.fact
+        value = {key: value[key] for key in (*FIELDS, "entity") if key in value}
         unit = units[0]
         applicable = (
             value["state"] == "current"
@@ -107,17 +115,21 @@ def known(service, db, scope):
 
 
 def _semantic(fact, unit):
-    return fingerprint(
-        dict(
-            value=normalize(fact["value"]),
-            state=fact["state"],
-            valid_from=fact["valid_from"],
-            valid_to=fact["valid_to"],
-            conditions=sorted(normalize(x) for x in unit["conditions"]),
-            negations=sorted(normalize(x) for x in unit["negations"]),
-            reality=unit["reality"],
-        )
+    value = dict(
+        value=normalize(fact["value"]),
+        state=fact["state"],
+        valid_from=fact["valid_from"],
+        valid_to=fact["valid_to"],
+        conditions=sorted(normalize(x) for x in unit["conditions"]),
+        negations=sorted(normalize(x) for x in unit["negations"]),
+        reality=unit["reality"],
     )
+    modality = fact.get("canonical", {}).get("modality", "asserted")
+    if modality != "asserted":
+        value["modality"] = modality
+    if fact.get("update", {}).get("operation") == "retract":
+        value["operation"] = "retract"
+    return fingerprint(value)
 
 
 def _replace_unit(writer, db, row, unit, scope, field, item):
@@ -168,6 +180,32 @@ def commit(writer, db, draft, event, source_map):
     fact = validate(draft["fact"])
     require(len(draft["units"]) == 1, "invalid_input", 400)
     unit = draft["units"][0]
+    typed = fact.get("canonical") is not None
+    selected_targets = []
+    if typed:
+        from . import canonical_facts
+
+        require(fact["reality"] == unit["reality"] == event["reality"], "invalid_input", 400)
+        service.contracts.validate(
+            "memory-extraction#proposal_fact", fact["canonical"] | fact["update"]
+        )
+        require(
+            all(
+                fact[key] == fact["canonical"][key]
+                for key in ("value", "state", "valid_from", "valid_to", "keywords")
+            )
+            and fact["key"] == fact["canonical"]["predicate"],
+            "invalid_input",
+            400,
+        )
+        fact = canonical_facts.resolve(
+            service, db, canonical(draft["scope"]), fact, draft["quotes"]
+        )
+        draft = dict(draft, fact=fact)
+        selected_targets = canonical_facts.targets(service, db, draft, fact)
+        unit["statement"] = canonical_facts.render(
+            fact["canonical"], operation=fact["update"]["operation"]
+        )
     names = None
     if fact_names.candidate(fact):
         require(source_text_installed(db), "dependency_unavailable", 503)
@@ -180,7 +218,8 @@ def commit(writer, db, draft, event, source_map):
         require(not names.incomplete, "invalid_input", 400)
     value_key = _semantic(fact, unit)
     scope = canonical(draft["scope"])
-    fact = fact_entities.resolve(service, db, scope, fact, draft["quotes"])
+    if not typed:
+        fact = fact_entities.resolve(service, db, scope, fact, draft["quotes"])
     identity_key = fact_entities.fact_key(fact)
     observed = draft["observed_at"]
     require(parse_time(observed).tzinfo is not None, "invalid_input", 400)
@@ -198,6 +237,9 @@ def commit(writer, db, draft, event, source_map):
             if entry.row["value_key"] == value_key and entry.row["superseded_by"] is None
         ]
     )
+    existing = [
+        row for row in existing if bool(json.loads(row["payload"]).get("canonical")) == typed
+    ]
     existing = sorted(existing, key=lambda row: parse_time(row["observed_at"]), reverse=True)
     duplicate = next(
         (r for r in existing if names is not None or service._group_current(db, r["group_id"])),
@@ -234,7 +276,8 @@ def commit(writer, db, draft, event, source_map):
                 else names.entries[prior_row["group_id"]].fact
             )
             if (
-                prior["state"] != "current"
+                bool(prior.get("canonical")) != typed
+                or prior["state"] != "current"
                 or (prior["valid_from"] and parse_time(prior["valid_from"]) > service.clock())
                 or (prior["valid_to"] and parse_time(prior["valid_to"]) <= service.clock())
                 or (names is None and not service._group_current(db, prior_row["group_id"]))
@@ -272,6 +315,16 @@ def commit(writer, db, draft, event, source_map):
         saved["sources"] = list(sources.values())[-16:]
         merged = json.loads(duplicate["payload"])
         merged["keywords"] = list(dict.fromkeys(merged["keywords"] + fact["keywords"]))[:12]
+        if typed:
+            merged.update(
+                canonical=dict(
+                    fact["canonical"], valid_from=merged["valid_from"], valid_to=merged["valid_to"]
+                ),
+                update=fact["update"],
+            )
+            saved["statement"] = canonical_facts.render(
+                merged["canonical"], operation=fact["update"]["operation"]
+            )
         db.execute(
             "UPDATE automatic_facts SET observed_at=?,payload=? WHERE group_id=?",
             (max(observed, duplicate["observed_at"], key=parse_time), canonical(merged), group_id),
@@ -284,7 +337,7 @@ def commit(writer, db, draft, event, source_map):
         )
     for quote in draft["quotes"]:
         require(quote["source_key"] in source_map, "invalid_input", 400)
-        if names is None:
+        if names is None and not typed:
             db.execute(
                 "INSERT OR IGNORE INTO automatic_evidence(group_id,source_key,quote) VALUES (?,?,?)",
                 (group_id, quote["source_key"], quote["quote"]),
@@ -293,7 +346,7 @@ def commit(writer, db, draft, event, source_map):
             db.execute(
                 "INSERT OR IGNORE INTO automatic_evidence(group_id,source_key,quote,source_text) "
                 "VALUES (?,?,?,?)",
-                (group_id, quote["source_key"], quote["quote"], quote["source_text"]),
+                (group_id, quote["source_key"], quote["quote"], quote.get("source_text")),
             )
     if duplicate:
         _replace_unit(writer, db, row, saved, draft["scope"], draft["field_key"], draft["item_key"])
@@ -307,6 +360,11 @@ def commit(writer, db, draft, event, source_map):
                 draft["field_key"],
                 draft["item_key"],
             )
+    if typed:
+        canonical_facts.reconcile(
+            writer, db, draft, fact, selected_targets, group_id, supersede=_supersede
+        )
+        return group_id, ids
     # A past report cannot supersede the current value. A future-effective fact waits for its date.
     if duplicate:
         fact, unit = (dict(merged, key=fact_names.KEY) if names is not None else merged), saved
@@ -413,8 +471,8 @@ def commit(writer, db, draft, event, source_map):
     return group_id, ids
 
 
-def index_text(db, unit):
-    if not installed(db):
+def index_text(db, unit, *, fact_schema=None):
+    if not (installed(db) if fact_schema is None else fact_schema in SUPPORTED_VERSIONS):
         return ""
     group_id = unit["semantic_group_id"]
     row = db.execute("SELECT payload FROM automatic_facts WHERE group_id=?", (group_id,)).fetchone()
@@ -470,4 +528,8 @@ def filter_current(db, candidates, query, clock, *, fact_snapshot=None):
             ):
                 continue
         result.append(entry)
+    if not history and fact_snapshot is not None:
+        from .canonical_facts import current_groups
+
+        result = current_groups(result, fact_snapshot, clock)
     return fact_entities.filter_targets(db, result, query, facts=facts, decoded=decoded)

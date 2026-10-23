@@ -150,7 +150,7 @@ def exact_groups(service, db, scope, selection, kind, value):
         if group["id"] in current
     }
     marker = marker_rows.fetchone()
-    fact_installed = marker is not None and marker[0] in {"1", "2"}
+    fact_installed = marker is not None and marker[0] in {"1", "2", "3"}
     projection_reads = list(projection_queries(units))
     valid_keys = [key for key, value in units.items() if value is not None]
     requests = projection_reads + (list(group_queries(valid_keys)) if fact_installed else [])

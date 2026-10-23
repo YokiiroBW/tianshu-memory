@@ -321,7 +321,11 @@ def resolve(service, db, scope, fact, quotes):
 
 def fact_key(fact):
     entity = fact.get("entity")
-    return fact["key"] if entity is None else fact["key"] + "@" + entity["id"]
+    key = fact["key"] if entity is None else fact["key"] + "@" + entity["id"]
+    modality = fact.get("canonical", {}).get("modality", "asserted")
+    if modality != "asserted":
+        key += "~" + modality
+    return key + "~fictional" if fact.get("reality") == "fictional" else key
 
 
 def filter_targets(db, candidates, query, *, facts=None, decoded=None):

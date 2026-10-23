@@ -19,6 +19,9 @@ DEFINITIONS = {
     "receipt": ("receipt_request", "receipt_response"),
     "batch": ("batch_request", "batch_response"),
     "association": ("association_request", "association_response"),
+    "query_v2": ("query_request", "query_response"),
+    "verify_v2": ("verify_request", "verify_response"),
+    "forget_v2": ("forget_request", "forget_response"),
 }
 
 
@@ -27,7 +30,8 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
         async def endpoint(request: Request):
             lease = None
             request_id = "request-unavailable"
-            mutation = operation in {"propose", "association"}
+            mutation = operation in {"propose", "association", "forget_v2"}
+            version_two = operation.endswith("_v2")
 
             def failed(error, *, uncertain=False):
                 note_fault(error.code)
@@ -40,6 +44,8 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
 
             try:
                 require(application is not None and auth is not None, "dependency_unavailable", 503)
+                if version_two and application.service.contracts.context_v2_version is None:
+                    application.service.contracts.load_memory_v2()
                 require(
                     application.service.contracts.context_version == "1.1.0",
                     "dependency_unavailable",
@@ -51,7 +57,13 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                         auth.authenticate, request.headers.get("authorization")
                     )
                 history = operation in {"history", "input_history"}
-                permission = "context_query" if history else "context_" + operation
+                permission = (
+                    "context_propose"
+                    if operation == "forget_v2"
+                    else "context_query"
+                    if history or version_two
+                    else "context_" + operation
+                )
                 require(permission in caller.get("operations", []))
                 require(await anote_authenticated(), "log_unavailable", 503)
                 require(not request.headers.get("origin") and not request.headers.get("cookie"))
@@ -68,7 +80,13 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                         body.extend(chunk)
                 payload = strict_json(body)
                 input_type, output_type = DEFINITIONS[operation]
-                package = "context-history" if history else "memory-context"
+                package = (
+                    "memory-context-v2"
+                    if version_two
+                    else "context-history"
+                    if history
+                    else "memory-context"
+                )
                 application.service.contracts.validate(package + "#" + input_type, payload)
                 header = payload["command" if mutation else "query"]
                 request_id = header["request_id"]
@@ -89,7 +107,26 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                             header["origin"]["assertion_ref"],
                             request_id,
                         )
-                        result = getattr(application, operation)(payload, context)
+                        if operation == "verify_v2":
+                            contexts = []
+                            for check in payload["checks"]:
+                                required = (
+                                    "select_profiles"
+                                    if check["kind"] == "profile"
+                                    else "context_query"
+                                )
+                                require(required in current_caller.get("operations", []))
+                                contexts.append(
+                                    auth.resolve(
+                                        current_name,
+                                        current_caller,
+                                        check["request"]["query"]["origin"]["assertion_ref"],
+                                        request_id,
+                                    )
+                                )
+                            result = application.verify_v2(payload, context, contexts)
+                        else:
+                            result = getattr(application, operation)(payload, context)
                         application.service.contracts.validate(package + "#" + output_type, result)
                         if result.get("state") == "rejected":
                             note_fault(result["error_code"])
@@ -128,8 +165,13 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
         return endpoint
 
     for operation in DEFINITIONS:
+        path = (
+            "/internal/v2/memory/context/" + operation.removesuffix("_v2")
+            if operation.endswith("_v2")
+            else "/internal/v1/memory/context/" + operation.replace("_", "-")
+        )
         app.add_api_route(
-            "/internal/v1/memory/context/" + operation.replace("_", "-"),
+            path,
             endpoint_for(operation),
             methods=["POST"],
             name="memory_context_" + operation,

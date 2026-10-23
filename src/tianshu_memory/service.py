@@ -35,6 +35,8 @@ class MemoryService:
     ):
         self.store, self.contracts, self.clock, self.max_units = store, contracts, clock, max_units
         self.retrieval = retrieval
+        if retrieval is not None:
+            retrieval.store = store
         self.source_authority = source_authority
         self.max_pending_jobs = max_pending_jobs
 
@@ -71,9 +73,10 @@ class MemoryService:
             postgres_history_versions,
             record_version,
         )
+        from .memory_migration import installed as memory_v3
         from .postgres import is_postgres
 
-        if self.retrieval is not None:
+        if self.retrieval is not None and not memory_v3(db):
             self.retrieval.invalidate()
         if "profile_subject" in scope:
             scope = {k: v for k, v in scope.items() if k != "profile_subject"}
@@ -249,7 +252,48 @@ class MemoryService:
             (new_id("event"), kind, canonical(payload)),
         )
 
+    def _invalidate_sources(
+        self, db, keys, *, suppress=None, forgotten=False, replacement=None, target=None
+    ):
+        """One source lifecycle for facts, original spans, derived vectors and late jobs."""
+        from .memory_documents import discard
+        from .memory_migration import installed
+
+        keys = set(keys)
+        groups, scopes = set(), set()
+        for key in keys:
+            row = db.execute("SELECT scope FROM sources WHERE key=?", (key,)).fetchone()
+            if row is None:
+                continue
+            scopes.add(row[0])
+            groups.update(
+                item[0]
+                for item in db.execute("SELECT group_id FROM lineage WHERE source_key=?", (key,))
+            )
+            if suppress is not None:
+                db.execute("UPDATE sources SET epoch=epoch+1,state='withdrawn' WHERE key=?", (key,))
+                if self.synchronized:
+                    db.execute("INSERT OR IGNORE INTO suppression VALUES (?,?)", (key, suppress))
+            if installed(db):
+                for document in db.execute(
+                    "SELECT id FROM memory_documents WHERE source_key=?", (key,)
+                ).fetchall():
+                    discard(db, document[0])
+        bumped = self._invalidate(
+            db, groups, forgotten=forgotten, replacement=replacement, target=target
+        )
+        for encoded in scopes - bumped if installed(db) else set():
+            scope = json.loads(encoded)
+            version = self._bump(db, scope)
+            self._emit(db, "memory.revised", {"scope": scope, "scope_version": version})
+        self._invalidate_jobs(db, source_keys=keys)
+        return groups
+
     def _invalidate(self, db, group_ids, *, forgotten=False, replacement=None, target=None):
+        from .memory_documents import remove_groups
+
+        group_ids = list(group_ids)
+        remove_groups(db, group_ids)
         scopes = set()
         for group_id in group_ids:
             group = db.execute("SELECT * FROM groups WHERE id=?", (group_id,)).fetchone()
@@ -359,26 +403,14 @@ class MemoryService:
                     "SELECT source_key FROM lineage WHERE group_id=?", (row["group_id"],)
                 )
             ]
-            groups = {row["group_id"]}
-            for key in keys:
-                groups.update(
-                    r[0]
-                    for r in db.execute("SELECT group_id FROM lineage WHERE source_key=?", (key,))
-                )
-                db.execute("UPDATE sources SET epoch=epoch+1,state='withdrawn' WHERE key=?", (key,))
-                if self.synchronized:
-                    db.execute(
-                        "INSERT OR IGNORE INTO suppression VALUES (?,?)",
-                        (key, request["revision_kind"]),
-                    )
-            self._invalidate(
+            self._invalidate_sources(
                 db,
-                groups,
+                keys,
+                suppress=request["revision_kind"],
                 forgotten=request["revision_kind"] == "forget",
                 replacement=request["replacement_statement"],
                 target=request["record_id"],
             )
-            self._invalidate_jobs(db, source_keys=keys)
             db.execute("UPDATE confirmations SET consumed=1 WHERE ref=?", (proof["ref"],))
             return {
                 "schema_version": 1,
@@ -738,7 +770,7 @@ class MemoryService:
                         result["candidate_job_ref"] = new_id("candidate")
                         snapshot = {r["key"]: [r["revision"], r["epoch"]] for r in rows}
                         db.execute(
-                            "INSERT INTO jobs VALUES (?,'pending',?,?)",
+                            "INSERT INTO jobs(id,state,event,source_snapshot) VALUES (?,'pending',?,?)",
                             (
                                 result["candidate_job_ref"],
                                 canonical(event),

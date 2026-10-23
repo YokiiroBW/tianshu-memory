@@ -301,6 +301,7 @@ class _WorkflowBase:
 
     def _index(self, db, unit, scope, field, item):
         from .automatic_facts import index_text
+        from .fact_migration import version
         from .recall_language import topic_tokens
 
         text = " ".join(
@@ -315,7 +316,8 @@ class _WorkflowBase:
         )
         # No DML occurs between lexical/token preparation. Read the complete
         # current fact/evidence text once here, and reread on the next _index call.
-        text += " " + index_text(db, unit)
+        fact_schema = version(db)
+        text += " " + index_text(db, unit, fact_schema=fact_schema)
         db.execute(
             "INSERT INTO search_index VALUES (?,?,?,?)",
             (
@@ -325,6 +327,9 @@ class _WorkflowBase:
                 " ".join(terms(text) + topic_tokens(text)),
             ),
         )
+        from .memory_documents import index_group
+
+        index_group(db, unit["semantic_group_id"], fact_schema=fact_schema)
 
     def _publish_profile(self, db, draft, approval_ref, sources):
         scope = profiles.storage_scope(draft)

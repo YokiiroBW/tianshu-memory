@@ -71,7 +71,7 @@ def checks(service, db, scopes):
     ]
 
 
-def group_rows(db, requester, *, owners=None, selection=None):
+def group_rows(db, requester, *, owners=None, selection=None, after=None, limit=GROUP_WINDOW):
     """One bounded metadata window, with every lineage in its real original scope.
 
     No body is read until these origin checks and eligible_groups' current-source
@@ -96,6 +96,9 @@ def group_rows(db, requester, *, owners=None, selection=None):
         "OR json_extract(p.payload,'$.conversation_id')!=json_extract(g.scope,'$.conversation_id')))",
     ]
     parameters = [requester["actor_id"], requester["conversation_id"]]
+    if after is not None:
+        predicates.append("g.id>?")
+        parameters.append(after)
     if owners is not None:
         predicates.append("g.scope IN (" + ",".join("?" for _ in owners) + ")")
         parameters.extend(canonical(owner) for owner in owners)
@@ -105,10 +108,10 @@ def group_rows(db, requester, *, owners=None, selection=None):
     rows = db.execute(
         "SELECT g.* FROM groups g WHERE "
         + " AND ".join(predicates)
-        + " ORDER BY g.rowid DESC LIMIT ?",
-        [*parameters, GROUP_WINDOW + 1],
+        + (" ORDER BY g.id LIMIT ?" if after is not None else " ORDER BY g.rowid DESC LIMIT ?"),
+        [*parameters, limit + 1],
     ).fetchall()
-    return rows[:GROUP_WINDOW], len(rows) <= GROUP_WINDOW
+    return rows[:limit], len(rows) <= limit
 
 
 def group_candidates(service, db, requester, *, owners=None, selection=None, approved=()):

@@ -16,16 +16,20 @@ CREATE TABLE automatic_evidence (
  quote TEXT NOT NULL, source_text TEXT, PRIMARY KEY(group_id,source_key,quote));
 """
 TABLES = ("automatic_facts", "automatic_evidence")
+SUPPORTED_VERSIONS = frozenset({"1", "2", "3"})
+
+
+def version(db):
+    row = db.execute("SELECT value FROM metadata WHERE key='automatic_fact_schema'").fetchone()
+    return row[0] if row is not None else ""
 
 
 def installed(db):
-    row = db.execute("SELECT value FROM metadata WHERE key='automatic_fact_schema'").fetchone()
-    return row is not None and row[0] in {"1", "2"}
+    return version(db) in SUPPORTED_VERSIONS
 
 
 def source_text_installed(db):
-    row = db.execute("SELECT value FROM metadata WHERE key='automatic_fact_schema'").fetchone()
-    return row is not None and row[0] == "2"
+    return version(db) in {"2", "3"}
 
 
 def migrate(store, backup_path):
@@ -41,9 +45,9 @@ def migrate(store, backup_path):
         version = db.execute(
             "SELECT value FROM metadata WHERE key='automatic_fact_schema'"
         ).fetchone()
-        require(version is None or version[0] in {"1", "2"}, "dependency_unavailable", 503)
-        if version is not None and version[0] == "2":
-            return {"automatic_fact_schema": 2, "already_installed": True}
+        require(version is None or version[0] in {"1", "2", "3"}, "dependency_unavailable", 503)
+        if version is not None and version[0] in {"2", "3"}:
+            return {"automatic_fact_schema": int(version[0]), "already_installed": True}
         backup.parent.mkdir(parents=True, exist_ok=True)
         with backup.open("xb"):
             pass

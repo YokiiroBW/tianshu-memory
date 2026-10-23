@@ -20,6 +20,8 @@ CONTEXT_MANIFEST_SHA256 = "aaf25b4446c3915d48e46c6f0f687a26b57f30ac1c4494085266a
 HISTORY_MANIFEST_SHA256 = "5db7d9223a8c9bb69dd8046355ed0bc0fff1f963290adf43566b529493624e6e"
 CONTENT_MANIFEST_SHA256 = "beecd2f75b09df089f7d20c10c1ba39cdaa79c5ba78b8db702ef5005129e9199"
 LIFE_MANIFEST_SHA256 = "ff7cbaf5bb9cf1330a11821c0e5f0eefb728a934e9fb8698c9b644e09f43042c"
+EXTRACTION_MANIFEST_SHA256 = "462b792b498d7f6663124be7db9b7e482528b3b97709205921d3cf11a87ae857"
+CONTEXT_V2_MANIFEST_SHA256 = "c917a18d4a7d76a0ba3b34434f6ec711defc856a6693c97a4dec69acbce0a8b8"
 
 
 def digest(data: bytes) -> str:
@@ -141,6 +143,8 @@ class Contracts:
         self.source_batch_version = None
         self.source_batch_rules = None
         self.context_version = None
+        self.extraction_version = None
+        self.context_v2_version = None
         self.content_version = None
         self._validation_lock = Lock()
         self._validation_registry = None
@@ -334,6 +338,56 @@ class Contracts:
         schema = json.loads((directory / "schema.json").read_text(encoding="utf-8"))
         self.schemas["context-history"] = schema
         self.registry = self.registry.with_resource(schema["$id"], Resource.from_contents(schema))
+
+    def load_memory_v2(self):
+        """Load the frozen extension; shared rules remain in their original packages."""
+        self.load_context()
+        self.load_profiles()
+        for package, version, pin, dependencies, name in (
+            (
+                "memory-extraction/v1",
+                "1.0.0",
+                EXTRACTION_MANIFEST_SHA256,
+                {"text-dialogue/v1": MANIFEST_SHA256},
+                "memory-extraction",
+            ),
+            (
+                "memory-context/v2",
+                "2.0.0",
+                CONTEXT_V2_MANIFEST_SHA256,
+                {
+                    "text-dialogue/v1": MANIFEST_SHA256,
+                    "profile-memory/v1": PROFILE_MANIFEST_SHA256,
+                    "memory-context/v1": CONTEXT_MANIFEST_SHA256,
+                    "context-history/v1": HISTORY_MANIFEST_SHA256,
+                    "memory-extraction/v1": EXTRACTION_MANIFEST_SHA256,
+                },
+                "memory-context-v2",
+            ),
+        ):
+            directory = self.directory.parent.parent / package
+            raw = (directory / "manifest.json").read_bytes()
+            manifest = json.loads(raw)
+            if (
+                digest(raw) != pin
+                or manifest["package"] != package
+                or manifest["version"] != version
+                or manifest["dependencies"] != dependencies
+            ):
+                raise ValueError("Memory extension contract manifest mismatch: " + package)
+            for relative, expected in manifest["sha256"].items():
+                path = (directory / relative).resolve()
+                if (
+                    not path.is_relative_to(directory.resolve())
+                    or digest(path.read_bytes()) != expected
+                ):
+                    raise ValueError("Memory extension contract file mismatch: " + relative)
+            schema = json.loads((directory / "schema.json").read_text(encoding="utf-8"))
+            self.schemas[name] = schema
+            self.registry = self.registry.with_resource(
+                schema["$id"], Resource.from_contents(schema)
+            )
+        self.extraction_version, self.context_v2_version = "1.0.0", "2.0.0"
 
     def load_content(self):
         """Verify the full one-direction Knowledge -> Life -> Common dependency graph."""

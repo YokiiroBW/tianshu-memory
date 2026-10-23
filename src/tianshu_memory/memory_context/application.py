@@ -16,6 +16,21 @@ class MemoryContext:
     def query(self, request, context):
         return query.execute(self, request, context)
 
+    def query_v2(self, request, context):
+        from .read_v2 import execute
+
+        return execute(self, request, context)
+
+    def verify_v2(self, request, context, legacy_contexts):
+        from .read_v2 import verify
+
+        return verify(self, request, context, legacy_contexts)
+
+    def forget_v2(self, request, context):
+        from .episode_forget import execute
+
+        return execute(self, request, context)
+
     def history(self, request, context):
         from .history import execute
 
