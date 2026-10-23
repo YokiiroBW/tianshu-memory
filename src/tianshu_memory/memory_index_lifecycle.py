@@ -1,6 +1,7 @@
 """Bounded incremental projection maintenance using the existing document ledger."""
 
 import asyncio
+import sqlite3
 from contextlib import asynccontextmanager
 
 from .domain import Fault
@@ -19,7 +20,15 @@ def attach(app, service):
             while not stopped.is_set():
                 try:
                     result = await asyncio.to_thread(indexer.index_step, batch_size=4)
-                except (Fault, OSError, TimeoutError, ValueError, KeyError, TypeError):
+                except (
+                    Fault,
+                    OSError,
+                    TimeoutError,
+                    sqlite3.OperationalError,
+                    ValueError,
+                    KeyError,
+                    TypeError,
+                ):
                     result = {"state": "unavailable", "indexed": 0}
                 application.state.memory_index = result
                 delay = 0.1 if result["state"] == "pending" else 5

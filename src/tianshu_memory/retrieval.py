@@ -5,6 +5,7 @@ import math
 import threading
 import time
 from collections import OrderedDict
+from contextlib import closing
 
 from .domain import canonical, require
 from .retrieval_vectors import vectors
@@ -61,7 +62,7 @@ class Retrieval:
             from .memory_migration import installed
             from .persistent_retrieval import rank
 
-            with self.store.readonly() as db:
+            with closing(self.store.readonly()) as db:
                 persistent = installed(db)
                 documents = []
                 if persistent:

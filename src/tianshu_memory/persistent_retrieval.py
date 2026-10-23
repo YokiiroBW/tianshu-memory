@@ -2,6 +2,7 @@
 
 import json
 import time
+from contextlib import closing
 
 from .domain import Fault, canonical, require
 from .retrieval_vectors import vectors
@@ -15,7 +16,7 @@ def rank(retrieval, store, query, documents, lexical_ids, settings, *, deadline=
     complete = True
     corrupted = []
     if settings["mode"] != "keyword" and documents:
-        with store.readonly() as db:
+        with closing(store.readonly()) as db:
             for offset in range(0, len(documents), 256):
                 batch = documents[offset : offset + 256]
                 for row in db.execute(
@@ -88,7 +89,7 @@ def rank(retrieval, store, query, documents, lexical_ids, settings, *, deadline=
     if settings["rerank"] and ranked:
         missing_text = [identity for identity in ranked if "text" not in by_id[identity]]
         if missing_text:
-            with store.readonly() as db:
+            with closing(store.readonly()) as db:
                 rows = db.execute(
                     "SELECT id,text,content_hash FROM memory_documents WHERE id IN ("
                     + ",".join("?" for _ in missing_text)

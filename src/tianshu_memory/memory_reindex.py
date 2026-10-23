@@ -1,6 +1,7 @@
 """Resumable, source-verified rebuilds of derived documents; never re-extract facts."""
 
 import json
+from contextlib import closing
 
 from .domain import Fault, canonical, new_id, require, source_selector, utc
 from .memory_documents import capture, index_group
@@ -142,7 +143,7 @@ class MemoryReindexer:
         require(type(batch_size) is int and 1 <= batch_size <= 32, "invalid_input", 400)
         if service.retrieval is None:
             return {"indexed": 0, "state": "not_configured"}
-        with service.store.readonly() as db:
+        with closing(service.store.readonly()) as db:
             if not installed(db):
                 return {"indexed": 0, "state": "migration_required"}
         settings = service.retrieval.settings()

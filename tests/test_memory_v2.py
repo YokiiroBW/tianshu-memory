@@ -2,6 +2,7 @@
 
 import copy
 import json
+from contextlib import closing
 
 import pytest
 from test_automatic_facts import initialize
@@ -829,7 +830,7 @@ def test_selection_proof_key_survives_post_upgrade_backup_and_reopen(sync):
     from tianshu_memory.store import Store
 
     setup(sync)
-    with sync.store.readonly() as db:
+    with closing(sync.store.readonly()) as db:
         key = db.execute(
             "SELECT value FROM metadata WHERE key='memory_selection_proof_key'"
         ).fetchone()[0]
@@ -839,7 +840,7 @@ def test_selection_proof_key_survives_post_upgrade_backup_and_reopen(sync):
     shutil.copyfile(sync.store.recovery_path, str(backup) + ".source-guard.json")
     restored = Store(backup)
     try:
-        with restored.readonly() as db:
+        with closing(restored.readonly()) as db:
             assert (
                 db.execute(
                     "SELECT value FROM metadata WHERE key='memory_selection_proof_key'"
