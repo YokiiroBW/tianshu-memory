@@ -9,7 +9,7 @@ from jsonschema.exceptions import ValidationError
 from starlette.requests import ClientDisconnect
 
 from ..diagnostics import anote_authenticated, note_fault, record_execution
-from ..domain import Fault, require, strict_json
+from ..domain import Fault, OriginDenied, OriginUnavailable, canonical, require, strict_json
 
 DEFINITIONS = {
     "query": ("query_request", "query_response"),
@@ -22,7 +22,48 @@ DEFINITIONS = {
     "query_v2": ("query_request", "query_response"),
     "verify_v2": ("verify_request", "verify_response"),
     "forget_v2": ("forget_request", "forget_response"),
+    "prepare_v2": ("prepare_request", "prepare_response"),
+    "profiles_v2": ("profile_batch_request", "profile_batch_response"),
 }
+
+
+def preparation_contexts(auth, name, caller, request, context):
+    from .preparation import catalog
+
+    required = catalog(request)
+    main_origin = canonical(request["query"]["origin"])
+    necessary_origins = {main_origin} | {
+        canonical(check["request"]["query"]["origin"])
+        for check in request["checks"]
+        if check["check_id"] in required
+    }
+    # Each permission is checked below; issuer resolution itself has identical
+    # service/caller semantics for the same complete origin within this request.
+    cache = {main_origin: context}
+    result = []
+    for check in request["checks"]:
+        permission = "select_profiles" if check["kind"] == "profile" else "context_query"
+        require(permission in caller.get("operations", []))
+        origin = check["request"]["query"]["origin"]
+        key = canonical(origin)
+        if key not in cache:
+            try:
+                cache[key] = auth.resolve(
+                    name,
+                    caller,
+                    origin["assertion_ref"],
+                    request["query"]["request_id"],
+                    classify_denial=True,
+                    allow_unavailable=key not in necessary_origins,
+                )
+            except OriginDenied as error:
+                cache[key] = error
+            except OriginUnavailable as error:
+                if key in necessary_origins:
+                    raise
+                cache[key] = error
+        result.append(cache[key])
+    return result
 
 
 def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
@@ -79,6 +120,8 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                         require(len(body) + len(chunk) <= 262144, "invalid_input", 400)
                         body.extend(chunk)
                 payload = strict_json(body)
+                if operation in {"prepare_v2", "profiles_v2"}:
+                    require(len(canonical(payload).encode()) <= 262144, "invalid_input", 400)
                 input_type, output_type = DEFINITIONS[operation]
                 package = (
                     "memory-context-v2"
@@ -107,7 +150,12 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                             header["origin"]["assertion_ref"],
                             request_id,
                         )
-                        if operation == "verify_v2":
+                        if operation == "prepare_v2":
+                            contexts = preparation_contexts(
+                                auth, current_name, current_caller, payload, context
+                            )
+                            result = application.prepare_v2(payload, context, contexts)
+                        elif operation == "verify_v2":
                             contexts = []
                             for check in payload["checks"]:
                                 required = (
@@ -126,10 +174,14 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                                 )
                             result = application.verify_v2(payload, context, contexts)
                         else:
+                            if operation == "profiles_v2":
+                                require("select_profiles" in current_caller.get("operations", []))
                             result = getattr(application, operation)(payload, context)
                         application.service.contracts.validate(package + "#" + output_type, result)
                         if result.get("state") == "rejected":
                             note_fault(result["error_code"])
+                        elif result.get("state") == "invalid":
+                            note_fault(result["failure"]["code"])
                         return result
 
                 async with asyncio.timeout(execute_timeout):

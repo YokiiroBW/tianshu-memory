@@ -35,6 +35,7 @@ class SyncHarness:
         self.calls, self.counter = [], 0
         self.mutate = lambda kind, body, response: None
         self.status = {}
+        self.raw_responses = {}
         self.contexts = {}
         template = examples[f"{domain}/viewer-response"]["viewer_context"]
         for i, admission in enumerate(self.admissions):
@@ -336,7 +337,7 @@ class SyncHarness:
                 status = harness.status.get(kind, 200)
                 if self.headers.get("Authorization") != f"Bearer {token}":
                     status = 401
-                payload = canonical(response).encode()
+                payload = harness.raw_responses.get(kind, canonical(response).encode())
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))

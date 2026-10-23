@@ -214,3 +214,41 @@ class Fault(Exception):
 def require(condition, code="forbidden", status=403):
     if not condition:
         raise Fault(code, status)
+
+
+class OriginDenied(Fault):
+    """A fully authenticated origin is definitively unusable for this read."""
+
+    def __init__(self):
+        super().__init__("forbidden", 403)
+
+
+class OriginUnavailable(Fault):
+    """A pure independent origin read could not supply a trusted context."""
+
+    def __init__(self):
+        super().__init__("dependency_unavailable", 503)
+
+
+class DependencyChanged(Fault):
+    """A validated historical expectation differs from the fresh authorized state."""
+
+    def __init__(self, version=None):
+        super().__init__("scope_changed", 409, version)
+
+
+class SelectionChanged(Fault):
+    """The current signed selection fails a specific fresh comparison."""
+
+    def __init__(self):
+        super().__init__("scope_changed", 409)
+
+
+def require_dependency(condition):
+    if not condition:
+        raise DependencyChanged()
+
+
+def require_selection(condition):
+    if not condition:
+        raise SelectionChanged()

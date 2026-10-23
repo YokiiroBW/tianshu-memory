@@ -6,7 +6,16 @@ import time
 from datetime import timedelta
 
 from .. import automatic_facts, canonical_facts, memory_documents
-from ..domain import Fault, canonical, fingerprint, parse_time, query_terms, require, utc
+from ..domain import (
+    Fault,
+    canonical,
+    fingerprint,
+    parse_time,
+    query_terms,
+    require,
+    require_selection,
+    utc,
+)
 from ..fact_queries import snapshot_for_groups
 from ..memory_migration import installed
 from ..recall_index import eligible_groups
@@ -133,9 +142,21 @@ def query_domain(service, frame, subquery):
     owners = {canonical(entry[0]) for entry in scopes}
     groups = [entry for entry in frame["groups"] if entry[0]["scope"] in owners]
     episodes = [row for row in frame["episodes"] if row["scope"] in owners]
+    represented = {entry[0]["scope"] for entry in groups} | {row["scope"] for row in episodes}
+    anchors = {
+        canonical(frame["scope"]),
+        *(canonical(entry[0]) for entry in frame["scopes"] if entry[1] is not None),
+    }
+    # Registered source owners are discovery metadata, not a room membership
+    # roster or queryable content. Keep authorization anchors and every owner
+    # with candidates, before any category, relevance, time or budget filtering.
+    proof_scopes = sorted(
+        (entry for entry in frame["scopes"] if canonical(entry[0]) in anchors | represented),
+        key=lambda entry: canonical(entry[0]),
+    )
     digest = fingerprint(
         dict(
-            scopes=scopes,
+            scopes=proof_scopes,
             groups=sorted(
                 (entry[0]["id"], sorted((row["id"], row["version"]) for row in entry[1]))
                 for entry in groups
@@ -291,7 +312,7 @@ def episode_evidence(db, document):
         "SELECT d.*,s.reality FROM memory_documents d JOIN sources s ON s.key=d.source_key WHERE d.id=? AND d.content_hash=?",
         (document["id"], document["content_hash"]),
     ).fetchone()
-    require(row is not None and row["observed_at"] is not None, "scope_changed", 409)
+    require_selection(row is not None and row["observed_at"] is not None)
     owner = json.loads(row["scope"])
     return dict(
         evidence_id="evidence:" + fingerprint(row["id"]),
@@ -341,7 +362,7 @@ def dependencies(db, frame, evidence):
             "SELECT d.source_key,s.*,p.payload AS physical FROM memory_documents d JOIN sources s ON s.key=d.source_key JOIN source_admissions a ON a.key=s.key JOIN physical_sources p ON p.key=a.physical_key WHERE d.id=?",
             (item["episode_id"],),
         ).fetchone()
-        require(row is not None, "scope_changed", 409)
+        require_selection(row is not None)
         source_rows[row["key"]] = dict(row)
         episode_dependencies.append(
             dict(
@@ -449,45 +470,37 @@ def make_bundle(service, db, request, context, frame, evidence, constraints):
 
 def verify_snapshot(service, db, bundle, frame, context):
     verify_selection_proof(db, bundle)
-    require(
+    require_selection(
         bundle["effective_scope"] == frame["scope"]
         and len(bundle["queries"]) == len(bundle["selection_constraints"]),
-        "scope_changed",
-        409,
     )
     for subquery, constraint in zip(
         bundle["queries"], bundle["selection_constraints"], strict=True
     ):
         domain = query_domain(service, frame, subquery)
-        require(
+        require_selection(
             constraint["query_id"] == subquery["query_id"]
             and constraint["owner_resolution"] == domain["resolution"]
             and constraint["candidate_domain_hash"] == domain["digest"]
             and constraint["candidate_count"] == domain["count"]
             and constraint["candidate_domain_complete"] == domain["complete"],
-            "scope_changed",
-            409,
         )
         if constraint["result_status"] == "no_match":
-            require(
-                "no_match" in constraint["proof_kinds"] and domain["complete"], "scope_changed", 409
-            )
+            require_selection("no_match" in constraint["proof_kinds"] and domain["complete"])
     evidence = {}
     for group in bundle["group_dependencies"]:
         identity = group["group"]["semantic_group_id"]
-        require(identity in frame["group_map"], "scope_changed", 409)
+        require_selection(identity in frame["group_map"])
         for item in fact_evidence(frame, identity):
             evidence[item["evidence_id"]] = item
     docs = {item["id"]: item for item in frame["episodes"]}
     for dependency in bundle["episode_dependencies"]:
-        require(dependency["episode_id"] in docs, "scope_changed", 409)
+        require_selection(dependency["episode_id"] in docs)
         item = episode_evidence(db, docs[dependency["episode_id"]])
         evidence[item["evidence_id"]] = item
-    require(
+    require_selection(
         set(evidence) == set(bundle["evidence_ids"])
         and len(bundle["evidence_ids"]) == len(evidence),
-        "scope_changed",
-        409,
     )
     ordered = [evidence[identity] for identity in bundle["evidence_ids"]]
     fresh = make_bundle(
@@ -503,8 +516,8 @@ def verify_snapshot(service, db, bundle, frame, context):
         "history_snapshot",
         "input_history_snapshot",
     ):
-        require(fresh[key] == bundle[key], "scope_changed", 409)
-    require(fresh["bundle_id"] == bundle["bundle_id"], "scope_changed", 409)
+        require_selection(fresh[key] == bundle[key])
+    require_selection(fresh["bundle_id"] == bundle["bundle_id"])
     return fresh
 
 

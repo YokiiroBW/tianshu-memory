@@ -3,7 +3,7 @@
 import json
 from datetime import timedelta
 
-from ..domain import canonical, fingerprint, parse_time, require, utc
+from ..domain import canonical, fingerprint, parse_time, require_dependency, utc
 from .migration import identity_version
 from .scopes import checks, verified_scopes
 
@@ -72,15 +72,13 @@ def execute(application, request, context, *, input_only=False):
         association = identity_version(db, scope)
         expected = request["expected_snapshot"]
         if expected is not None:
-            require(
+            require_dependency(
                 expected
                 == dict(
                     scope_version=version,
                     association_version=association,
                     scope_checks=checks(service, db, scopes),
                 ),
-                "scope_changed",
-                409,
             )
         snapshot = dict(
             association_version=association,
@@ -94,7 +92,7 @@ def execute(application, request, context, *, input_only=False):
                 for other, link, epoch in scopes
             ],
         )
-        require(request["known_snapshot"] in (None, snapshot), "scope_changed", 409)
+        require_dependency(request["known_snapshot"] in (None, snapshot))
         verified = service.clock()
         return dict(
             schema_version=1,

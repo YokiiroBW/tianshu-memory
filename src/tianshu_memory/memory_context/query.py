@@ -2,7 +2,15 @@
 
 from datetime import timedelta
 
-from ..domain import Fault, canonical, parse_time, query_terms, require, terms, utc
+from ..domain import (
+    DependencyChanged,
+    canonical,
+    parse_time,
+    query_terms,
+    require,
+    terms,
+    utc,
+)
 from ..fact_migration import installed
 from ..recall_language import candidate_aliases, history_query, self_reference
 from ..recall_relevance import named_owner
@@ -42,7 +50,7 @@ def execute(application, request, context):
             or request["known_association_version"] not in (None, association_version)
             or request["known_scope_checks"] not in (None, scope_checks)
         ):
-            raise Fault("scope_changed", 409, version)
+            raise DependencyChanged(version)
         verified = service.clock()
         result = dict(
             schema_version=1,

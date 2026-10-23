@@ -26,6 +26,16 @@ class MemoryContext:
 
         return verify(self, request, context, legacy_contexts)
 
+    def prepare_v2(self, request, context, contexts):
+        from .preparation import execute
+
+        return execute(self, request, context, contexts)
+
+    def profiles_v2(self, request, context):
+        from .preparation import profile_batch
+
+        return profile_batch(self, request, context)
+
     def forget_v2(self, request, context):
         from .episode_forget import execute
 

@@ -3,7 +3,7 @@
 import json
 from contextlib import contextmanager
 
-from ..domain import Fault, canonical, require
+from ..domain import Fault, canonical, require, require_dependency
 from ..postgres import is_postgres
 from ..recall_index import eligible_groups
 from .migration import ready
@@ -166,11 +166,7 @@ def observed_group_scopes(service, db, requester, observed):
             service, db, requester, owners=[entry[0] for entry in scopes[1:]]
         )
         readable = {entry[0]["scope"] for entry in candidates}
-        require(
-            all(canonical(owner) in readable for owner, _, _ in scopes[1:]),
-            "scope_changed",
-            409,
-        )
+        require_dependency(all(canonical(owner) in readable for owner, _, _ in scopes[1:]))
     return scopes, candidates
 
 
@@ -227,9 +223,7 @@ def verified_scopes(service, request, context):
     with service.operation(scope=scope, context=context) as db:
         ready(db)
         service._authorize(db, context, scope=scope)
-        require(
-            authorized_scopes(service, db, scope, request["include_associated"]) == scopes,
-            "scope_changed",
-            409,
+        require_dependency(
+            authorized_scopes(service, db, scope, request["include_associated"]) == scopes
         )
         yield db, scopes, []

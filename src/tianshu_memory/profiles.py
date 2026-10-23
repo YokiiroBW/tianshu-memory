@@ -4,7 +4,7 @@ import json
 from collections import defaultdict
 from datetime import timedelta
 
-from .domain import Fault, canonical, parse_time, query_terms, require, utc
+from .domain import DependencyChanged, Fault, canonical, parse_time, query_terms, require, utc
 from .postgres import GROUP_READ_BATCH, is_postgres
 
 
@@ -165,7 +165,7 @@ def select(service, request, context):
                 - 1
             )
         if request["known_scope_version"] not in (None, version):
-            raise Fault("scope_changed", 409, version)
+            raise DependencyChanged(version)
         if service.source_authority is None:
             raise Fault("dependency_unavailable", 503)
         verified = service.clock()

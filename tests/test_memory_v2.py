@@ -27,7 +27,7 @@ def setup(h):
     h.save()
 
 
-def candidate(h, text, serial=1, actor=0, *, reality="real"):
+def candidate(h, text, serial=1, actor=0, *, reality="real", capture=True):
     physical, admission, grant = [
         copy.deepcopy(items[actor]) for items in (h.physicals, h.admissions, h.grants)
     ]
@@ -71,6 +71,8 @@ def candidate(h, text, serial=1, actor=0, *, reality="real"):
     response = h.post("memory/turn-commits", event)
     assert response.status_code == 200, response.text
     job = response.json()["candidate_job_ref"]
+    if not capture:
+        return job, None
     pending = h.post(PATH, dict(job_id=job, output=None, supported_extraction_schemas=[3, 4]))
     assert pending.status_code == 200, pending.text
     assert pending.json()["extraction_schema"] == 4
