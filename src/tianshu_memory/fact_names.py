@@ -9,8 +9,9 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 
-from .domain import parse_time, require
+from .domain import fingerprint, parse_time, require
 from .fact_migration import source_text_installed
+from .fact_provenance import DERIVED_UPDATES
 
 KEY = "identity.name"
 KEYS = (KEY, "person.name", "author.name", "name")
@@ -51,6 +52,11 @@ SENTENCE_END = set("。；;！!？?.\n\r")
 
 def candidate(fact):
     return fact["key"] in KEYS and fact.get("entity") is None
+
+
+def canonical_key(key):
+    """The existing author-name aliases share one stored predicate."""
+    return KEY if key in KEYS else key
 
 
 def field_values(kind, value):
@@ -139,6 +145,17 @@ def _claims(text, fact):
 
 
 def _statement(fact, unit):
+    value = fact.get("canonical")
+    if value is not None:
+        # Typed statements are rendered by Memory, including historical update
+        # labels. Their canonical property owns the meaning; source grounding
+        # below remains mandatory for every original quote and source text.
+        return (
+            value["subject"]["kind"] == "author"
+            and value["predicate"] == fact["key"] == KEY
+            and value["modality"] == "asserted"
+            and value["value"] == fact["value"]
+        )
     text = unit["statement"].strip().rstrip("。.")
     if text == fact["value"].strip() or any(_claims(text, fact)):
         return True
@@ -180,6 +197,41 @@ def grounded(fact, unit, proofs):
     return True
 
 
+def proof_ref(proof):
+    return fingerprint([proof["source_key"], proof["quote"], proof.get("source_text")])
+
+
+def assertion_proofs(fact, proofs):
+    """Select server-retained assertion proof; control evidence stays in lineage."""
+    refs = fact.get("name_assertion_refs")
+    if refs is None:
+        return proofs
+    if (
+        not fact.get("canonical")
+        or fact.get("update", {}).get("operation") not in DERIVED_UPDATES
+        or type(refs) is not list
+        or not refs
+        or any(type(ref) is not str for ref in refs)
+        or len(set(refs)) != len(refs)
+    ):
+        return []
+    available = {proof_ref(proof): proof for proof in proofs}
+    if any(ref not in available for ref in refs):
+        return []
+    return [available[ref] for ref in refs]
+
+
+def inherit(fact, unit, selected, names):
+    """Exact same-value/modality targets were validated before this call."""
+    proofs = {}
+    for row, _ in selected:
+        entry = names.entries.get(row["group_id"])
+        require(entry is not None, "invalid_input", 400)
+        proofs.update((proof_ref(proof), proof) for proof in entry.proofs)
+    require(grounded(fact, unit, list(proofs.values())), "invalid_input", 400)
+    return dict(fact, name_assertion_refs=sorted(proofs))
+
+
 def prepare(fact, unit, evidence, content):
     """Normalize only after exact evidence validation, before any target identity."""
     if fact["key"] not in KEYS:
@@ -196,7 +248,7 @@ def prepare(fact, unit, evidence, content):
         "invalid_input",
         400,
     )
-    return dict(fact, key=KEY)
+    return dict(fact, key=canonical_key(fact["key"]))
 
 
 @dataclass(frozen=True)
@@ -205,6 +257,7 @@ class NameEntry:
     unit: dict
     row: dict
     fact: dict
+    proofs: tuple
 
 
 @dataclass(frozen=True)
@@ -363,6 +416,7 @@ def load(service, db, candidates, facts, *, domain_complete=None):
     for identity, row in selected.items():
         group, records, units = entries[identity]
         fact = json.loads(row["payload"])
+        proofs = assertion_proofs(fact, [dict(proof) for proof in evidence[identity]])
         if (
             len(units) != 1
             or row["scope"] != group["scope"]
@@ -371,8 +425,8 @@ def load(service, db, candidates, facts, *, domain_complete=None):
             or not lineage[identity]
             or any(scope != group["scope"] for scope in lineage[identity].values())
             or {proof["source_key"] for proof in evidence[identity]} != set(lineage[identity])
-            or not grounded(fact, units[0], [dict(proof) for proof in evidence[identity]])
+            or not grounded(fact, units[0], proofs)
         ):
             continue
-        result[identity] = NameEntry(group, units[0], row, dict(fact, key=KEY))
+        result[identity] = NameEntry(group, units[0], row, dict(fact, key=KEY), tuple(proofs))
     return NameView(result, frozenset(incomplete))

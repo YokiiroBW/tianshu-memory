@@ -209,13 +209,14 @@ def commit(writer, db, draft, event, source_map):
     names = None
     if fact_names.candidate(fact):
         require(source_text_installed(db), "dependency_unavailable", 503)
-        require(
-            fact["key"] == fact_names.KEY and fact_names.grounded(fact, unit, draft["quotes"]),
-            "invalid_input",
-            400,
-        )
+        require(fact["key"] == fact_names.KEY, "invalid_input", 400)
         names = fact_names.family(service, db, draft["scope"])
         require(not names.incomplete, "invalid_input", 400)
+        if typed and fact["update"]["operation"] in fact_provenance.DERIVED_UPDATES:
+            fact = fact_names.inherit(fact, unit, selected_targets, names)
+            draft = dict(draft, fact=fact)
+        else:
+            require(fact_names.grounded(fact, unit, draft["quotes"]), "invalid_input", 400)
     value_key = _semantic(fact, unit)
     scope = canonical(draft["scope"])
     if not typed:

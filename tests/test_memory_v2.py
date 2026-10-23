@@ -291,11 +291,11 @@ def test_plan_does_not_retire_reported_execution_and_retract_is_historical(sync)
         job,
         wrong,
         fact(
-            "14:30",
+            "14:10",
             predicate="event.departure",
             subject=subject,
             modality="observed",
-            operation="replace",
+            operation="retract",
             targets=prior["target_refs"],
         ),
     )

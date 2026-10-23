@@ -2,6 +2,7 @@
 
 import json
 
+from . import fact_names
 from .domain import canonical, fingerprint, parse_time, require
 from .fact_entities import normalize_mention
 
@@ -30,7 +31,7 @@ def stored(proposal):
 
 
 def render(value, *, operation=None):
-    if value["predicate"] == "identity.name" and value["subject"]["kind"] == "author":
+    if value["predicate"] == fact_names.KEY and value["subject"]["kind"] == "author":
         text = "姓名：" + value["value"]
     else:
         subject = value["subject"]["mention"] or "用户"
@@ -45,10 +46,12 @@ def render(value, *, operation=None):
 def prepare(proposal):
     """The public schema is validated before conversion; metadata has one owner."""
     value = stored(proposal)
+    if value["subject"]["kind"] == "author":
+        value = dict(value, predicate=fact_names.canonical_key(value["predicate"]))
     if proposal["operation"] == "retract":
         value = dict(value, state="historical")
     require(value["modality"] in MODALITIES, "invalid_input", 400)
-    if value["predicate"] == "identity.name":
+    if value["predicate"] == fact_names.KEY:
         require(
             value["subject"]["kind"] == "author" and value["modality"] == "asserted",
             "invalid_input",
@@ -143,7 +146,7 @@ def resolve(service, db, scope, fact, quotes):
 
 def targets(service, db, draft, fact):
     """Validate exact optimistic targets before any write or semantic retirement."""
-    from .fact_entities import fact_key
+    from .fact_entities import fact_key, property_identity
 
     update = fact["update"]
     result = []
@@ -174,7 +177,9 @@ def targets(service, db, draft, fact):
         require(json.loads(row["members"]) == [target["record_id"]], "invalid_input", 400)
         prior = json.loads(row["payload"])
         require(prior.get("canonical") is not None, "invalid_input", 400)
-        require(fact_key(prior) == fact_key(fact), "invalid_input", 400)
+        require(property_identity(prior) == property_identity(fact), "invalid_input", 400)
+        if update["operation"] != "replace":
+            require(fact_key(prior) == fact_key(fact), "invalid_input", 400)
         if prior.get("canonical"):
             require(
                 prior["canonical"]["cardinality"] == fact["canonical"]["cardinality"],
@@ -183,6 +188,15 @@ def targets(service, db, draft, fact):
             )
         if update["operation"] in {"confirm", "retract"}:
             require(prior["value"] == fact["value"], "invalid_input", 400)
+        if update["operation"] == "retract":
+            require(
+                all(
+                    fact[key] is None or fact[key] == prior[key]
+                    for key in ("valid_from", "valid_to")
+                ),
+                "invalid_input",
+                400,
+            )
         if update["operation"] == "confirm":
             require(
                 prior["state"] == fact["state"]
@@ -255,13 +269,18 @@ def reconcile(writer, db, draft, fact, selected, group_id, *, supersede):
     # A confirmation carries the same value and complete target provenance in
     # its new group; its targets remain auditable predecessors, not competing
     # current copies that could reappear after retracting the confirmation.
-    effective = fact["valid_from"] or draft["observed_at"]
+    derived = operation in {"retract", "confirm"}
+    # An inherited effective interval describes the original assertion. The
+    # new control source, not that old interval, dates its confirmation/retract.
+    effective = draft["observed_at"] if derived else fact["valid_from"] or draft["observed_at"]
     if parse_time(effective) > writer.service.clock():
         return
     for old, prior in selected:
         if old["group_id"] == group_id:
             continue
-        prior_effective = prior["valid_from"] or old["observed_at"]
+        prior_effective = (
+            old["observed_at"] if derived else prior["valid_from"] or old["observed_at"]
+        )
         if parse_time(prior_effective) > parse_time(effective):
             supersede(writer, db, draft["scope"], group_id, old["group_id"], prior_effective, fact)
             continue

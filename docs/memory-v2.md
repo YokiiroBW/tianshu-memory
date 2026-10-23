@@ -8,7 +8,11 @@
 
 schema 4 不收自由 statement。模型提供 subject/predicate/value、single/set、assert/add/replace/retract/confirm、精确 target_refs、qualifiers 和原句引用；Memory 渲染 statement。modality 为 asserted/observed/planned/conditional/uncertain，独立于 current/historical。计划不会被渲染成已经执行，来源报告已发生也不等于客观核实。实体 mention 必须在该项原句中，person/scope 来自受信事件；事实的 reality 同样由事件确定。真实与虚构槽相互隔离，可信本人姓名仍沿旧完整来源规则。
 
-replace/retract/confirm 只操作同 owner、实体、predicate、modality、reality 的准确版本。集合 add 保留其他成员，替换只退休明确 targets。历史补充不会被当前单值互斥拒绝，也不能以历史 replace 退休当前值。单值未来生效由读取时的有效时间裁定。
+默认当前槽包含 modality，未指定目标的计划与已发生报告并行保留。explicit replace 验证同 owner、主体、predicate、reality、cardinality 的准确版本，可以由新来源报告改变 modality，且只退休明确 targets。confirm/retract 仍要求同 modality、同值；集合 add 保留其他成员。历史补充不会被当前单值互斥拒绝，也不能以历史 replace 退休当前值。单值未来生效由读取时的有效时间裁定。
+
+作者姓名沿现有 `identity.name/person.name/author.name/name` 规则统一为 `identity.name`，兼容 key、field、渲染和更新目标保持一致；其他作者属性及实体名字不进入本人姓名槽。独立姓名断言必须由本次完整原文正向证明，转述、条件、否定或其他人的名字仍不能成为本人姓名。confirm/retract 从已核精确目标继承原正向姓名证据；服务器在既有事实 payload 中保存证据引用摘要，读取重新核对完整原文。控制意图仍是必须有效的来源依赖，不冒充新的姓名断言，也不能让 assert/add/replace 借用旧证明。
+
+派生确认的有效期必须等于目标，撤回中非空日期只能继承目标相同日期；控制原话无需重报这些旧日期。新断言和 replace 的日期仍须本次来源支持。事实原有效期与控制发生时间分开：确认/撤回退休目标的时刻使用新控制来源的 observed_at。全部继承来源沿既有 lineage/evidence 保留，原来源遗忘、撤权、迟到任务和重建仍统一失效。
 
 retract/confirm 的旧值来自精确目标，结果组继承目标的完整来源 revision/epoch 和引用证据，包括前序更新已继承的依赖。retract 必须匹配目标值，confirm 还必须保持状态、有效期、条件和否定项。确认组保留同一值及证据，旧目标成为可审计前驱，避免随后撤回确认时原副本重新成为当前值。独立 assert/add/replace 的新内容不继承被操作目标的来源；schema 4 仅在相同来源基础内合并独立同值事实，不能把一个新来源声明并入带旧来源依赖的组。旧 schema 3 的既有语义去重不变。
 

@@ -319,6 +319,18 @@ def resolve(service, db, scope, fact, quotes):
     return dict(fact, entity=dict(entity, id=identity))
 
 
+def property_identity(fact):
+    """Business property identity, independent of its assertion modality slot."""
+    entity = fact.get("entity")
+    subject = fact.get("canonical", {}).get("subject")
+    return (
+        subject["kind"] if subject else ("entity" if entity else "author"),
+        entity["id"] if entity else None,
+        fact["key"],
+        fact.get("reality", "real"),
+    )
+
+
 def fact_key(fact):
     entity = fact.get("entity")
     key = fact["key"] if entity is None else fact["key"] + "@" + entity["id"]

@@ -176,6 +176,7 @@ class CandidateExtraction:
     def _typed_drafts(self, event, content, output):
         from . import canonical_facts
         from .fact_names import candidate
+        from .fact_provenance import DERIVED_UPDATES
         from .temporal_facts import sourced_times
 
         self.service.contracts.validate("memory-extraction#output", output)
@@ -192,7 +193,12 @@ class CandidateExtraction:
                     400,
                 )
                 indexes.add(index)
-            fact = sourced_times(canonical_facts.prepare(memory["fact"]), evidence, content)
+            fact = canonical_facts.prepare(memory["fact"])
+            # Derived updates prove inherited dates against their exact current
+            # targets inside the write transaction. Independent dates must be
+            # supported by this proposal's own original source.
+            if fact["update"]["operation"] not in DERIVED_UPDATES:
+                fact = sourced_times(fact, evidence, content)
             fact["reality"] = event["reality"]
             # A repaired observation-as-effective date must also update the one
             # canonical representation, never leave different dates in two fields.
