@@ -41,6 +41,9 @@ def candidate_aliases(value):
 
 
 def history_query(value):
+    target = _subjectless_target(_reference_body(value))
+    if target is not None:
+        value = target
     value = re.sub(r'[“「《"].*?[”」》"]', "", clean_query(value)).casefold()
     return any(
         token in value
@@ -103,7 +106,8 @@ def self_reference(value):
 
 _NAME_PREAMBLE = r"^(?:(?:请问|你还记得|还记得|记得|我想问|我忘了|我记不清|群里|关于)\s*)+"
 _REPORT_WHEN = r"(?:(?:上次|之前|以前|刚才|前面)\s*)?"
-_REPORT_VERB = r"(?:提到过|说起过|提过|说过)"
+_REPORT_ACTION = r"(?:提到|说起|提|说)"
+_REPORT_VERB = _REPORT_ACTION + "过"
 _REPORT_PREFIX = r"(?:(?:不是|并非|如果|假如)\s*)?"
 _REPORT_NEGATION = r"(?:并没有|没有|并未|不曾|没|未)?"
 
@@ -112,6 +116,37 @@ def _reference_body(value, *, lexical=False):
     if lexical:
         value = lexical_question_text(value)
     return re.sub(_NAME_PREAMBLE, "", clean_query(value).strip())
+
+
+def _source_object_target(target):
+    """Keep the bounded object grammar shared by named and unnamed reports."""
+    head = re.sub(r"^(?:(?:以前|之前|原来|现在|目前)(?:的)?\s*)+", "", target)
+    plain = re.sub(r"的(?:名字|名称|位置|原名|旧名)", "", head).rstrip("？?。.!！")
+    if re.search(
+        r"[，,。；;：:.!?！？\n\r\"'“”‘’「」『』《》`（）()【】\[\]]|的|家(?:那|这)|和|与|跟|还有|没|不|未|别",
+        plain,
+    ):
+        return False
+    head = _object_focus(head)
+    if head is None:
+        return False
+    head = head.casefold()
+    aliases = topic_aliases(head) | set(query_aliases(head))
+    return any(
+        re.match(re.escape(alias.casefold()) + (r"(?![a-z])" if alias.isascii() else ""), head)
+        for alias in aliases
+    )
+
+
+def _subjectless_target(body):
+    """Return only an anchored positive report's unchanged, bounded object text."""
+    discourse = re.match(
+        _REPORT_WHEN + r"(?:群里\s*)?" + _REPORT_ACTION + r"(?:过)?的\s*(.+)$", body
+    )
+    if discourse is None:
+        return None
+    target = discourse[1].strip()
+    return target if _source_object_target(target) else None
 
 
 class NamedReferenceQuery:
@@ -136,6 +171,11 @@ class NamedReferenceQuery:
         """
         body = self._body()
         if re.match(r"有人(?:说|问|提到|写道)|听说|据说", body):
+            return False
+        if _subjectless_target(body) is not None:
+            # "提到的那只猫" has no speaker name. Do not turn its reporting
+            # words into an unknown person via the weak X那只 pattern below.
+            # An actual canonical name is still resolved by for_name first.
             return False
         label = r"(?P<label>[\u3400-\u9fff]{1,32}?|[A-Za-z][\w-]*(?:[ \t]+[A-Za-z][\w-]*){0,3})"
         possessive = re.match(
@@ -198,26 +238,7 @@ class NamedReferenceQuery:
             target = match[1].strip()
             # A second possessor, reported quotation or extra clause needs evidence
             # this bounded grammar does not establish. Do not erase that qualifier.
-            head = re.sub(r"^(?:(?:以前|之前|原来|现在|目前)(?:的)?\s*)+", "", target)
-            plain = re.sub(r"的(?:名字|名称|位置|原名|旧名)", "", head).rstrip("？?。.!！")
-            if re.search(
-                r"[，,。；;：:.!?！？\n\r\"'“”‘’「」『』《》`（）()【】\[\]]|的|家(?:那|这)|和|与|跟|还有|没|不|未|别",
-                plain,
-            ):
-                return ""
-            head = _object_focus(head)
-            if head is None:
-                return ""
-            head = head.casefold()
-            aliases = topic_aliases(head) | set(query_aliases(head))
-            if not any(
-                re.match(
-                    re.escape(alias.casefold()) + (r"(?![a-z])" if alias.isascii() else ""), head
-                )
-                for alias in aliases
-            ):
-                return ""
-            return target
+            return target if _source_object_target(target) else ""
         # Negated/conditional/joint reports are not a positive source connection.
         # Exact name boundaries keep a short name from shadowing a longer one.
         unsafe = _REPORT_PREFIX + speaker + _REPORT_WHEN + _REPORT_NEGATION + _REPORT_VERB
@@ -269,6 +290,9 @@ def _object_focus(value):
 
 def query_focus(value):
     """An explicit possessive/object question supplies stronger anchors than its preamble."""
+    target = _subjectless_target(_reference_body(value))
+    if target is not None:
+        value = target
     location = re.search(
         r"(?:我的?|我那|我家的)?([\u3400-\u9fff]{2,12}?)(?:一般|平时|通常|平常)?"
         r"(?:搁|放|收|存放|摆)(?:在)?哪(?:儿|里|个地方)?",
