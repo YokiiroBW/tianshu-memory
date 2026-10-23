@@ -23,6 +23,226 @@ def saved_entity(h, result):
     return json.loads(row[0])["entity"]
 
 
+def named_alias_location_case(sync, *, null_id=False):
+    initialize(sync)
+    named, _ = add(
+        sync, "我把透明杯子叫弦月", "cup.name", "弦月", entity=entity("透明杯子", kind="cup")
+    )
+    identity = saved_entity(sync, named)["id"]
+    old, _ = add(
+        sync,
+        "透明杯子刚放到玄关柜上",
+        "cup.location",
+        "玄关柜上",
+        second=2,
+        entity=entity("透明杯子", identity, "cup"),
+    )
+    updated, job = add(
+        sync,
+        "我后来只把弦月挪到了餐桌，票的事还没顾上。",
+        "cup.location",
+        "餐桌",
+        second=3,
+        entity=entity("弦月", None if null_id else identity, "cup"),
+    )
+    assert saved_entity(sync, updated)["id"] == identity
+    with sync.store.transaction() as db:
+        previous = db.execute(
+            "SELECT superseded_by FROM automatic_facts WHERE group_id=?", (old["group_ids"][0],)
+        ).fetchone()
+    assert previous["superseded_by"] == updated["group_ids"][0]
+    current = {u["record_id"] for u in recall(sync, "杯子现在放在哪儿")}
+    assert set(updated["record_ids"]) <= current <= set(updated["record_ids"] + named["record_ids"])
+    assert current.isdisjoint(old["record_ids"])
+    history = recall(sync, "杯子以前放在哪里")
+    assert set(old["record_ids"]) <= {u["record_id"] for u in history}
+    assert (
+        sync.post("memory/candidates/process", dict(job_id=job, output=None)).json()["state"]
+        == "completed"
+    )
+
+
+@pytest.mark.parametrize("null_id", [False, True])
+def test_named_alias_updates_existing_object_location(sync, null_id):
+    named_alias_location_case(sync, null_id=null_id)
+
+
+def named_alias_rejection_case(sync, reason):
+    initialize(sync)
+    text = "我把透明杯子叫弦月"
+    options = {}
+    if reason == "conditions":
+        text = "冬天我把透明杯子叫弦月"
+        options["conditions"] = ["冬天"]
+    elif reason == "negations":
+        text += "，不叫旧月"
+        options["negations"] = ["不叫旧月"]
+    elif reason == "expired":
+        text += "，这个名字用到2000年1月1日"
+        options["valid_to"] = "2000-01-01T00:00:00Z"
+    elif reason == "future":
+        text = "2099年1月1日起，" + text
+        options["valid_from"] = "2099-01-01T00:00:00Z"
+    elif reason == "historical":
+        text = "透明杯子原名弦月"
+        options["state"] = "historical"
+    elif reason == "literal_prefix":
+        text = "我把透明杯子叫我的弦月"
+    named, _ = add(
+        sync,
+        text,
+        "cup.location" if reason == "arbitrary_value" else "cup.name",
+        "我的弦月" if reason == "literal_prefix" else "弦月",
+        entity=entity("透明杯子", kind="cup"),
+        **options,
+    )
+    identity = saved_entity(sync, named)["id"]
+    if reason in {"ambiguous", "wrong_id"}:
+        sibling, _ = add(
+            sync,
+            "我的蓝色杯子叫" + ("弦月" if reason == "ambiguous" else "晨星"),
+            "cup.name",
+            "弦月" if reason == "ambiguous" else "晨星",
+            second=2,
+            entity=entity("蓝色杯子", kind="cup"),
+        )
+        if reason == "wrong_id":
+            identity = saved_entity(sync, sibling)["id"]
+    if reason == "superseded":
+        add(
+            sync,
+            "透明杯子现在改叫薄荷",
+            "cup.name",
+            "薄荷",
+            second=2,
+            entity=entity("透明杯子", identity, "cup"),
+        )
+    elif reason == "forgotten":
+        assert sync.post("memory/revise", sync.revision(named["record_ids"][0])).status_code == 200
+    elif reason == "withdrawn":
+        sync.grants[-1]["state"] = "denied"
+        sync.platform_head["sequence"] += 1
+        response = sync.post("memory/select", sync.selection())
+        assert response.status_code in {200, 409}, response.text
+    elif reason in {"missing_quote", "not_naming", "incomplete_group"}:
+        with sync.store.transaction() as db:
+            if reason == "missing_quote":
+                db.execute(
+                    "DELETE FROM automatic_evidence WHERE group_id=?", (named["group_ids"][0],)
+                )
+            elif reason == "not_naming":
+                db.execute(
+                    "UPDATE automatic_evidence SET quote='透明杯子放在窗台' WHERE group_id=?",
+                    (named["group_ids"][0],),
+                )
+            else:
+                db.execute(
+                    "UPDATE groups SET members=? WHERE id=?",
+                    (json.dumps(["record:missing"]), named["group_ids"][0]),
+                )
+    with sync.store.transaction() as db:
+        before = db.execute("SELECT COUNT(*) FROM automatic_facts").fetchone()[0]
+    add(
+        sync,
+        "我把弦月挪到了餐桌",
+        "cup.location",
+        "餐桌",
+        second=4,
+        actor=1 if reason == "foreign_scope" else 0,
+        entity=entity("弦月", identity, "pen" if reason == "wrong_kind" else "cup"),
+        expected_state="rejected",
+    )
+    with sync.store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM automatic_facts").fetchone()[0] == before
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "ambiguous",
+        "wrong_id",
+        "wrong_kind",
+        "foreign_scope",
+        "arbitrary_value",
+        "literal_prefix",
+        "superseded",
+        "expired",
+        "future",
+        "historical",
+        "conditions",
+        "negations",
+        "forgotten",
+        "withdrawn",
+        "missing_quote",
+        "not_naming",
+        "incomplete_group",
+    ],
+)
+def test_named_alias_does_not_bypass_existing_identity_and_source_boundaries(sync, reason):
+    named_alias_rejection_case(sync, reason)
+
+
+def test_ambiguous_named_alias_with_no_id_does_not_create_a_third_object(sync):
+    initialize(sync)
+    for second, descriptor in enumerate(("透明杯子", "蓝色杯子"), 1):
+        add(
+            sync,
+            descriptor + "叫弦月",
+            "cup.name",
+            "弦月",
+            second=second,
+            entity=entity(descriptor, kind="cup"),
+        )
+    add(
+        sync,
+        "我把弦月挪到了餐桌",
+        "cup.location",
+        "餐桌",
+        second=3,
+        entity=entity("弦月", kind="cup"),
+        expected_state="rejected",
+    )
+    with sync.store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM automatic_facts").fetchone()[0] == 2
+
+
+def test_literal_title_alias_uses_existing_source_label_rules(sync):
+    initialize(sync)
+    named, _ = add(
+        sync, "我的蓝皮书叫《远岸》", "book.title", "《远岸》", entity=entity("蓝皮书", kind="book")
+    )
+    identity = saved_entity(sync, named)["id"]
+    moved, _ = add(
+        sync,
+        "我把《远岸》放到书架上了",
+        "book.location",
+        "书架",
+        second=2,
+        entity=entity("《远岸》", identity, "book"),
+    )
+    assert saved_entity(sync, moved)["id"] == identity
+
+
+def test_literal_alias_normalization_does_not_strip_name_content(sync):
+    initialize(sync)
+    named, _ = add(
+        sync,
+        "我的透明杯子叫Ｍｏｏｎ",
+        "cup.name",
+        "Ｍｏｏｎ",
+        entity=entity("透明杯子", kind="cup"),
+    )
+    moved, _ = add(
+        sync,
+        "我把moon挪到餐桌",
+        "cup.location",
+        "餐桌",
+        second=2,
+        entity=entity("moon", saved_entity(sync, named)["id"], "cup"),
+    )
+    assert saved_entity(sync, moved)["id"] == saved_entity(sync, named)["id"]
+
+
 @pytest.mark.parametrize("mention", ["我这个杯子", "我的那个水杯", "我这只白色杯子"])
 def test_self_reference_corrects_the_unique_owned_object_in_one_commit(sync, mention):
     initialize(sync)

@@ -8,7 +8,7 @@ import json
 import re
 import unicodedata
 
-from .domain import fingerprint, require
+from .domain import fingerprint, parse_time, require
 from .recall_language import history_query, normalize_cups, normalize_objects, topic_aliases
 
 OBJECT_NOUNS = {
@@ -199,6 +199,56 @@ def validate(entity):
     )
 
 
+def _literal_alias(value):
+    # Names are literal data: do not strip ownership words, punctuation or
+    # quoted content as descriptor normalization deliberately does.
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _sourced_aliases(service, db, scope, candidates):
+    """Resolve only exact name/title candidates through existing whole groups."""
+    if not candidates:
+        return set()
+    from .fact_labels import positive_source
+    from .postgres import GROUP_READ_BATCH
+    from .recall_index import eligible_groups
+
+    keys = sorted(candidates)
+    matches, owner = set(), json.loads(scope)
+    for offset in range(0, len(keys), GROUP_READ_BATCH):
+        batch = keys[offset : offset + GROUP_READ_BATCH]
+        groups = db.execute(
+            "SELECT g.*,f.fact_key AS alias_key FROM groups g JOIN automatic_facts f "
+            "ON f.group_id=g.id WHERE g.id IN ("
+            + ",".join("?" for _ in batch)
+            + ") AND f.superseded_by IS NULL",
+            batch,
+        ).fetchall()
+        approved = {
+            group["id"]: candidates[group["id"]]
+            for group, _, units in eligible_groups(service, db, groups, owner)
+            if len(units) == 1
+            and not units[0]["conditions"]
+            and not units[0]["negations"]
+            and group["alias_key"] == fact_key(candidates[group["id"]])
+        }
+        if not approved:
+            continue
+        quotes = {identity: [] for identity in approved}
+        for row in db.execute(
+            "SELECT e.group_id,e.quote FROM automatic_evidence e JOIN lineage l "
+            "ON l.group_id=e.group_id AND l.source_key=e.source_key WHERE e.group_id IN ("
+            + ",".join("?" for _ in approved)
+            + ")",
+            sorted(approved),
+        ):
+            quotes[row["group_id"]].append(row["quote"])
+        for identity, fact in approved.items():
+            if positive_source(fact, quotes[identity]):
+                matches.add(fact["entity"]["id"])
+    return matches
+
+
 def resolve(service, db, scope, fact, quotes):
     entity = fact.get("entity")
     if entity is None:
@@ -220,9 +270,12 @@ def resolve(service, db, scope, fact, quotes):
             reference and reference[0] == label[0] and label[1].endswith(reference[1])
         )
 
-    matches, grounded = set(), set()
+    from .fact_labels import candidate as label_candidate
+
+    matches, grounded, aliases = set(), set(), {}
     for row in db.execute("SELECT group_id,payload FROM automatic_facts WHERE scope=?", (scope,)):
-        prior = json.loads(row["payload"]).get("entity")
+        previous = json.loads(row["payload"])
+        prior = previous.get("entity")
         if not prior:
             continue
         possible, supported = (
@@ -232,6 +285,22 @@ def resolve(service, db, scope, fact, quotes):
             matches.add(prior["id"])
             if supported:
                 grounded.add(prior["id"])
+        if (
+            not elliptical
+            and prior["kind"] == entity["kind"]
+            and _literal_alias(previous["value"]) == _literal_alias(entity["mention"])
+            and label_candidate(previous)
+            and previous["state"] == "current"
+        ):
+            now = service.clock()
+            if (not previous["valid_from"] or parse_time(previous["valid_from"]) <= now) and (
+                not previous["valid_to"] or parse_time(previous["valid_to"]) > now
+            ):
+                aliases[row["group_id"]] = previous
+    # A supplied ID cannot choose among ambiguous descriptions or names. An
+    # alias reuses the same ledger identity, never a parallel named object.
+    aliases = {key: value for key, value in aliases.items() if value["entity"]["id"] not in matches}
+    matches.update(_sourced_aliases(service, db, scope, aliases))
     # A grounded color ellipse may reuse an object, never create a nounless one.
     require(not elliptical or (len(matches) == 1 and matches <= grounded), "invalid_input", 400)
     # A reference cannot silently rename another object or bind a foreign/revoked object.

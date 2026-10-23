@@ -96,6 +96,33 @@ from tianshu_memory.role_grants import RoleGrants
 from tianshu_memory.store import Store
 
 
+@pytest.mark.parametrize("null_id", [False, True])
+def test_native_postgres_named_alias_updates_existing_location(pg_sync, null_id):
+    from test_fact_entities import named_alias_location_case
+
+    named_alias_location_case(pg_sync, null_id=null_id)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "ambiguous",
+        "wrong_id",
+        "foreign_scope",
+        "superseded",
+        "expired",
+        "withdrawn",
+        "conditions",
+        "missing_quote",
+        "incomplete_group",
+    ],
+)
+def test_native_postgres_named_alias_obeys_current_source_identity(pg_sync, reason):
+    from test_fact_entities import named_alias_rejection_case
+
+    named_alias_rejection_case(pg_sync, reason)
+
+
 def pg_options():
     url = os.environ.get("TIANSHU_TEST_POSTGRES_URL")
     if not url:
