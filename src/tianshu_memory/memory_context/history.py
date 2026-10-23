@@ -67,7 +67,7 @@ def source_version_retained(service, db, scope, version):
 def execute(application, request, context, *, input_only=False):
     service = application.service
     scope = request["requested_scope"]
-    with verified_scopes(service, request, context) as (db, scopes):
+    with verified_scopes(service, request, context) as (db, scopes, _):
         version = service._scope_version(db, scope)
         association = identity_version(db, scope)
         expected = request["expected_snapshot"]

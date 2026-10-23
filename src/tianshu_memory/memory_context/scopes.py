@@ -111,10 +111,23 @@ def group_rows(db, requester, *, owners=None, selection=None):
     return rows[:GROUP_WINDOW], len(rows) <= GROUP_WINDOW
 
 
-def group_candidates(service, db, requester, *, owners=None, selection=None):
+def group_candidates(service, db, requester, *, owners=None, selection=None, approved=()):
     rows, complete = group_rows(db, requester, owners=owners, selection=selection)
     owner_scopes = {row["id"]: json.loads(row["scope"]) for row in rows}
-    return eligible_groups(service, db, rows, requester, scopes_by_group=owner_scopes), complete
+    retained = {entry[0]["id"]: entry for entry in approved}
+    reused = {
+        row["id"]: retained[row["id"]]
+        for row in rows
+        if row["id"] in retained and dict(row) == dict(retained[row["id"]][0])
+    }
+    remaining = [row for row in rows if row["id"] not in reused]
+    reused.update(
+        (entry[0]["id"], entry)
+        for entry in eligible_groups(
+            service, db, remaining, requester, scopes_by_group=owner_scopes
+        )
+    )
+    return [reused[row["id"]] for row in rows if row["id"] in reused], complete
 
 
 def observed_group_scopes(service, db, requester, observed):
@@ -133,6 +146,7 @@ def observed_group_scopes(service, db, requester, observed):
         )
         scopes.append((owner, None, 1))
     require(scopes[0][0] == requester, "scope_changed", 409)
+    candidates = []
     if len(scopes) > 1:
         # The bound applies to this actual owner set, not a roster of the room.
         candidates, _ = group_candidates(
@@ -144,7 +158,7 @@ def observed_group_scopes(service, db, requester, observed):
             "scope_changed",
             409,
         )
-    return scopes
+    return scopes, candidates
 
 
 def prior_checks(request):
@@ -179,16 +193,19 @@ def verified_scopes(service, request, context):
         service._authorize(db, context, scope=scope)
         if shared:
             observed = prior_checks(request)
-            scopes = (
-                [(scope, None, 1)]
+            scopes, approved = (
+                ([(scope, None, 1)], [])
                 if observed is None
                 else observed_group_scopes(service, db, scope, observed)
             )
-            yield db, scopes
+            # The read transaction still owns the authority lock. Reuse these
+            # exact complete groups only within this operation; later HTTP or
+            # external-ranking phases create a fresh proof and candidate set.
+            yield db, scopes, approved
             return
         scopes = authorized_scopes(service, db, scope, request["include_associated"])
         if len(scopes) == 1:
-            yield db, scopes
+            yield db, scopes, []
             return
     # Explicit persisted private consent; never forge an origin for the other owner.
     for other, _, _ in scopes[1:]:
@@ -202,4 +219,4 @@ def verified_scopes(service, request, context):
             "scope_changed",
             409,
         )
-        yield db, scopes
+        yield db, scopes, []

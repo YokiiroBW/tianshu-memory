@@ -47,7 +47,7 @@ def eligible_groups(service, db, groups, scope, *, scopes_by_group=None):
             keys,
         ):
             lineage[row["group_id"]].append(row)
-        current = _current_groups(service, db, keys, lineage)
+        current = current_groups(service, db, keys, lineage)
         selected_keys = [key for key in keys if key in current]
         if not selected_keys:
             continue
@@ -64,7 +64,7 @@ def eligible_groups(service, db, groups, scope, *, scopes_by_group=None):
                 owner_key = scope_key if scopes_by_group is None else canonical(owner)
                 units[group["id"]] = _units(group, records[group["id"]], owner, owner_key)
         projections = {}
-        for sql, parameters in _projection_queries(units):
+        for sql, parameters in projection_queries(units):
             for row in db.execute(sql, parameters):
                 projections[row["ref"]] = row
         for group in batch:
@@ -124,7 +124,7 @@ def exact_groups(service, db, scope, selection, kind, value):
         eligible = eligible_groups(service, db, groups, scope)
         return eligible, snapshot_for_groups(db, eligible, service=service)
 
-    current = _current_groups(service, db, [group["id"] for group in groups], lineage)
+    current = current_groups(service, db, [group["id"] for group in groups], lineage)
     selected = [group["id"] for group in groups if group["id"] in current]
     if not selected:
         return [], snapshot_for_groups(db, [], service=service)
@@ -151,13 +151,11 @@ def exact_groups(service, db, scope, selection, kind, value):
     }
     marker = marker_rows.fetchone()
     fact_installed = marker is not None and marker[0] in {"1", "2"}
-    projection_queries = list(_projection_queries(units))
+    projection_reads = list(projection_queries(units))
     valid_keys = [key for key, value in units.items() if value is not None]
-    requests = projection_queries + (list(group_queries(valid_keys)) if fact_installed else [])
+    requests = projection_reads + (list(group_queries(valid_keys)) if fact_installed else [])
     cursors = db.read_batch(requests) if requests else []
-    projections = {
-        row["ref"]: row for cursor in cursors[: len(projection_queries)] for row in cursor
-    }
+    projections = {row["ref"]: row for cursor in cursors[: len(projection_reads)] for row in cursor}
     eligible = [
         (group, records[group["id"]], units[group["id"]])
         for group in groups
@@ -169,7 +167,7 @@ def exact_groups(service, db, scope, selection, kind, value):
     valid_keys = {group["id"] for group, _, _ in eligible}
     facts = {
         row["group_id"]: row
-        for cursor in cursors[len(projection_queries) :]
+        for cursor in cursors[len(projection_reads) :]
         for row in cursor
         if row["group_id"] in valid_keys
     }
@@ -180,7 +178,7 @@ def exact_groups(service, db, scope, selection, kind, value):
     )
 
 
-def _current_groups(service, db, keys, lineage):
+def current_groups(service, db, keys, lineage):
     current_many = getattr(service.source_authority, "current_many", None)
     return (
         current_many(db, lineage)
@@ -189,7 +187,7 @@ def _current_groups(service, db, keys, lineage):
     )
 
 
-def _projection_queries(units):
+def projection_queries(units):
     refs = list(
         {
             source["projection_ref"]

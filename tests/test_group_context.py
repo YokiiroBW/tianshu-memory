@@ -176,6 +176,43 @@ def test_cold_group_recall_preserves_owner_and_legacy_select_stays_exact(room):
     assert recalled(h, probe(h, selected))["scope_checks"] == selected["scope_checks"]
 
 
+def test_known_owner_proof_reuses_complete_groups_only_in_its_own_operation(room, monkeypatch):
+    from tianshu_memory.memory_context import scopes
+
+    h = room
+    named_cats(h)
+    text = "阿川上次提过的猫叫什么"
+    selected = recalled(h, query(h, text))
+    request = query(
+        h,
+        text,
+        known_scope_version=selected["scope_version"],
+        known_association_version=selected["association_version"],
+        known_scope_checks=selected["scope_checks"],
+    )
+    validate = scopes.eligible_groups
+    batches = []
+
+    def counted(service, db, groups, scope, **kwargs):
+        batches.append([group["id"] for group in groups])
+        return validate(service, db, groups, scope, **kwargs)
+
+    monkeypatch.setattr(scopes, "eligible_groups", counted)
+    for _ in range(2):
+        batches.clear()
+        h.calls.clear()
+        current = recalled(h, request)
+        assert current["selected_units"] == selected["selected_units"]
+        assert len(batches) == 2
+        assert len(batches[0]) == len(batches[1]) == 2
+        assert not set(batches[0]) & set(batches[1])
+        assert [kind for kind, _, _ in h.calls if kind != "origin"] == [
+            "snapshot",
+            "current",
+            "head",
+        ]
+
+
 def test_group_never_expands_private_other_room_or_actor(room):
     h = room
     a = owner(h, audience="self_private")

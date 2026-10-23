@@ -1,9 +1,11 @@
 """Memory-owned shared profile domain. No standalone service or unreviewed HTTP writer."""
 
 import json
+from collections import defaultdict
 from datetime import timedelta
 
 from .domain import Fault, canonical, parse_time, query_terms, require, utc
+from .postgres import GROUP_READ_BATCH, is_postgres
 
 
 def audience_key(actor_id, sharing, conversation_id=None):
@@ -212,44 +214,108 @@ def select(service, request, context):
             f"AND g.state='active' AND g.category IN ({placeholders}){exact_filter} ORDER BY g.id",
             parameters,
         ).fetchall()
-        eligible = []
-        for group in groups:
-            expected_scope = dict(
-                audience_key(scope["actor_id"], group["sharing"], scope["conversation_id"]),
-                profile_subject=target,
-            )
-            if json.loads(group["scope"]) != expected_scope or not service._group_current(
-                db, group["id"]
-            ):
-                continue
-            rows = db.execute(
-                "SELECT * FROM records WHERE group_id=? ORDER BY id", (group["id"],)
-            ).fetchall()
-            if set(json.loads(group["members"])) != {r["id"] for r in rows} or not rows:
-                continue
-            units = [json.loads(row["payload"]) for row in rows]
-            if any(
-                row["state"] != "active"
-                or unit.get("subject") != target
-                or unit.get("sharing") != group["sharing"]
-                or unit.get("category") != group["category"]
-                or unit.get("field_key") != group["field_key"]
-                or unit.get("visibility") != "shared_projection"
-                or unit.get("record_version") != row["version"]
-                or unit.get("record_id") != row["id"]
-                or unit.get("semantic_group_id") != group["id"]
-                or not unit.get("sources")
-                or any(source.get("kind") != "shareable_projection" for source in unit["sources"])
-                for row, unit in zip(rows, units, strict=True)
-            ):
-                continue
-            if not service._projections_current(db, units):
-                continue
-            if service.contracts.profile_version is not None:
-                for unit in units:
-                    service.contracts.validate("profiles#unit", unit)
-            eligible.append((group, rows, units))
+        eligible = _eligible(service, db, groups, scope, target)
         if not exact:
             eligible = service._rank_groups(db, eligible, search_terms, request["query_text"])
         response.update(service._fit_groups(eligible, request["budget"]))
         return response
+
+
+def _units(group, rows, target):
+    """Profile integrity remains separate from ordinary person-memory units."""
+    if set(json.loads(group["members"])) != {row["id"] for row in rows} or not rows:
+        return None
+    units = [json.loads(row["payload"]) for row in rows]
+    if any(
+        row["state"] != "active"
+        or unit.get("subject") != target
+        or unit.get("sharing") != group["sharing"]
+        or unit.get("category") != group["category"]
+        or unit.get("field_key") != group["field_key"]
+        or unit.get("visibility") != "shared_projection"
+        or unit.get("record_version") != row["version"]
+        or unit.get("record_id") != row["id"]
+        or unit.get("semantic_group_id") != group["id"]
+        or not unit.get("sources")
+        or any(source.get("kind") != "shareable_projection" for source in unit["sources"])
+        for row, unit in zip(rows, units, strict=True)
+    ):
+        return None
+    return units
+
+
+def _eligible(service, db, groups, scope, target):
+    from .recall_index import current_groups, projection_queries
+
+    result = []
+    postgres = is_postgres(db)
+    batch_size = GROUP_READ_BATCH if postgres else 1
+    for offset in range(0, len(groups), batch_size):
+        batch = groups[offset : offset + batch_size]
+        approved = [
+            group
+            for group in batch
+            if json.loads(group["scope"])
+            == dict(
+                audience_key(scope["actor_id"], group["sharing"], scope["conversation_id"]),
+                profile_subject=target,
+            )
+        ]
+        records, projections = defaultdict(list), None
+        if postgres:
+            keys = [group["id"] for group in approved]
+            if not keys:
+                continue
+            lineage = defaultdict(list)
+            for row in db.execute(
+                "SELECT l.group_id,l.revision AS required_revision,l.epoch AS required_epoch,"
+                "s.key,s.state,s.revision,s.epoch FROM lineage l JOIN sources s "
+                "ON s.key=l.source_key WHERE l.group_id IN (" + ",".join("?" for _ in keys) + ")",
+                keys,
+            ):
+                lineage[row["group_id"]].append(row)
+            current = current_groups(service, db, keys, lineage)
+            approved = [group for group in approved if group["id"] in current]
+            keys = [group["id"] for group in approved]
+            if not keys:
+                continue
+            # Bodies are queued only after every retained group's source authority passes.
+            for row in db.execute(
+                "SELECT * FROM records WHERE group_id IN ("
+                + ",".join("?" for _ in keys)
+                + ") ORDER BY group_id,id",
+                keys,
+            ):
+                records[row["group_id"]].append(row)
+        else:
+            approved = [group for group in approved if service._group_current(db, group["id"])]
+            for group in approved:
+                records[group["id"]] = db.execute(
+                    "SELECT * FROM records WHERE group_id=? ORDER BY id", (group["id"],)
+                ).fetchall()
+        units, malformed = {}, None
+        for group in approved:
+            try:
+                units[group["id"]] = _units(group, records[group["id"]], target)
+            except (ValueError, TypeError, KeyError, AttributeError) as error:
+                # Preserve the first group's projection/schema error before a
+                # later malformed body, as the original scalar loop did.
+                malformed = error
+                break
+        if postgres:
+            projections = {}
+            for sql, parameters in projection_queries(units):
+                projections.update((row["ref"], row) for row in db.execute(sql, parameters))
+        for group in approved:
+            if group["id"] not in units:
+                raise malformed
+            group_units = units[group["id"]]
+            if group_units is None or not service._projections_current(
+                db, group_units, projections=projections
+            ):
+                continue
+            if service.contracts.profile_version is not None:
+                for unit in group_units:
+                    service.contracts.validate("profiles#unit", unit)
+            result.append((group, records[group["id"]], group_units))
+    return result

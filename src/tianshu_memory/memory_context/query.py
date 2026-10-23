@@ -33,7 +33,7 @@ def execute(application, request, context):
     period = request["time_range"]
     if period is not None:
         require(parse_time(period["from"]) < parse_time(period["to"]), "invalid_input", 400)
-    with verified_scopes(service, request, context) as (db, scopes):
+    with verified_scopes(service, request, context) as (db, scopes, approved):
         version = service._scope_version(db, scope)
         association_version = identity_version(db, scope)
         scope_checks = checks(service, db, scopes)
@@ -86,7 +86,9 @@ def execute(application, request, context):
             owners = [scope] if self_reference(ranking_query) else None
             # Name uniqueness and target relevance share one window across categories;
             # an unselected identity category must not hide a same-name other owner.
-            candidates, complete = group_candidates(service, db, scope, owners=owners)
+            candidates, complete = group_candidates(
+                service, db, scope, owners=owners, approved=approved
+            )
             authorized_group_ids = frozenset(entry[0]["id"] for entry in candidates)
             result["coverage"]["complete"] &= complete
         for selected_scope, _, _ in [] if shared else scopes:
@@ -221,7 +223,7 @@ def execute(application, request, context):
     if remote_rank:
         result["coverage"]["complete"] &= len(candidates) <= settings["candidates"]
         candidates = service.retrieval.rank(ranking_query, candidates, lexical, settings)
-    with verified_scopes(service, request, context) as (db, current_scopes):
+    with verified_scopes(service, request, context) as (db, current_scopes, approved):
         require(
             int(db.execute("SELECT value FROM metadata WHERE key='source_revision'").fetchone()[0])
             == prepared["revision"],
@@ -238,7 +240,7 @@ def execute(application, request, context):
             # A clock boundary can change current names without any DML/revision.
             # Reuse the same bounded authorized domain to reprove both this witness
             # and uniqueness against all other owners, not just the returned owner.
-            fresh, complete = group_candidates(service, db, scope)
+            fresh, complete = group_candidates(service, db, scope, approved=approved)
             fresh_snapshot = snapshot_for_groups(
                 db, fresh, service=service, domain_complete=complete
             )

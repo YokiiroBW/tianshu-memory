@@ -39,20 +39,9 @@ class CandidateExtraction:
                 return completed
             if job["state"] != "pending":
                 return dict(state="invalidated", result=None, content=[])
-        content = self._content(event)
         if request["output"] is None:
-            with service.operation(scope=scope, sources=event["sources"], event=event) as db:
-                # Another same-job request can finish while _content reads its
-                # sources. Its committed receipt outranks a new pending snapshot.
-                completed = self._completed(db, job["id"])
-                if completed:
-                    return completed
-                hints = facts.known(service, db, scope)
-                version = 3 if facts.installed(db) else 1
-            result = dict(state="pending", result=None, content=content)
-            if version == 3:
-                result.update(extraction_schema=3, known_facts=hints)
-            return result
+            return self._content(event, pending_job=job["id"])
+        content = self._content(event)
         try:
             drafts = self._drafts(event, content, request["output"])
             # The workflow rolls this proposal's entire transaction back before
@@ -81,7 +70,7 @@ class CandidateExtraction:
             dict(state="completed", result=json.loads(receipt[0]), content=[]) if receipt else None
         )
 
-    def _content(self, event):
+    def _content(self, event, *, pending_job=None):
         service = self.service
         scope, sources = event["scope"], event["sources"]
         with service.operation(scope=scope, sources=sources, event=event) as db:
@@ -128,6 +117,18 @@ class CandidateExtraction:
                 for index, source in enumerate(sources):
                     if service.source_identity(source, scope) in covered:
                         result[index]["text"] = ""
+            if pending_job is not None:
+                # This fresh post-content transaction already owns the same
+                # source/event boundary. Read the ledger and matching hints
+                # here, rather than immediately repeating the whole barrier.
+                completed = self._completed(db, pending_job)
+                if completed:
+                    return completed
+                hints = facts.known(service, db, scope)
+                pending = dict(state="pending", result=None, content=result)
+                if facts.installed(db):
+                    pending.update(extraction_schema=3, known_facts=hints)
+                return pending
         return result
 
     def _drafts(self, event, content, output):

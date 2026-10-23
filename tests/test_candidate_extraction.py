@@ -9,6 +9,7 @@ from test_source_sync import certificates as certificates
 from test_source_sync import source_contracts as source_contracts
 from test_source_sync import source_examples as source_examples
 from test_source_sync import sync as sync
+from test_storage_backends import pg_sync as pg_sync
 
 from tianshu_memory.domain import Fault, canonical, fingerprint
 from tianshu_memory.workflow import TrustedWorkflow
@@ -85,6 +86,57 @@ def test_read_commit_recall_replay_and_role_isolation(sync):
     assert sync.post(PATH, dict(job_id=job, output=None)).json() == committed.json()
     assert sync.post(PATH, dict(job_id=job, output=output())).json() == committed.json()
     assert recall(sync)[0]["record_id"] == units[0]["record_id"]
+
+
+def pending_read_case(h):
+    from test_automatic_facts import initialize
+
+    initialize(h)
+    job = prepare(h)
+    h.calls.clear()
+    pending = h.post(PATH, dict(job_id=job, output=None))
+    assert pending.status_code == 200, pending.text
+    assert pending.json() == dict(
+        state="pending",
+        result=None,
+        content=[dict(index=0, text=TEXT, sent_at="2026-10-11T00:00:00Z")],
+        extraction_schema=3,
+        known_facts=[],
+    )
+    assert [kind for kind, _, _ in h.calls if kind != "origin"] == [
+        "snapshot",
+        "current",
+        "head",
+        "snapshot",
+        "current",
+        "snapshot",
+        "current",
+        "head",
+    ]
+    snapshots = [body["include_content"] for kind, body, _ in h.calls if kind == "snapshot"]
+    assert snapshots == [False, True, False]
+    # A model proposal still returns through its independent current-source
+    # commit boundary; the pending read never persists inferred memories.
+    with h.store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM write_ledger").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0
+    rejected = output()
+    rejected["memories"][0]["evidence"][0]["quote"] = "不在来源里的句子"
+    assert h.post(PATH, dict(job_id=job, output=rejected)).json()["state"] == "rejected"
+    complete = h.post(PATH, dict(job_id=job, output=output()))
+    assert complete.status_code == 200, complete.text
+    assert complete.json()["result"]["state"] == "committed"
+    h.calls.clear()
+    assert h.post(PATH, dict(job_id=job, output=None)).json() == complete.json()
+    assert h.calls == []
+
+
+def test_pending_read_uses_its_existing_final_source_transaction(sync):
+    pending_read_case(sync)
+
+
+def test_native_postgres_pending_read_barrier_and_replay(pg_sync):
+    pending_read_case(pg_sync)
 
 
 @pytest.mark.parametrize("empty", [False, True])
@@ -242,17 +294,21 @@ def test_completed_job_wins_when_an_older_request_commits_during_content(sync, m
     original_content = CandidateExtraction._content
     completed = []
 
-    def finish_old_request_before_content(current, current_event):
+    def finish_old_request_before_content(current, current_event, **kwargs):
         completed.append(
             TrustedWorkflow(current.service).commit_extracted(dict(job_id=job, drafts=drafts))
         )
-        content = original_content(current, current_event)
+        content = original_content(current, current_event, **kwargs)
         # Context applications mask already-consumed source content. Without a
         # fresh ledger read this used to return rejected or misleading pending.
-        assert all(source["text"] == "" for source in content)
+        if kwargs:
+            assert content == dict(state="completed", result=completed[0], content=[])
+        else:
+            assert all(source["text"] == "" for source in content)
         return content
 
     monkeypatch.setattr(CandidateExtraction, "_content", finish_old_request_before_content)
+
     response = sync.post(PATH, dict(job_id=job, output=None if lookup else output()))
     assert response.status_code == 200, response.text
     assert response.json() == dict(state="completed", result=completed[0], content=[])
@@ -269,3 +325,21 @@ def test_completed_job_wins_when_an_older_request_commits_during_content(sync, m
     sync.config["callers"]["companion"]["event_scopes"] = [sync.scope(1)]
     sync.save()
     assert sync.post(PATH, dict(job_id=job, output=None)).status_code == 403
+
+
+@pytest.mark.parametrize("lookup", [False, True])
+def test_native_postgres_older_candidate_receipt_still_wins(pg_sync, monkeypatch, lookup):
+    test_completed_job_wins_when_an_older_request_commits_during_content(
+        pg_sync, monkeypatch, lookup
+    )
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_native_postgres_candidate_source_revocation(pg_sync, empty):
+    test_source_revocation_between_prepare_and_commit_blocks_memory(pg_sync, empty)
+
+
+def test_native_postgres_explicit_source_stays_filtered_from_learning(pg_sync):
+    from test_automatic_facts import test_explicit_source_is_not_written_again_by_automatic_learning
+
+    test_explicit_source_is_not_written_again_by_automatic_learning(pg_sync)
