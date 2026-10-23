@@ -4,6 +4,7 @@ import json
 from contextlib import contextmanager
 
 from ..domain import Fault, canonical, require
+from ..postgres import is_postgres
 from ..recall_index import eligible_groups
 from .migration import ready
 
@@ -20,9 +21,17 @@ def authorized_scopes(service, db, scope, include_associated):
     result = [(scope, None, 1)]
     if not include_associated or scope["audience"] != "self_private":
         return result
-    rows = db.execute(
+    if is_postgres(db):
+        # JSONB object text is not canonical application JSON. Compare the
+        # complete endpoint objects, without weakening their scope identity.
+        read = db.native
+        endpoint_match = "((scopes::jsonb #> '{0}')=?::jsonb OR (scopes::jsonb #> '{1}')=?::jsonb)"
+    else:
+        read = db.execute
+        endpoint_match = "(json_extract(scopes,'$[0]')=? OR json_extract(scopes,'$[1]')=?)"
+    rows = read(
         "SELECT * FROM context_associations WHERE actor_id=? AND state='linked' AND (source_person=? OR target_person=?) "
-        "AND (json_extract(scopes,'$[0]')=? OR json_extract(scopes,'$[1]')=?) ORDER BY id LIMIT 17",
+        "AND " + endpoint_match + " ORDER BY id LIMIT 17",
         (
             scope["actor_id"],
             scope["person_id"],
