@@ -8,7 +8,7 @@ import json
 import re
 import unicodedata
 
-from . import fact_entities, fact_labels, fact_names
+from . import fact_entities, fact_labels, fact_names, fact_provenance
 from .domain import canonical, fingerprint, parse_time, require
 from .fact_migration import SUPPORTED_VERSIONS, installed, source_text_installed
 from .fact_queries import for_groups, snapshot_for_groups
@@ -240,6 +240,9 @@ def commit(writer, db, draft, event, source_map):
     existing = [
         row for row in existing if bool(json.loads(row["payload"]).get("canonical")) == typed
     ]
+    basis = fact_provenance.independent_basis(service, draft, source_map) if typed else None
+    if typed:
+        existing = fact_provenance.reusable(db, existing, fact["update"]["operation"], basis)
     existing = sorted(existing, key=lambda row: parse_time(row["observed_at"]), reverse=True)
     duplicate = next(
         (r for r in existing if names is not None or service._group_current(db, r["group_id"])),
@@ -267,6 +270,10 @@ def commit(writer, db, draft, event, source_map):
                 if entry.row["superseded_by"] is None
             ]
         )
+        if typed:
+            prior_rows = fact_provenance.reusable(
+                db, prior_rows, fact["update"]["operation"], basis
+            )
         for prior_row in sorted(
             prior_rows, key=lambda row: parse_time(row["observed_at"]), reverse=True
         ):
@@ -290,6 +297,12 @@ def commit(writer, db, draft, event, source_map):
             ):
                 duplicate = prior_row
                 break
+    closure = None
+    if typed:
+        draft, source_map, closure = fact_provenance.target_evidence(
+            db, draft, selected_targets, source_map
+        )
+        unit = draft["units"][0]
     raw = {k: v for k, v in draft.items() if k not in {"fact", "observed_at", "quotes"}}
     if duplicate:
         group_id, ids = duplicate["group_id"], json.loads(duplicate["members"])
@@ -335,6 +348,7 @@ def commit(writer, db, draft, event, source_map):
             "INSERT INTO automatic_facts VALUES (?,?,?,?,?,?,NULL)",
             (group_id, scope, identity_key, value_key, observed, canonical(fact)),
         )
+    fact_provenance.bind(db, group_id, closure)
     for quote in draft["quotes"]:
         require(quote["source_key"] in source_map, "invalid_input", 400)
         if names is None and not typed:

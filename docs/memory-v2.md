@@ -10,6 +10,8 @@ schema 4 不收自由 statement。模型提供 subject/predicate/value、single/
 
 replace/retract/confirm 只操作同 owner、实体、predicate、modality、reality 的准确版本。集合 add 保留其他成员，替换只退休明确 targets。历史补充不会被当前单值互斥拒绝，也不能以历史 replace 退休当前值。单值未来生效由读取时的有效时间裁定。
 
+retract/confirm 的旧值来自精确目标，结果组继承目标的完整来源 revision/epoch 和引用证据，包括前序更新已继承的依赖。retract 必须匹配目标值，confirm 还必须保持状态、有效期、条件和否定项。确认组保留同一值及证据，旧目标成为可审计前驱，避免随后撤回确认时原副本重新成为当前值。独立 assert/add/replace 的新内容不继承被操作目标的来源；schema 4 仅在相同来源基础内合并独立同值事实，不能把一个新来源声明并入带旧来源依赖的组。旧 schema 3 的既有语义去重不变。
+
 旧记录保持 `legacy_unstructured`。新明确来源可以建立规范当前值，旧值不会阻塞 assert；同值也不把旧 mixed statement 合并升格为 canonical。当前投影在同槽和时间可证时优先规范事实，原记录与原文继续可查。模型仍可能误解自然语言；引用存在和结构正确本身不证明语义蕴含。
 
 ## 显式迁移和旧来源重建
@@ -38,6 +40,8 @@ uv run tianshu-memory --config C:/runtime/memory/config.json reindex-memory --ba
 不透明 bundle_id 承载服务端 selection 的 HMAC 证明，覆盖查询、预算、限制、选择约束、全部证据与来源依赖。公开 evidence_digest 不能自行改成一份无结果证明。证明 key 位于现 metadata，由显式迁移创建，随后续备份保留；不进入模型或公开诊断。verify 验证证明后仍重做当前来源/候选域检查，签名不替代权限或新鲜性。
 
 `POST /internal/v2/memory/context/forget` 使用 kind=forget_episode、episode_ref/version、当前指令 evidence_refs 和既有 Platform revision proof。用户证明绑定完整语义请求；沿 `context_propose` 权限和原 scope。一次忘记撤回目标来源的所有重叠 span、向量、FTS、相关事实与迟到候选，并更新无事实来源的历史版本。没有事实的来源也能遗忘，无需伪造 record。响应和超时恢复复用 v1 receipt 与原 context_operations；source suppression 阻止重建或迟到嵌入复活。
+
+来源级 forget_episode 的 receipt 保持 `record_ids=[]`、`group_ids=[]`：精确 episode/source 目标由原请求语义摘要绑定，并不受旧单组回执容量限制。实际清理包括所有依赖该来源的派生组，完整失效状态和历史审计仍在既有记录中；空 IDs 不表示没有清理派生事实。直接针对 record 的旧 forget 协议不变。
 
 ## 可选本地 CPU 向量后端
 

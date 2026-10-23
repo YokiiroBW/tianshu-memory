@@ -181,12 +181,19 @@ def targets(service, db, draft, fact):
                 "invalid_input",
                 400,
             )
+        if update["operation"] in {"confirm", "retract"}:
+            require(prior["value"] == fact["value"], "invalid_input", 400)
         if update["operation"] == "confirm":
             require(
                 prior["state"] == fact["state"]
-                and prior["value"] == fact["value"]
                 and prior["valid_from"] == fact["valid_from"]
                 and prior["valid_to"] == fact["valid_to"],
+                "invalid_input",
+                400,
+            )
+            require(
+                json.loads(record["payload"])["conditions"] == draft["units"][0]["conditions"]
+                and json.loads(record["payload"])["negations"] == draft["units"][0]["negations"],
                 "invalid_input",
                 400,
             )
@@ -243,8 +250,11 @@ def targets(service, db, draft, fact):
 
 def reconcile(writer, db, draft, fact, selected, group_id, *, supersede):
     operation = fact["update"]["operation"]
-    if operation not in {"replace", "retract"}:
+    if operation not in {"replace", "retract", "confirm"}:
         return
+    # A confirmation carries the same value and complete target provenance in
+    # its new group; its targets remain auditable predecessors, not competing
+    # current copies that could reappear after retracting the confirmation.
     effective = fact["valid_from"] or draft["observed_at"]
     if parse_time(effective) > writer.service.clock():
         return

@@ -47,17 +47,11 @@ def execute(application, request, context):
                 409,
             )
             service._source_rows(db, [json.loads(source["payload"])], scope)
-            groups = service._invalidate_sources(
-                db, [source["key"]], suppress="forget", forgotten=True
-            )
-            records = [
-                row[0]
-                for group in groups
-                for row in db.execute("SELECT id FROM records WHERE group_id=?", (group,))
-            ]
-            receipt = application._receipt(
-                db, request, "tombstoned", records=records, groups=sorted(groups)
-            )
+            service._invalidate_sources(db, [source["key"]], suppress="forget", forgotten=True)
+            # The operation targets this exact episode/source, not one record
+            # group. Its request digest is retained in context_operations;
+            # the existing one-group receipt cannot enumerate a source closure.
+            receipt = application._receipt(db, request, "tombstoned")
         except Fault as error:
             db.execute("ROLLBACK TO forget_episode")
             if error.code not in {
