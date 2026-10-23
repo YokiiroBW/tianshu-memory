@@ -331,12 +331,17 @@ def rank_groups(
         ranked = rank(db, documents, expression)
     else:
         db.execute("CREATE VIRTUAL TABLE temp.allowed_search USING fts5(group_id UNINDEXED,text)")
-        db.executemany("INSERT INTO temp.allowed_search VALUES (?,?)", documents)
-        ranked = db.execute(
-            "SELECT group_id,text,bm25(allowed_search) AS relevance FROM temp.allowed_search "
-            "WHERE allowed_search MATCH ?",
-            (expression,),
-        )
+        try:
+            db.executemany("INSERT INTO temp.allowed_search VALUES (?,?)", documents)
+            ranked = db.execute(
+                "SELECT group_id,text,bm25(allowed_search) AS relevance FROM temp.allowed_search "
+                "WHERE allowed_search MATCH ?",
+                (expression,),
+            ).fetchall()
+        finally:
+            # One transaction may rank several subqueries with different scopes.
+            # Keep this temporary corpus owned by this invocation, not the connection.
+            db.execute("DROP TABLE temp.allowed_search")
     query_plan = LexicalQuery(query)
     matches = {}
     clauses_by_group = {}

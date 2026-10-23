@@ -91,19 +91,6 @@ def collect(service, db, request, context):
                 group, units, snapshot.decoded[identity], snapshot.rows[identity]["observed_at"]
             )
     episodes = list(memory_documents.episode_metadata(service, db, [item[0] for item in scopes]))
-    domain = fingerprint(
-        dict(
-            groups=[
-                (entry[0]["id"], [(row["id"], row["version"]) for row in entry[1]])
-                for entry in groups
-            ],
-            episodes=[
-                (row["id"], row["source_revision"], row["source_epoch"], row["content_hash"])
-                for row in episodes
-            ],
-            complete=complete,
-        )
-    )
     return dict(
         scope=scope,
         scopes=scopes,
@@ -113,11 +100,17 @@ def collect(service, db, request, context):
         documents=document_rows,
         episodes=episodes,
         complete=complete,
-        domain=domain,
     )
 
 
-def prepare_query(service, db, frame, subquery, selection):
+def query_domain(service, frame, subquery):
+    """Resolve names globally, then bind the complete authorized owner scopes.
+
+    Person resolution only projects scopes already authorized by collect,
+    including explicit current private associations. It never discovers other
+    conversations for that person. Body selection and its freshness proof share
+    this projection; relevance, category and time filters cannot shrink it.
+    """
     resolution, witnesses = targets.resolve(
         service,
         frame["snapshot"],
@@ -126,15 +119,49 @@ def prepare_query(service, db, frame, subquery, selection):
         frame["scope"],
         complete=frame["complete"],
     )
-    owners = {
+    people = {
         target["person_id"] for target in resolution["targets"] if target["status"] == "resolved"
     }
-    candidates = [
-        entry
-        for entry in frame["groups"]
-        if entry[0]["category"] in selection
-        and (resolution["mode"] == "room" or json.loads(entry[0]["scope"])["person_id"] in owners)
-    ]
+    scopes = sorted(
+        (
+            entry
+            for entry in frame["scopes"]
+            if resolution["mode"] == "room" or entry[0]["person_id"] in people
+        ),
+        key=lambda entry: canonical(entry[0]),
+    )
+    owners = {canonical(entry[0]) for entry in scopes}
+    groups = [entry for entry in frame["groups"] if entry[0]["scope"] in owners]
+    episodes = [row for row in frame["episodes"] if row["scope"] in owners]
+    digest = fingerprint(
+        dict(
+            scopes=scopes,
+            groups=sorted(
+                (entry[0]["id"], sorted((row["id"], row["version"]) for row in entry[1]))
+                for entry in groups
+            ),
+            episodes=sorted(
+                (row["id"], row["source_revision"], row["source_epoch"], row["content_hash"])
+                for row in episodes
+            ),
+            complete=frame["complete"],
+        )
+    )
+    return dict(
+        resolution=resolution,
+        witnesses=witnesses,
+        scopes=scopes,
+        groups=groups,
+        episodes=episodes,
+        complete=frame["complete"],
+        digest=digest,
+        count=len(groups) + len(episodes),
+    )
+
+
+def prepare_query(service, db, frame, subquery, selection):
+    domain = query_domain(service, frame, subquery)
+    candidates = [entry for entry in domain["groups"] if entry[0]["category"] in selection]
     history = subquery["intent"] != "current"
     if not history:
         candidates = automatic_facts.filter_current(
@@ -163,19 +190,15 @@ def prepare_query(service, db, frame, subquery, selection):
         fact_snapshot=frame["snapshot"],
         authorized_group_ids=frozenset(frame["group_map"]),
     )
-    scopes = [
-        item[0]
-        for item in frame["scopes"]
-        if resolution["mode"] == "room" or item[0]["person_id"] in owners
-    ]
     episode_ids = {
         row["id"]
-        for row in frame["episodes"]
-        if (resolution["mode"] == "room" or json.loads(row["scope"])["person_id"] in owners)
-        and temporal(dict(row, valid_from=None, valid_to=None), period)[0]
+        for row in domain["episodes"]
+        if temporal(dict(row, valid_from=None, valid_to=None), period)[0]
     }
     lexical_episodes = list(
-        memory_documents.episode_metadata(service, db, scopes, query_text=subquery["text"])
+        memory_documents.episode_metadata(
+            service, db, [entry[0] for entry in domain["scopes"]], query_text=subquery["text"]
+        )
     )
     documents = (
         [
@@ -187,7 +210,7 @@ def prepare_query(service, db, frame, subquery, selection):
         else []
     )
     if "episodes" in subquery["kinds"]:
-        documents += [row for row in frame["episodes"] if row["id"] in episode_ids]
+        documents += [row for row in domain["episodes"] if row["id"] in episode_ids]
     lexical_ids = (
         ["fact:" + entry[0]["id"] for entry in lexical] if "facts" in subquery["kinds"] else []
     )
@@ -198,11 +221,10 @@ def prepare_query(service, db, frame, subquery, selection):
     )
     return dict(
         subquery=subquery,
-        resolution=resolution,
-        witnesses=witnesses,
+        domain=domain,
         documents=documents,
         lexical_ids=lexical_ids,
-        reference_incomplete=targets.unresolved_reference(subquery["text"], resolution),
+        reference_incomplete=targets.unresolved_reference(subquery["text"], domain["resolution"]),
     )
 
 
@@ -436,25 +458,19 @@ def verify_snapshot(service, db, bundle, frame, context):
     for subquery, constraint in zip(
         bundle["queries"], bundle["selection_constraints"], strict=True
     ):
-        resolution, _ = targets.resolve(
-            service,
-            frame["snapshot"],
-            frame["groups"],
-            subquery["text"],
-            frame["scope"],
-            complete=frame["complete"],
-        )
+        domain = query_domain(service, frame, subquery)
         require(
             constraint["query_id"] == subquery["query_id"]
-            and constraint["owner_resolution"] == resolution
-            and constraint["candidate_domain_hash"] == frame["domain"]
-            and constraint["candidate_domain_complete"] == frame["complete"],
+            and constraint["owner_resolution"] == domain["resolution"]
+            and constraint["candidate_domain_hash"] == domain["digest"]
+            and constraint["candidate_count"] == domain["count"]
+            and constraint["candidate_domain_complete"] == domain["complete"],
             "scope_changed",
             409,
         )
         if constraint["result_status"] == "no_match":
             require(
-                "no_match" in constraint["proof_kinds"] and frame["complete"], "scope_changed", 409
+                "no_match" in constraint["proof_kinds"] and domain["complete"], "scope_changed", 409
             )
     evidence = {}
     for group in bundle["group_dependencies"]:
@@ -566,7 +582,15 @@ def execute(application, request, context):
     rank_plans(service, prepared, backend_failed)
     with operation(service, items) as db:
         fresh = collect(service, db, request, context)
-        require(fresh["domain"] == frame["domain"], "scope_changed", 409)
+        for plan in prepared:
+            domain = query_domain(service, fresh, plan["subquery"])
+            require(
+                domain["resolution"] == plan["domain"]["resolution"]
+                and domain["digest"] == plan["domain"]["digest"],
+                "scope_changed",
+                409,
+            )
+            plan["domain"] = domain
         return assemble(service, db, request, context, fresh, prepared)
 
 
@@ -593,9 +617,10 @@ def assemble(service, db, request, context, frame, prepared):
     included = set()
     facts_count = episodes_count = 0
     for plan in prepared:
-        query, resolution = plan["subquery"], plan["resolution"]
+        query, domain = plan["subquery"], plan["domain"]
+        resolution = domain["resolution"]
         result_ids, omissions, missing_time = [], [], 0
-        witness_ids = [entry[0]["id"] for entry in plan["witnesses"]]
+        witness_ids = [entry[0]["id"] for entry in domain["witnesses"]]
         for document in plan["ranked"]:
             batch = (
                 fact_evidence(frame, document["group_id"])
@@ -652,7 +677,7 @@ def assemble(service, db, request, context, frame, prepared):
             omissions.append("index_incomplete")
         if missing_time:
             omissions.append("source_time_unavailable")
-        incomplete = bool(omissions) or not frame["complete"]
+        incomplete = bool(omissions) or not domain["complete"]
         status = "incomplete" if incomplete else "matched" if result_ids else "no_match"
         if unresolved and not result_ids:
             status = "unresolved"
@@ -679,7 +704,7 @@ def assemble(service, db, request, context, frame, prepared):
                     returned_facts=sum(item["kind"] != "episode" for item in selected),
                     matched_episodes=sum(item["kind"] == "episode" for item in plan["ranked"]),
                     returned_episodes=sum(item["kind"] == "episode" for item in selected),
-                    candidate_complete=frame["complete"],
+                    candidate_complete=domain["complete"],
                     index_complete=plan["index_complete"],
                     history_complete=False,
                     missing_source_times=missing_time,
@@ -691,9 +716,9 @@ def assemble(service, db, request, context, frame, prepared):
                 query_id=query["query_id"],
                 owner_resolution=resolution,
                 proof_kinds=list(dict.fromkeys(proofs)),
-                candidate_domain_hash=frame["domain"],
-                candidate_count=len(frame["groups"]) + len(frame["episodes"]),
-                candidate_domain_complete=frame["complete"],
+                candidate_domain_hash=domain["digest"],
+                candidate_count=domain["count"],
+                candidate_domain_complete=domain["complete"],
                 result_status=status,
             )
         )
