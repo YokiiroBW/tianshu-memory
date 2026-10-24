@@ -21,6 +21,7 @@ from tianshu_memory.app import create_app
 from tianshu_memory.domain import Fault
 from tianshu_memory.read_lifecycle import begin_source_read, cancellable_read, source_read_lock
 from tianshu_memory.source_authority import SourceAuthority
+from tianshu_memory.source_order import SourceOperationOrder
 
 
 class ObservedLock:
@@ -296,6 +297,7 @@ def test_queued_v2_forget_keeps_unknown_and_commits_once_after_timeout(sync, mon
 @pytest.mark.parametrize("bundle", [False, True])
 def test_cancel_checkpoint_precedes_every_outer_authority_transaction(bundle):
     authority = object.__new__(SourceAuthority)
+    authority._operation_order = SourceOperationOrder()
     authority._operation_lock, authority._bundled = threading.RLock(), threading.local()
 
     def forbidden():
@@ -344,6 +346,7 @@ def test_cancel_after_successful_acquire_still_hits_the_locked_guard(bundle):
 
     lock = CancelOnAcquire(threading.RLock())
     authority = object.__new__(SourceAuthority)
+    authority._operation_order = SourceOperationOrder()
     authority._operation_lock, authority._bundled = lock, threading.local()
 
     def forbidden():

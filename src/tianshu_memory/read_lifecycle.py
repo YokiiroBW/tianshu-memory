@@ -17,6 +17,20 @@ class _Read:
 _current: ContextVar[_Read | None] = ContextVar("memory_read_lifecycle", default=None)
 
 
+def _pending_read():
+    read = _current.get()
+    if read is None or read.started:
+        return None
+    if read.abandoned():
+        raise Fault("timeout", 408)
+    return read
+
+
+def source_wait_timeout():
+    """Only not-started pure reads poll their existing cancellation lifecycle."""
+    return 0.1 if _pending_read() is not None else None
+
+
 @contextmanager
 def cancellable_read(abandoned):
     """Bind only the explicitly selected HTTP pure-read worker, never its siblings."""
@@ -35,16 +49,14 @@ def source_read_lock(lock):
     still wait for the same RLock; started reads and all untagged work retain
     the original blocking acquisition and completion rules.
     """
-    read = _current.get()
-    if read is None or read.started:
+    if _pending_read() is None:
         with lock:
             yield
         return
     acquired = False
     try:
         while not acquired:
-            if read.abandoned():
-                raise Fault("timeout", 408)
+            _pending_read()
             acquired = lock.acquire(timeout=0.1)
         yield
     finally:
@@ -58,8 +70,6 @@ def begin_source_read():
     Once started, every later boundary keeps the original completion semantics.
     This does not interrupt a sync, business transaction, or multi-phase read.
     """
-    read = _current.get()
-    if read is not None and not read.started:
-        if read.abandoned():
-            raise Fault("timeout", 408)
+    read = _pending_read()
+    if read is not None:
         read.started = True

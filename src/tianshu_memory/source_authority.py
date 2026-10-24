@@ -17,6 +17,7 @@ from .domain import (
 from .postgres import is_postgres
 from .read_lifecycle import begin_source_read, source_read_lock
 from .source_lookup_migration import require_ready
+from .source_order import SourceOperationOrder
 
 
 class LocalRevisionChanged(Exception):
@@ -33,6 +34,7 @@ class SourceAuthority:
         # Serialize this owner's sync-and-business boundary, not SQLite across network I/O.
         # Otherwise independent readers repeatedly invalidate each other's global CAS.
         self._operation_lock = threading.RLock()
+        self._operation_order = SourceOperationOrder()
         self._bundled = threading.local()
 
     @staticmethod
@@ -450,7 +452,7 @@ class SourceAuthority:
                 service._authorize(active["db"], kwargs["context"], scope=scope)
             yield active["db"]
             return
-        with source_read_lock(self._operation_lock):
+        with self._operation_order.turn(), source_read_lock(self._operation_lock):
             begin_source_read()
             with self._operation(service, scope, **kwargs) as db:
                 yield db
@@ -467,7 +469,7 @@ class SourceAuthority:
             "invalid_input",
             400,
         )
-        with source_read_lock(self._operation_lock):
+        with self._operation_order.turn(), source_read_lock(self._operation_lock):
             begin_source_read()
             selectors, domains = {}, set()
             with service.store.transaction() as db:
