@@ -92,6 +92,7 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
             request_id = "request-unavailable"
             mutation = operation in {"propose", "association", "forget_v2"}
             version_two = operation.endswith("_v2")
+            pure_read = operation in {"query_v2", "verify_v2", "prepare_v2", "profiles_v2"}
 
             def failed(error, *, uncertain=False):
                 note_fault(error.code)
@@ -191,7 +192,11 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                         return result
 
                 async with asyncio.timeout(execute_timeout):
-                    result = await lease.run(execute, business=True)
+                    result = await lease.run(
+                        execute,
+                        business=True,
+                        read_only=pure_read,
+                    )
                 return JSONResponse(
                     result,
                     headers={

@@ -1,11 +1,13 @@
 """Admission ownership outlives a timed-out response while its worker still runs."""
 
 import asyncio
+from contextlib import nullcontext
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
 from .domain import Fault
+from .read_lifecycle import cancellable_read
 
 
 class Requests:
@@ -28,13 +30,14 @@ class Lease:
         self.business_started = False
         self.request = None
 
-    async def run(self, operation, *args, business=False):
+    async def run(self, operation, *args, business=False, read_only=False):
         def execute():
             if self.abandoned:
                 raise Fault("timeout", 408)
             if business:
                 self.business_started = True
-            return operation(*args)
+            with cancellable_read(lambda: self.abandoned) if read_only else nullcontext():
+                return operation(*args)
 
         self.task = asyncio.create_task(run_in_threadpool(execute))
         # Drain a late fault even when the response has already ended.

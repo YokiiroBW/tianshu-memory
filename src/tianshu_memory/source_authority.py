@@ -15,6 +15,7 @@ from .domain import (
     utc,
 )
 from .postgres import is_postgres
+from .read_lifecycle import begin_source_read
 from .source_lookup_migration import require_ready
 
 
@@ -450,6 +451,7 @@ class SourceAuthority:
             yield active["db"]
             return
         with self._operation_lock:
+            begin_source_read()
             with self._operation(service, scope, **kwargs) as db:
                 yield db
 
@@ -466,6 +468,7 @@ class SourceAuthority:
             400,
         )
         with self._operation_lock:
+            begin_source_read()
             selectors, domains = {}, set()
             with service.store.transaction() as db:
                 for item in requirements:
