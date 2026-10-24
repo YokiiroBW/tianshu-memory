@@ -9,7 +9,7 @@ from test_source_sync import source_contracts as source_contracts
 from test_source_sync import source_examples as source_examples
 from test_source_sync import sync as sync
 
-from tianshu_memory.memory_context.scopes import authorized_scopes
+from tianshu_memory.memory_context.authorization import authorized_scopes
 
 
 @pytest.mark.parametrize("read_from", ["source", "target"])

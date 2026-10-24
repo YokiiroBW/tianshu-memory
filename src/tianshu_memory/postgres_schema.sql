@@ -358,3 +358,26 @@ CREATE TABLE IF NOT EXISTS memory_vectors (
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS extraction_schema BIGINT;
 CREATE TABLE IF NOT EXISTS memory_episode_index (document_id TEXT,scope TEXT,text TEXT);
 CREATE INDEX IF NOT EXISTS memory_episode_index_terms ON memory_episode_index USING gin(to_tsvector('simple',text));
+
+CREATE TABLE IF NOT EXISTS memory_batches (
+ id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id) DEFERRABLE INITIALLY IMMEDIATE,
+ window_id TEXT NOT NULL, manifest TEXT NOT NULL, portrait_input TEXT,
+ portrait_basis TEXT NOT NULL, recorded_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS memory_summaries (
+ group_id TEXT PRIMARY KEY REFERENCES groups(id) DEFERRABLE INITIALLY IMMEDIATE,
+ kind TEXT NOT NULL, scope TEXT NOT NULL, window_id TEXT NOT NULL, manifest TEXT NOT NULL,
+ summary_refs TEXT NOT NULL, importance TEXT NOT NULL, recorded_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS memory_summary_scope ON memory_summaries(scope,kind,recorded_at);
+CREATE TABLE IF NOT EXISTS memory_summary_sources (
+ group_id TEXT NOT NULL REFERENCES groups(id) DEFERRABLE INITIALLY IMMEDIATE,
+ source_key TEXT NOT NULL REFERENCES sources(key) DEFERRABLE INITIALLY IMMEDIATE,
+ revision BIGINT NOT NULL, epoch BIGINT NOT NULL, source_scope TEXT NOT NULL,
+ purpose TEXT NOT NULL, PRIMARY KEY(group_id,source_key));
+CREATE INDEX IF NOT EXISTS memory_summary_source ON memory_summary_sources(source_key);
+CREATE TABLE IF NOT EXISTS memory_portraits (
+ scope TEXT PRIMARY KEY, revision BIGINT NOT NULL,
+ group_id TEXT NOT NULL REFERENCES groups(id) DEFERRABLE INITIALLY IMMEDIATE);
+CREATE TABLE IF NOT EXISTS memory_source_lifecycle (
+ source_key TEXT NOT NULL REFERENCES sources(key) DEFERRABLE INITIALLY IMMEDIATE,
+ revision BIGINT NOT NULL, importance TEXT NOT NULL, recorded_at TEXT NOT NULL,
+ expires_at TEXT NOT NULL, PRIMARY KEY(source_key,revision));

@@ -276,6 +276,8 @@ class SyncHarness:
                 "request_id": body["request_id"],
                 "context": copy.deepcopy(self.contexts[body["assertion_ref"]]),
             }
+        if kind == "window_check":
+            return self.window_checker(body)
         if kind in {"snapshot", "head"}:
             requested = {canonical(selector) for selector in body["selectors"]}
             keys = {canonical(selector["key"]) for selector in body["selectors"]}
@@ -320,11 +322,13 @@ class SyncHarness:
                     if self.path == "/internal/v1/source-facts/read"
                     else "current"
                     if self.path == "/internal/v1/source-access/read"
+                    else "window_check"
+                    if self.path == "/internal/v1/memory/consolidation/window/check"
                     else "origin"
                 )
                 token = (
                     "synthetic-core-token"
-                    if kind in {"snapshot", "head"}
+                    if kind in {"snapshot", "head", "window_check"}
                     else (
                         "synthetic-platform-token"
                         if kind == "current"

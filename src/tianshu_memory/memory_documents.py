@@ -117,6 +117,19 @@ def index_group(db, group_id, *, fact_schema=None):
     units = [json.loads(row[0]) for row in rows]
     if not units:
         return
+    from .consolidation_sources import metadata
+
+    summary = metadata(db, [group_id]).get(group_id)
+    if summary is not None:
+        manifest = json.loads(summary["manifest"])
+        observed = max((item["observed_at"] for item in manifest["members"]), key=parse_time)
+        document = fact_document(group, units, None, observed)
+        document["kind"] = summary["kind"]
+        document["text"] = "\n".join(unit["statement"] for unit in units)
+        document["content_hash"] = text_hash(document["text"])
+        document["span_end"] = len(document["text"].encode())
+        put(db, document)
+        return
     automatic = db.execute(
         "SELECT payload,observed_at FROM automatic_facts WHERE group_id=?", (group_id,)
     ).fetchone()

@@ -19,6 +19,13 @@ from .domain import canonical
 SCHEMA = Path(__file__).with_name("postgres_schema.sql").read_text(encoding="utf-8")
 TABLES = tuple(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA))
 MEMORY_V3_TABLES = {"fact_subjects", "memory_documents", "memory_vectors", "memory_episode_index"}
+CONSOLIDATION_TABLES = {
+    "memory_batches",
+    "memory_summaries",
+    "memory_summary_sources",
+    "memory_portraits",
+    "memory_source_lifecycle",
+}
 DERIVED_TABLES = {"memory_documents", "memory_vectors", "memory_episode_index"}
 SEARCH_TABLES = {
     "search_index",
@@ -299,6 +306,11 @@ def prepare(db, source, *, files, recovery_path, state_directory, epoch):
             "SELECT value FROM metadata WHERE key='automatic_fact_schema'"
         ).fetchone()
         required = set(TABLES) if marker and marker[0] == "3" else set(TABLES) - MEMORY_V3_TABLES
+        consolidation = db.native(
+            "SELECT value FROM metadata WHERE key='memory_consolidation_schema'"
+        ).fetchone()
+        if consolidation is None:
+            required -= CONSOLIDATION_TABLES
         if not required <= installed:
             raise ValueError("PostgreSQL Memory schema is incomplete; authority tables missing")
         return

@@ -34,6 +34,12 @@ def installed(db):
 
 
 def migrate(store, backup_path):
+    from . import consolidation_migration
+
+    with store.transaction() as db:
+        upgrading_existing = installed(db)
+    if upgrading_existing:
+        return consolidation_migration.migrate(store, backup_path)
     backup = Path(backup_path).resolve()
     require(
         not str(backup).startswith("\\\\")
@@ -78,12 +84,14 @@ def migrate(store, backup_path):
                 f"CREATE TRIGGER source_revision_fact_subjects_{action} AFTER {action} ON fact_subjects BEGIN UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'; END"
             )
         db.execute("UPDATE metadata SET value='3' WHERE key='automatic_fact_schema'")
+        consolidation_migration.install(db)
         db.execute("UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'")
         require(
             db.execute("PRAGMA foreign_key_check").fetchone() is None, "dependency_unavailable", 503
         )
     return {
         "automatic_fact_schema": 3,
+        "memory_consolidation_schema": 1,
         "backup": str(backup),
         "backup_guard": str(guard),
         "existing_records_preserved": True,

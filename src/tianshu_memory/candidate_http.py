@@ -36,9 +36,11 @@ def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
             body = bytearray()
             async with asyncio.timeout(body_timeout):
                 async for chunk in request.stream():
-                    require(len(body) + len(chunk) <= 65536, "invalid_input", 413)
+                    require(len(body) + len(chunk) <= 262144, "invalid_input", 413)
                     body.extend(chunk)
             payload = strict_json(body)
+            require(isinstance(payload, dict), "invalid_input", 400)
+            require("job_ids" in payload or len(body) <= 65536, "invalid_input", 413)
             lease.request = request
 
             def execute():

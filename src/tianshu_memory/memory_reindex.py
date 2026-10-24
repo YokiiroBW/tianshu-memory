@@ -156,7 +156,7 @@ class MemoryReindexer:
             scopes = {
                 row[0]
                 for document in documents
-                if document["kind"] == "fact"
+                if document["kind"] != "episode"
                 for row in db.execute(
                     "SELECT DISTINCT s.scope FROM lineage l JOIN sources s ON s.key=l.source_key WHERE l.group_id=?",
                     (document["group_id"],),
@@ -197,7 +197,7 @@ class MemoryReindexer:
         }
 
     def _current(self, db, document):
-        if document["kind"] == "fact":
+        if document["kind"] != "episode":
             group = db.execute(
                 "SELECT state FROM groups WHERE id=?", (document["group_id"],)
             ).fetchone()

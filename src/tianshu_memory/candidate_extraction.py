@@ -14,6 +14,12 @@ class CandidateExtraction:
 
     def execute(self, request, publisher):
         require(type(request) is dict, "invalid_input", 400)
+        if "job_ids" in request:
+            from .consolidation import Consolidation
+
+            if self.service.contracts.extraction_version is None:
+                self.service.contracts.load_memory_v2()
+            return Consolidation(self).execute(request, publisher)
         negotiated = set(request) != {"job_id", "output"}
         if negotiated:
             if self.service.contracts.extraction_version is None:
@@ -98,7 +104,7 @@ class CandidateExtraction:
             dict(state="completed", result=json.loads(receipt[0]), content=[]) if receipt else None
         )
 
-    def _content(self, event, *, pending_job=None, protocol=3):
+    def _content(self, event, *, pending_job=None, protocol=3, retain_originals=False):
         service = self.service
         scope, sources = event["scope"], event["sources"]
         with service.operation(scope=scope, sources=sources, event=event) as db:
@@ -129,7 +135,7 @@ class CandidateExtraction:
         require(len(canonical(result).encode()) <= 65536, "budget_exceeded", 413)
         with service.operation(scope=scope, sources=sources, event=event) as db:
             rows = service._source_rows(db, sources, scope, reality=event["reality"])
-            if context_installed(db):
+            if context_installed(db) and not retain_originals:
                 covered = {
                     row["key"]
                     for row in rows

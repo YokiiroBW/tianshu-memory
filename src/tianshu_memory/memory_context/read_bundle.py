@@ -15,7 +15,12 @@ from ..domain import (
     require_dependency,
     require_selection,
 )
-from .scopes import authorized_scopes, group_read
+from .authorization import authorized_scopes
+from .scopes import group_read
+
+
+def contextual(bundle):
+    return bundle.get("retrieval_mode", "factual") == "context"
 
 
 def selection_proof(db, bundle):
@@ -25,6 +30,18 @@ def selection_proof(db, bundle):
     # These fields are freshly recomputed by every verify. Every other field,
     # including future schema additions, belongs to the immutable selection.
     fresh = {"bundle_id", "verified_at", "valid_until", "owner_heads", "source_revision"}
+    if contextual(bundle):
+        # A positive selection retains its material identities, while current
+        # authorization and history observations are rebuilt at every boundary.
+        fresh.update(
+            {
+                "scope_version",
+                "association_version",
+                "scope_checks",
+                "history_snapshot",
+                "input_history_snapshot",
+            }
+        )
     payload = {name: value for name, value in bundle.items() if name not in fresh}
     digest = hmac.new(
         bytes.fromhex(key[0]),

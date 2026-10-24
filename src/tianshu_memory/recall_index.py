@@ -179,12 +179,15 @@ def exact_groups(service, db, scope, selection, kind, value):
 
 
 def current_groups(service, db, keys, lineage):
+    from .consolidation_sources import current
+
     current_many = getattr(service.source_authority, "current_many", None)
-    return (
+    selected = (
         current_many(db, lineage)
         if current_many is not None
         else {key for key in keys if service._group_current(db, key, rows=lineage[key])}
     )
+    return {key for key in selected if current(service, db, key)}
 
 
 def projection_queries(units):
@@ -235,6 +238,37 @@ def _units(group, rows, scope, scope_key):
 
 
 def rank_groups(
+    service, db, eligible, search_terms, query, *, fact_snapshot=None, authorized_group_ids=None
+):
+    from .consolidation_sources import metadata
+
+    summaries = metadata(db, [entry[0]["id"] for entry in eligible])
+    contextual = [entry for entry in eligible if entry[0]["id"] in summaries]
+    typed = [entry for entry in eligible if entry[0]["id"] not in summaries]
+    ranked = _rank_typed_groups(
+        service,
+        db,
+        typed,
+        search_terms,
+        query,
+        fact_snapshot=fact_snapshot,
+        authorized_group_ids=authorized_group_ids,
+    )
+    if contextual and search_terms:
+        expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in search_terms)
+        corpus = [
+            (
+                entry[0]["id"],
+                " ".join(token for unit in entry[2] for token in terms(unit["statement"])),
+            )
+            for entry in contextual
+        ]
+        by_id = {entry[0]["id"]: entry for entry in contextual}
+        ranked.extend(by_id[row["group_id"]] for row in rank_corpus(db, corpus, expression))
+    return ranked
+
+
+def _rank_typed_groups(
     service, db, eligible, search_terms, query, *, fact_snapshot=None, authorized_group_ids=None
 ):
     if not search_terms or not eligible:
@@ -334,23 +368,7 @@ def rank_groups(
 
     expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in search_terms)
     documents = (document(group, rows) for group, rows, _ in eligible)
-    if is_postgres(db):
-        from .postgres_recall import rank
-
-        ranked = rank(db, documents, expression)
-    else:
-        db.execute("CREATE VIRTUAL TABLE temp.allowed_search USING fts5(group_id UNINDEXED,text)")
-        try:
-            db.executemany("INSERT INTO temp.allowed_search VALUES (?,?)", documents)
-            ranked = db.execute(
-                "SELECT group_id,text,bm25(allowed_search) AS relevance FROM temp.allowed_search "
-                "WHERE allowed_search MATCH ?",
-                (expression,),
-            ).fetchall()
-        finally:
-            # One transaction may rank several subqueries with different scopes.
-            # Keep this temporary corpus owned by this invocation, not the connection.
-            db.execute("DROP TABLE temp.allowed_search")
+    ranked = rank_corpus(db, documents, expression)
     query_plan = LexicalQuery(query)
     matches = {}
     clauses_by_group = {}
@@ -380,3 +398,23 @@ def rank_groups(
         ),
         key=lambda entry: matches[entry[0]["id"]],
     )
+
+
+def rank_corpus(db, documents, expression):
+    """Lexical ranking of an already authorized corpus, without typed interpretation."""
+    if is_postgres(db):
+        from .postgres_recall import rank
+
+        return sorted(
+            rank(db, documents, expression), key=lambda row: (row["relevance"], row["group_id"])
+        )
+    db.execute("CREATE VIRTUAL TABLE temp.allowed_search USING fts5(group_id UNINDEXED,text)")
+    try:
+        db.executemany("INSERT INTO temp.allowed_search VALUES (?,?)", documents)
+        return db.execute(
+            "SELECT group_id,text,bm25(allowed_search) AS relevance FROM temp.allowed_search "
+            "WHERE allowed_search MATCH ? ORDER BY relevance,group_id",
+            (expression,),
+        ).fetchall()
+    finally:
+        db.execute("DROP TABLE temp.allowed_search")

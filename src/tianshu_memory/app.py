@@ -678,7 +678,13 @@ def configured_app():
             retrieval = Retrieval(LocalEmbeddingBackend(config["retrieval"]))
         else:
             retrieval = Retrieval(RetrievalTransport(config_path))
-    service = MemoryService(store, contracts, source_authority=sources, retrieval=retrieval)
+    service = MemoryService(
+        store,
+        contracts,
+        source_authority=sources,
+        retrieval=retrieval,
+        consolidation_ttl_days=config.get("memory_consolidation", {}).get("ttl_days"),
+    )
     if config.get("observation_source") is not None:
         from .observations import ObservationLedger, PlatformVerifier
 

@@ -5,7 +5,7 @@ import json
 import time
 from datetime import timedelta
 
-from .. import automatic_facts, canonical_facts, memory_documents
+from .. import automatic_facts, canonical_facts, consolidation_sources, memory_documents
 from ..domain import (
     Fault,
     canonical,
@@ -20,16 +20,20 @@ from ..fact_queries import snapshot_for_groups
 from ..memory_migration import installed
 from ..recall_index import eligible_groups
 from . import targets
+from .authorization import authorized_scopes
 from .history import history_version
 from .migration import identity_version
 from .read_bundle import (
+    contextual,
     operation,
     requirements,
     selection_proof,
     verify_legacy,
     verify_selection_proof,
 )
-from .scopes import authorized_scopes, checks, group_read, group_rows
+from .scopes import checks, group_read, group_rows
+
+MAX_BUNDLE_OWNERS = 17
 
 
 def collect(service, db, request, context):
@@ -107,27 +111,30 @@ def collect(service, db, request, context):
         group_map={entry[0]["id"]: entry for entry in groups},
         snapshot=snapshot,
         documents=document_rows,
+        summaries=consolidation_sources.metadata(db, group_ids),
         episodes=episodes,
         complete=complete,
     )
 
 
-def query_domain(service, frame, subquery):
-    """Resolve names globally, then bind the complete authorized owner scopes.
+def query_domain(service, frame, subquery, *, context_mode=False):
+    """Select within the existing authorized frame, with factual proofs optional.
 
-    Person resolution only projects scopes already authorized by collect,
-    including explicit current private associations. It never discovers other
-    conversations for that person. Body selection and its freshness proof share
-    this projection; relevance, category and time filters cannot shrink it.
+    Factual resolution binds the complete projected owner domain. Context uses
+    that frame directly without resolving a textual name or claiming exhaustion.
+    Neither mode discovers conversations or grants a new scope.
     """
-    resolution, witnesses = targets.resolve(
-        service,
-        frame["snapshot"],
-        frame["groups"],
-        subquery["text"],
-        frame["scope"],
-        complete=frame["complete"],
-    )
+    if context_mode:
+        resolution, witnesses = dict(mode="unresolved", targets=[]), []
+    else:
+        resolution, witnesses = targets.resolve(
+            service,
+            frame["snapshot"],
+            frame["groups"],
+            subquery["text"],
+            frame["scope"],
+            complete=frame["complete"],
+        )
     people = {
         target["person_id"] for target in resolution["targets"] if target["status"] == "resolved"
     }
@@ -135,12 +142,22 @@ def query_domain(service, frame, subquery):
         (
             entry
             for entry in frame["scopes"]
-            if resolution["mode"] == "room" or entry[0]["person_id"] in people
+            if context_mode or resolution["mode"] == "room" or entry[0]["person_id"] in people
         ),
         key=lambda entry: canonical(entry[0]),
     )
     owners = {canonical(entry[0]) for entry in scopes}
     groups = [entry for entry in frame["groups"] if entry[0]["scope"] in owners]
+    # Context summaries already carry exact owners within collect's authorized
+    # frame. Supplying them never resolves an unproven textual person reference.
+    contextual = [entry for entry in frame["groups"] if entry[0]["id"] in frame["summaries"]]
+    groups = list({entry[0]["id"]: entry for entry in [*groups, *contextual]}.values())
+    contextual_owners = {entry[0]["scope"] for entry in contextual}
+    scopes = [
+        entry
+        for entry in frame["scopes"]
+        if entry in scopes or canonical(entry[0]) in contextual_owners
+    ]
     episodes = [row for row in frame["episodes"] if row["scope"] in owners]
     represented = {entry[0]["scope"] for entry in groups} | {row["scope"] for row in episodes}
     anchors = {
@@ -174,16 +191,24 @@ def query_domain(service, frame, subquery):
         scopes=scopes,
         groups=groups,
         episodes=episodes,
-        complete=frame["complete"],
+        complete=frame["complete"] and not context_mode,
         digest=digest,
         count=len(groups) + len(episodes),
     )
 
 
-def prepare_query(service, db, frame, subquery, selection):
-    domain = query_domain(service, frame, subquery)
+def prepare_query(service, db, frame, subquery, selection, *, context_mode=False):
+    domain = query_domain(service, frame, subquery, context_mode=context_mode)
     candidates = [entry for entry in domain["groups"] if entry[0]["category"] in selection]
+    contextual = [entry for entry in candidates if entry[0]["id"] in frame["summaries"]]
+    candidates = [entry for entry in candidates if entry[0]["id"] not in frame["summaries"]]
     history = subquery["intent"] != "current"
+    if not history:
+        contextual = [
+            entry
+            for entry in contextual
+            if parse_time(frame["summaries"][entry[0]["id"]]["expires_at"]) > service.clock()
+        ]
     if not history:
         candidates = automatic_facts.filter_current(
             db, candidates, subquery["text"], service.clock, fact_snapshot=frame["snapshot"]
@@ -203,6 +228,8 @@ def prepare_query(service, db, frame, subquery, selection):
             return temporal(metadata, period)[0]
 
         candidates = [entry for entry in candidates if applies(entry)]
+        contextual = [entry for entry in contextual if applies(entry)]
+    candidates.extend(contextual)
     lexical = service._rank_groups(
         db,
         candidates,
@@ -211,10 +238,18 @@ def prepare_query(service, db, frame, subquery, selection):
         fact_snapshot=frame["snapshot"],
         authorized_group_ids=frozenset(frame["group_map"]),
     )
+    expired_sources = (
+        consolidation_sources.expired_sources(
+            db, [row["source_key"] for row in domain["episodes"]], service.clock
+        )
+        if not history
+        else set()
+    )
     episode_ids = {
         row["id"]
         for row in domain["episodes"]
         if temporal(dict(row, valid_from=None, valid_to=None), period)[0]
+        and row["source_key"] not in expired_sources
     }
     lexical_episodes = list(
         memory_documents.episode_metadata(
@@ -245,7 +280,8 @@ def prepare_query(service, db, frame, subquery, selection):
         domain=domain,
         documents=documents,
         lexical_ids=lexical_ids,
-        reference_incomplete=targets.unresolved_reference(subquery["text"], domain["resolution"]),
+        reference_incomplete=not context_mode
+        and targets.unresolved_reference(subquery["text"], domain["resolution"]),
     )
 
 
@@ -280,6 +316,7 @@ def fact_evidence(frame, identity):
         historical = bool(source and source["superseded_by"]) or bool(
             fact and fact["state"] == "historical"
         )
+        summary = frame["summaries"].get(identity)
         if value:
             value = dict(value, state="historical") if historical else value
             unit["statement"] = canonical_facts.render(
@@ -299,7 +336,13 @@ def fact_evidence(frame, identity):
             valid_to=fact["valid_to"] if fact else None,
             unit=unit,
         )
-        if value:
+        if summary:
+            evidence.update(
+                kind=summary["kind"],
+                importance=summary["importance"],
+                expires_at=summary["expires_at"],
+            )
+        elif value:
             evidence.update(kind="historical_fact" if historical else "current_fact", fact=value)
         else:
             evidence.update(kind="legacy_fact", representation="legacy_unstructured")
@@ -354,6 +397,17 @@ def dependencies(db, frame, evidence):
         ):
             source_rows[row["key"]] = dict(row)
             lineage.setdefault(row["group_id"], []).append(row["key"])
+        if consolidation_sources.installed(db):
+            for row in db.execute(
+                "SELECT d.group_id,s.*,p.payload AS physical FROM memory_summary_sources d "
+                "JOIN sources s ON s.key=d.source_key JOIN source_admissions a ON a.key=s.key "
+                "JOIN physical_sources p ON p.key=a.physical_key WHERE d.group_id IN ("
+                + ",".join("?" for _ in batch)
+                + ")",
+                batch,
+            ):
+                source_rows[row["key"]] = dict(row)
+                lineage.setdefault(row["group_id"], []).append(row["key"])
     episode_dependencies = []
     for item in evidence:
         if item["kind"] != "episode":
@@ -401,12 +455,56 @@ def dependencies(db, frame, evidence):
                     for row in rows
                 ],
                 source_dependency_ids=[
-                    "source-dependency:" + fingerprint(key) for key in lineage[identity]
+                    "source-dependency:" + fingerprint(key)
+                    for key in sorted(set(lineage[identity]))
                 ],
             )
         )
     require(len(sources) <= 256, "budget_exceeded", 429)
     return groups, episode_dependencies, sources
+
+
+def evidence_source_keys(db, evidence):
+    """Keep the existing 256-source bundle budget atomic for derived groups too."""
+    result = set()
+    for item in evidence:
+        if item["kind"] == "episode":
+            row = db.execute(
+                "SELECT source_key FROM memory_documents WHERE id=?", (item["episode_id"],)
+            ).fetchone()
+            require_selection(row is not None)
+            result.add(row[0])
+        else:
+            identity = item["unit"]["semantic_group_id"]
+            result.update(
+                row[0]
+                for row in db.execute(
+                    "SELECT source_key FROM lineage WHERE group_id=?", (identity,)
+                )
+            )
+            if consolidation_sources.installed(db):
+                result.update(
+                    row[0]
+                    for row in db.execute(
+                        "SELECT source_key FROM memory_summary_sources WHERE group_id=?",
+                        (identity,),
+                    )
+                )
+    return result
+
+
+def source_owners(db, keys):
+    owners = set()
+    ordered = sorted(keys)
+    for offset in range(0, len(ordered), 256):
+        batch = ordered[offset : offset + 256]
+        rows = db.execute(
+            "SELECT key,scope FROM sources WHERE key IN (" + ",".join("?" for _ in batch) + ")",
+            batch,
+        ).fetchall()
+        require_selection(len(rows) == len(batch))
+        owners.update(row["scope"] for row in rows)
+    return owners
 
 
 def history_snapshot(service, db, scopes, association, *, input_only=False):
@@ -426,12 +524,17 @@ def history_snapshot(service, db, scopes, association, *, input_only=False):
 
 def make_bundle(service, db, request, context, frame, evidence, constraints):
     scope = frame["scope"]
-    owners = {canonical(scope), *[canonical(item["owner_scope"]) for item in evidence]}
+    groups, episodes, sources = dependencies(db, frame, evidence)
+    owners = {
+        canonical(scope),
+        *[canonical(item["owner_scope"]) for item in evidence],
+        *[canonical(item["owner_scope"]) for item in sources],
+    }
+    require_selection(owners <= {canonical(entry[0]) for entry in frame["scopes"]})
     scopes = [entry for entry in frame["scopes"] if canonical(entry[0]) in owners]
     scopes.sort(key=lambda entry: (entry[0] != scope, canonical(entry[0])))
-    require(len(scopes) <= 17, "budget_exceeded", 429)
+    require(len(scopes) <= MAX_BUNDLE_OWNERS, "budget_exceeded", 429)
     association = identity_version(db, scope)
-    groups, episodes, sources = dependencies(db, frame, evidence)
     now = service.clock()
     result = dict(
         bundle_id="",
@@ -464,6 +567,8 @@ def make_bundle(service, db, request, context, frame, evidence, constraints):
         verified_at=utc(now),
         valid_until=utc(min(now + timedelta(seconds=30), parse_time(context["expires_at"]))),
     )
+    if "retrieval_mode" in request:
+        result["retrieval_mode"] = request["retrieval_mode"]
     result["bundle_id"] = selection_proof(db, result)
     return result
 
@@ -477,6 +582,9 @@ def verify_snapshot(service, db, bundle, frame, context):
     for subquery, constraint in zip(
         bundle["queries"], bundle["selection_constraints"], strict=True
     ):
+        require_selection(constraint["query_id"] == subquery["query_id"])
+        if contextual(bundle):
+            continue
         domain = query_domain(service, frame, subquery)
         require_selection(
             constraint["query_id"] == subquery["query_id"]
@@ -488,14 +596,27 @@ def verify_snapshot(service, db, bundle, frame, context):
         if constraint["result_status"] == "no_match":
             require_selection("no_match" in constraint["proof_kinds"] and domain["complete"])
     evidence = {}
+    allows_expired = any(query["intent"] != "current" for query in bundle["queries"])
     for group in bundle["group_dependencies"]:
         identity = group["group"]["semantic_group_id"]
         require_selection(identity in frame["group_map"])
+        summary = frame["summaries"].get(identity)
+        require_selection(
+            allows_expired or summary is None or parse_time(summary["expires_at"]) > service.clock()
+        )
         for item in fact_evidence(frame, identity):
             evidence[item["evidence_id"]] = item
     docs = {item["id"]: item for item in frame["episodes"]}
+    expired_sources = (
+        consolidation_sources.expired_sources(
+            db, [item["source_key"] for item in docs.values()], service.clock
+        )
+        if not allows_expired
+        else set()
+    )
     for dependency in bundle["episode_dependencies"]:
         require_selection(dependency["episode_id"] in docs)
+        require_selection(docs[dependency["episode_id"]]["source_key"] not in expired_sources)
         item = episode_evidence(db, docs[dependency["episode_id"]])
         evidence[item["evidence_id"]] = item
     require_selection(
@@ -506,16 +627,20 @@ def verify_snapshot(service, db, bundle, frame, context):
     fresh = make_bundle(
         service, db, bundle, context, frame, ordered, bundle["selection_constraints"]
     )
-    for key in (
+    selected = (
         "evidence_digest",
         "group_dependencies",
         "episode_dependencies",
         "source_dependencies",
-        "scope_checks",
-        "association_version",
-        "history_snapshot",
-        "input_history_snapshot",
-    ):
+    )
+    if not contextual(bundle):
+        selected += (
+            "scope_checks",
+            "association_version",
+            "history_snapshot",
+            "input_history_snapshot",
+        )
+    for key in selected:
         require_selection(fresh[key] == bundle[key])
     require_selection(fresh["bundle_id"] == bundle["bundle_id"])
     return fresh
@@ -571,6 +696,8 @@ def execute(application, request, context):
         "invalid_input",
         400,
     )
+    if request["known_bundle"] is not None:
+        require(contextual(request) == contextual(request["known_bundle"]), "invalid_input", 400)
     for query in request["queries"]:
         if query["time_filter"]:
             require(
@@ -600,7 +727,9 @@ def execute(application, request, context):
         if request["known_bundle"] is not None:
             verify_snapshot(service, db, request["known_bundle"], frame, context)
         prepared = [
-            prepare_query(service, db, frame, query, request["selection"])
+            prepare_query(
+                service, db, frame, query, request["selection"], context_mode=contextual(request)
+            )
             for query in request["queries"]
         ]
         for plan in prepared:
@@ -626,15 +755,55 @@ def execute(application, request, context):
     with operation(service, items) as db:
         fresh = collect(service, db, request, context)
         for plan in prepared:
-            domain = query_domain(service, fresh, plan["subquery"])
-            require(
-                domain["resolution"] == plan["domain"]["resolution"]
-                and domain["digest"] == plan["domain"]["digest"],
-                "scope_changed",
-                409,
+            eligible = prepare_query(
+                service,
+                db,
+                fresh,
+                plan["subquery"],
+                request["selection"],
+                context_mode=contextual(request),
             )
+            domain = eligible["domain"]
+            if not contextual(request):
+                require(
+                    domain["resolution"] == plan["domain"]["resolution"]
+                    and domain["digest"] == plan["domain"]["digest"],
+                    "scope_changed",
+                    409,
+                )
+            # Eligibility (including natural expiry and current fact validity)
+            # can change without a domain/version change while the backend runs.
+            # Reuse the same preparation rules, but never add or rerank candidates.
+            documents = {item["id"]: item for item in eligible["documents"]}
+            ranked = [
+                documents[document["id"]]
+                for document in plan["ranked"]
+                if document["id"] in documents
+                and document_binding(frame, document)
+                == document_binding(fresh, documents[document["id"]])
+            ]
+            plan["stale_ranked"] = len(ranked) != len(plan["ranked"])
+            plan["ranked"] = ranked
             plan["domain"] = domain
         return assemble(service, db, request, context, fresh, prepared)
+
+
+def document_binding(frame, document):
+    """The exact document and whole record versions seen before backend work."""
+    records = (
+        sorted((row["id"], row["version"]) for row in frame["group_map"][document["group_id"]][1])
+        if document["kind"] != "episode"
+        else []
+    )
+    # Reranking may hydrate episode text after the authoritative metadata read.
+    # Its content hash still binds that body; the temporary text field is not
+    # a source identity field and fresh evidence is rebuilt from the current DB.
+    metadata = (
+        {key: value for key, value in document.items() if key != "text"}
+        if document["kind"] == "episode"
+        else document
+    )
+    return metadata, records
 
 
 def rank_plans(service, prepared, backend_failed):
@@ -662,6 +831,9 @@ def rank_plans(service, prepared, backend_failed):
 def assemble(service, db, request, context, frame, prepared):
     evidence, results, constraints = [], [], []
     included = set()
+    included_sources = set()
+    included_owners = {canonical(frame["scope"])}
+    authorized_owners = {canonical(entry[0]) for entry in frame["scopes"]}
     facts_count = episodes_count = 0
     for plan in prepared:
         query, domain = plan["subquery"], plan["domain"]
@@ -671,7 +843,7 @@ def assemble(service, db, request, context, frame, prepared):
         for document in plan["ranked"]:
             batch = (
                 fact_evidence(frame, document["group_id"])
-                if document["kind"] == "fact"
+                if document["kind"] != "episode"
                 else [episode_evidence(db, document)]
             )
             if not batch:
@@ -695,23 +867,26 @@ def assemble(service, db, request, context, frame, prepared):
             new_facts = sum(item["kind"] != "episode" for item in added)
             new_episodes = len(added) - new_facts
             total = len(canonical([*evidence, *added]).encode())
-            owner_count = len(
-                {
-                    canonical(frame["scope"]),
-                    *[canonical(item["owner_scope"]) for item in [*evidence, *added]],
-                }
-            )
+            added_sources = evidence_source_keys(db, added)
+            added_owners = {
+                *[canonical(item["owner_scope"]) for item in added],
+                *source_owners(db, added_sources),
+            }
+            require_selection(added_owners <= authorized_owners)
             if (
                 facts_count + new_facts > request["limits"]["facts"]
                 or episodes_count + new_episodes > request["limits"]["episodes"]
                 or total > request["budget"]["bytes"]
                 or total > request["budget"]["tokens"]
-                or owner_count > 17
+                or len(included_owners | added_owners) > MAX_BUNDLE_OWNERS
+                or len(included_sources | added_sources) > 256
             ):
                 omissions.append("budget")
                 continue
             evidence.extend(added)
             included.update(item["evidence_id"] for item in added)
+            included_sources.update(added_sources)
+            included_owners.update(added_owners)
             result_ids.extend(item["evidence_id"] for item in complete_batch)
             facts_count += new_facts
             episodes_count += new_episodes
@@ -724,17 +899,22 @@ def assemble(service, db, request, context, frame, prepared):
             omissions.append("index_incomplete")
         if missing_time:
             omissions.append("source_time_unavailable")
+        if plan.get("stale_ranked"):
+            omissions.append("stale_source")
         incomplete = bool(omissions) or not domain["complete"]
         status = "incomplete" if incomplete else "matched" if result_ids else "no_match"
         if unresolved and not result_ids:
             status = "unresolved"
         proofs = ["positive_sources"]
-        if any(
+        if contextual(request):
+            status = "incomplete"
+            omissions.append("context_only")
+        elif any(
             target["kind"] == "named" and target["status"] == "resolved"
             for target in resolution["targets"]
         ):
             proofs.append("unique_owner")
-        if query["intent"] == "current":
+        if not contextual(request) and query["intent"] == "current":
             proofs.append("latest_values")
         if status == "no_match":
             omissions.append("no_match")
@@ -747,7 +927,7 @@ def assemble(service, db, request, context, frame, prepared):
                 evidence_ids=list(dict.fromkeys(result_ids)),
                 omissions=list(dict.fromkeys(omissions)),
                 coverage=dict(
-                    matched_facts=sum(item["kind"] == "fact" for item in plan["ranked"]),
+                    matched_facts=sum(item["kind"] != "episode" for item in plan["ranked"]),
                     returned_facts=sum(item["kind"] != "episode" for item in selected),
                     matched_episodes=sum(item["kind"] == "episode" for item in plan["ranked"]),
                     returned_episodes=sum(item["kind"] == "episode" for item in selected),

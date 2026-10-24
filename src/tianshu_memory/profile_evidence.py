@@ -57,6 +57,13 @@ def prepare(application, action, principal, credential):
             ).fetchone()
             require(row is not None, "not_found", 404)
             require(row["version"] == ref["record_version"], "version_conflict", 409)
+            from .consolidation_sources import metadata as summary_metadata
+
+            # Contextual summaries have several authors/derived dependencies;
+            # the old exact-evidence public draft cannot represent that closure.
+            require(
+                row["group_id"] not in summary_metadata(db, [row["group_id"]]), "invalid_input", 400
+            )
             unit = json.loads(row["payload"])
             require(
                 unit.get("reality") == "real"

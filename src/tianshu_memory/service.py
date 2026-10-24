@@ -32,6 +32,7 @@ class MemoryService:
         max_pending_jobs=256,
         source_authority=None,
         retrieval=None,
+        consolidation_ttl_days=None,
     ):
         self.store, self.contracts, self.clock, self.max_units = store, contracts, clock, max_units
         self.retrieval = retrieval
@@ -39,6 +40,20 @@ class MemoryService:
             retrieval.store = store
         self.source_authority = source_authority
         self.max_pending_jobs = max_pending_jobs
+        self.consolidation_ttl_days = consolidation_ttl_days or {
+            "low": 7,
+            "normal": 30,
+            "high": 180,
+        }
+        require(
+            set(self.consolidation_ttl_days) == {"low", "normal", "high"}
+            and all(
+                type(value) is int and 1 <= value <= 36500
+                for value in self.consolidation_ttl_days.values()
+            ),
+            "invalid_input",
+            400,
+        )
 
     @property
     def synchronized(self):
@@ -238,13 +253,37 @@ class MemoryService:
                 "FROM lineage l JOIN sources s ON s.key=l.source_key WHERE l.group_id=?",
                 (group_id,),
             ).fetchall()
-        return self.source_authority.current(db, rows)
+        from .consolidation_sources import current
+
+        return self.source_authority.current(db, rows) and current(self, db, group_id)
 
     def _invalidate_jobs(self, db, *, source_keys=(), scopes=()):
+        from .consolidation_sources import job_current, window_current
+
         # Bounded pending queue; invalidation frees capacity without deleting evidence.
+        if not source_keys and not scopes:
+            return
         for job in db.execute("SELECT * FROM jobs WHERE state='pending'").fetchall():
             event, snapshot = json.loads(job["event"]), json.loads(job["source_snapshot"])
-            if canonical(event["scope"]) in scopes:
+            claimed_invalid = False
+            if dict(job).get("extraction_schema") == 5:
+                claimed = db.execute(
+                    "SELECT manifest FROM memory_batches WHERE job_id=?",
+                    (job["id"],),
+                ).fetchone()
+                claimed_invalid = claimed is not None and not window_current(
+                    self, db, json.loads(claimed[0])
+                )
+            if claimed_invalid:
+                state = "scope_changed"
+            elif canonical(event["scope"]) in scopes:
+                if dict(job).get("extraction_schema") == 5:
+                    if not set(source_keys).intersection(snapshot) and job_current(
+                        self, db, event, snapshot
+                    ):
+                        # A claimed invalid window was handled above; an
+                        # unrelated scope update cannot retire healthy inputs.
+                        continue
                 state = "scope_changed"
             elif set(source_keys).intersection(snapshot):
                 state = "stale_source"
@@ -265,11 +304,13 @@ class MemoryService:
         self, db, keys, *, suppress=None, forgotten=False, replacement=None, target=None
     ):
         """One source lifecycle for facts, original spans, derived vectors and late jobs."""
+        from .consolidation_sources import dependents
         from .memory_documents import discard
         from .memory_migration import installed
 
         keys = set(keys)
         groups, scopes = set(), set()
+        groups.update(dependents(db, sources=keys))
         for key in keys:
             row = db.execute("SELECT scope FROM sources WHERE key=?", (key,)).fetchone()
             if row is None:
@@ -299,9 +340,10 @@ class MemoryService:
         return groups
 
     def _invalidate(self, db, group_ids, *, forgotten=False, replacement=None, target=None):
+        from .consolidation_sources import dependents
         from .memory_documents import remove_groups
 
-        group_ids = list(group_ids)
+        group_ids = list(dependents(db, groups=group_ids))
         remove_groups(db, group_ids)
         scopes = set()
         for group_id in group_ids:
@@ -517,6 +559,15 @@ class MemoryService:
                 ]
 
             from .automatic_facts import filter_current
+            from .consolidation_sources import metadata as summary_metadata
+
+            summaries = summary_metadata(db, [entry[0]["id"] for entry in eligible])
+            eligible = [
+                entry
+                for entry in eligible
+                if entry[0]["id"] not in summaries
+                or parse_time(summaries[entry[0]["id"]]["expires_at"]) > self.clock()
+            ]
 
             eligible = filter_current(
                 db, eligible, request["query_text"], self.clock, fact_snapshot=fact_snapshot
@@ -563,7 +614,16 @@ class MemoryService:
             return response
 
     def _verify_retrieval(self, db, candidates):
+        from .consolidation_sources import metadata as summary_metadata
+
+        summaries = summary_metadata(db, [entry[0]["id"] for entry in candidates])
         for group, records, units in candidates:
+            require(
+                group["id"] not in summaries
+                or parse_time(summaries[group["id"]]["expires_at"]) > self.clock(),
+                "scope_changed",
+                409,
+            )
             current_group = db.execute(
                 "SELECT state,members FROM groups WHERE id=?", (group["id"],)
             ).fetchone()

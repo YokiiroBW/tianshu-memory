@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from jsonschema import ValidationError
@@ -30,14 +30,30 @@ class SourceTransport:
     def current(self, request):
         return self._post("platform", "/internal/v1/source-access/read", "current_access", request)
 
-    def _post(self, owner, endpoint, schema, request):
+    def window_check(self, request):
+        return self._post(
+            "core",
+            "/internal/v1/memory/consolidation/window/check",
+            "summary_window_check",
+            request,
+            package="memory-extraction",
+            configured_endpoint="/internal/v1/source-facts/read",
+        )
+
+    def _post(
+        self, owner, endpoint, schema, request, *, package="sync-sources", configured_endpoint=None
+    ):
         try:
             require(self.contracts.source_version == "1.0.0", "dependency_unavailable", 503)
-            self.contracts.validate(f"sync-sources#{schema}_request", request)
+            self.contracts.validate(f"{package}#{schema}_request", request)
             body = json.dumps(
                 request, ensure_ascii=False, allow_nan=False, separators=(",", ":")
             ).encode("utf-8")
-            require(len(body) <= MAX_BODY_BYTES, "dependency_unavailable", 503)
+            require(
+                len(body) <= (262144 if package == "memory-extraction" else MAX_BODY_BYTES),
+                "dependency_unavailable",
+                503,
+            )
             config = strict_json(self.config_path.read_text(encoding="utf-8"))["source_sync"][owner]
             url, token = config["url"], config["token"]
             require(
@@ -51,13 +67,15 @@ class SourceTransport:
                 and bool(parsed.hostname)
                 and parsed.username is None
                 and parsed.password is None
-                and parsed.path == endpoint
+                and parsed.path == (configured_endpoint or endpoint)
                 and "?" not in url
                 and "#" not in url
                 and (parsed.port is None or 0 < parsed.port <= 65535),
                 "dependency_unavailable",
                 503,
             )
+            if configured_endpoint is not None:
+                url = urlunsplit((parsed.scheme, parsed.netloc, endpoint, "", ""))
             require(
                 isinstance(token, str) and bool(token) and all(33 <= ord(c) <= 126 for c in token),
                 "dependency_unavailable",
@@ -113,7 +131,7 @@ class SourceTransport:
                         length is None or len(payload) == int(length), "dependency_unavailable", 503
                     )
             resolved = strict_json(payload.decode("utf-8"))
-            self.contracts.validate(f"sync-sources#{schema}_response", resolved)
+            self.contracts.validate(f"{package}#{schema}_response", resolved)
             require(resolved["request_id"] == request["request_id"], "dependency_unavailable", 503)
             return resolved
         except (

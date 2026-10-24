@@ -4,6 +4,7 @@ import json
 import threading
 from contextlib import contextmanager
 
+from . import consolidation_sources as summary_sources
 from .domain import (
     Fault,
     admission_key,
@@ -145,6 +146,8 @@ class SourceAuthority:
         event=None,
         check=None,
         extra_selectors=(),
+        windows=(),
+        summary_scopes=(),
     ):
         require(
             not group_read
@@ -162,21 +165,54 @@ class SourceAuthority:
         for _ in range(3):
             with service.store.transaction() as db:
                 m0 = self.revision(db)
+                stored = summary_sources.stored_windows(db, scope, group_read=group_read)
+                for owner, shared in summary_scopes:
+                    stored.extend(summary_sources.stored_windows(db, owner, group_read=shared))
+                all_windows = {item["window_id"]: item for item in (*stored, *windows)}
+                summary_selectors = summary_sources.selectors(service, db, all_windows.values())
                 selectors = self.coverage(db, scope, sources, profile, group_read)
                 selectors = list(
-                    {canonical(value): value for value in (*selectors, *extra_selectors)}.values()
+                    {
+                        canonical(value): value
+                        for value in (*selectors, *extra_selectors, *summary_selectors)
+                    }.values()
                 )
                 if context is not None:
                     service._authorize(db, context, scope=scope)
-            turn_ids = [event["aggregate_id"]] if event else [check["turn_id"]] if check else []
+            turn_ids = list(
+                dict.fromkeys(
+                    [
+                        *(
+                            [event["aggregate_id"]]
+                            if event
+                            else [check["turn_id"]]
+                            if check
+                            else []
+                        ),
+                        *(
+                            member["turn_id"]
+                            for manifest in all_windows.values()
+                            for member in manifest["members"]
+                        ),
+                    ]
+                )
+            )
             viewer = (
                 None
                 if context is None
                 else {"origin": {"assertion_ref": context["assertion_ref"]}, "scope": scope}
             )
             observations = []
-            for index, batch in enumerate(self.batches(selectors, sources, scope)):
-                observation = self._read_batch(batch, turn_ids if index == 0 else [], viewer)
+            window_checks = {
+                identity: summary_sources.check_owner(self.transport, manifest)
+                for identity, manifest in ((item["window_id"], item) for item in windows)
+            }
+            selector_batches = self.batches(selectors, sources, scope)
+            for index in range(max(len(selector_batches), (len(turn_ids) + 31) // 32)):
+                batch = selector_batches[index] if index < len(selector_batches) else []
+                observation = self._read_batch(
+                    batch, turn_ids[index * 32 : (index + 1) * 32], viewer
+                )
                 self._relations(
                     "current_access",
                     observation["access_request"],
@@ -240,7 +276,7 @@ class SourceAuthority:
                         sources=sources,
                         profile=profile,
                         group_read=group_read,
-                        extra_selectors=extra_selectors,
+                        extra_selectors=(*extra_selectors, *summary_selectors),
                     )
                 else:
                     result = self.sync_batches(
@@ -257,16 +293,45 @@ class SourceAuthority:
                         sources=sources,
                         profile=profile,
                         group_read=group_read,
-                        extra_selectors=extra_selectors,
+                        extra_selectors=(*extra_selectors, *summary_selectors),
                     )
             except LocalRevisionChanged:
                 continue
+            if all_windows:
+                with service.store.transaction() as db:
+                    if self.revision(db) != result["local_revision"]:
+                        continue
+                    current_turns = {
+                        turn["turn_id"]: turn
+                        for item in observations
+                        for turn in item["snapshot"]["turns"]
+                    }
+                    failures = {
+                        identity: summary_sources.window_failure(
+                            service, db, manifest, current_turns, window_checks.get(identity)
+                        )
+                        for identity, manifest in all_windows.items()
+                    }
+                    invalid = [
+                        identity for identity, failure in failures.items() if failure is not None
+                    ]
+                    summary_sources.invalidate_windows(service, db, invalid)
+                    result["local_revision"] = self.revision(db)
+                for item in windows:
+                    failure = failures[item["window_id"]]
+                    if failure is not None:
+                        raise failure
             # Negatives are durable before a later bad event or scope conflict is rejected.
             snapshot = first["snapshot"]
             if event:
-                self._relations("actor_event", event, snapshot["turns"][0], snapshot)
+                turn = next(
+                    item for item in snapshot["turns"] if item["turn_id"] == event["aggregate_id"]
+                )
+                self._relations("actor_event", event, turn, snapshot)
             if check:
-                turn = snapshot["turns"][0]
+                turn = next(
+                    item for item in snapshot["turns"] if item["turn_id"] == check["turn_id"]
+                )
                 require(
                     turn["scope"] == scope
                     and turn["turn_id"] == check["turn_id"]
@@ -502,6 +567,9 @@ class SourceAuthority:
                 profile=bool(primary.get("profile")),
                 group_read=bool(primary.get("group_read")),
                 extra_selectors=list(selectors.values()),
+                summary_scopes=[
+                    (item["scope"], bool(item.get("group_read"))) for item in requirements
+                ],
             ) as db:
                 self._bundled.active = {"service": service, "domains": domains, "db": db}
                 try:
