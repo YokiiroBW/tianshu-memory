@@ -72,3 +72,36 @@ def sourced_times(fact, evidence, content):
         require(observation_copy and not timed, "invalid_input", 400)
         result[key] = None
     return result
+
+
+def unit_time(fact, proposed, evidence, content):
+    """Render validated intervals; do not retain a second fabricated time claim.
+
+    Canonical dates are validated against original evidence or exact targets by
+    their existing owners. This function cannot grant them authority. Undated
+    facts may retain source-supported wording without gaining invented bounds.
+    """
+    start, end = fact["valid_from"], fact["valid_to"]
+    if start or end:
+        if start and end:
+            return f"有效期：{start} 至 {end}"
+        return f"有效期自 {start}" if start else f"有效期截止 {end}"
+    label = proposed.strip() or "未说明有效时间"
+    quotes = [proof["quote"] for proof in evidence]
+    dates = re.finditer(r"(?<!\d)(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})(?:[日号])?", label)
+    for match in dates:
+        year, month, day = map(int, match.groups())
+        stamp = f"{year:04d}-{month:02d}-{day:02d}T00:00:00Z"
+        try:
+            supported = any(
+                supported_date(stamp, p["quote"], content[p["source_index"]]["sent_at"])
+                for p in evidence
+            )
+        except ValueError:
+            supported = False
+        if not supported:
+            return "未说明有效时间"
+    for permanent in ("长期有效", "永久", "永远", "一直有效"):
+        if permanent in label and not any(permanent in quote for quote in quotes):
+            return "未说明有效时间"
+    return label

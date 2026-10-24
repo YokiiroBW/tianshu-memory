@@ -1,7 +1,6 @@
 """Bounded HTTPS transport to configured owners; SQL and authority checks live elsewhere."""
 
 import json
-import ssl
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -9,6 +8,7 @@ import httpx
 from jsonschema import ValidationError
 
 from .domain import Fault, require, strict_json
+from .source_http_pool import OwnerHttpPool
 
 MAX_BODY_BYTES = 1024 * 1024
 
@@ -19,6 +19,10 @@ class SourceTransport:
     def __init__(self, config_path, contracts):
         self.config_path = Path(config_path)
         self.contracts = contracts
+        self._http_pool = OwnerHttpPool()
+
+    def close(self):
+        self._http_pool.close()
 
     def facts(self, request):
         return self._post("core", "/internal/v1/source-facts/read", "facts", request)
@@ -59,7 +63,7 @@ class SourceTransport:
                 "dependency_unavailable",
                 503,
             )
-            verify = True
+            ca_file = None
             if "ca_file" in config:
                 ca_file = config["ca_file"]
                 require(
@@ -67,10 +71,7 @@ class SourceTransport:
                     "dependency_unavailable",
                     503,
                 )
-                verify = ssl.create_default_context(cafile=ca_file)
-            with httpx.Client(
-                verify=verify, timeout=5, follow_redirects=False, trust_env=False
-            ) as client:
+            with self._http_pool.client(owner, url, ca_file) as client:
                 with client.stream(
                     "POST",
                     url,

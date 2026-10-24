@@ -3,6 +3,7 @@ import json
 import math
 import os
 import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -74,7 +75,26 @@ def create_app(
     execute_timeout=15.0,
     max_active=8,
 ):
-    app = FastAPI(title="Tianshu Memory", version="0.1.0", docs_url=None, redoc_url=None)
+    @asynccontextmanager
+    async def lifespan(application):
+        try:
+            yield
+        finally:
+            try:
+                if auth is not None and hasattr(auth, "close"):
+                    auth.close()
+            finally:
+                transport = getattr(getattr(service, "source_authority", None), "transport", None)
+                if transport is not None and hasattr(transport, "close"):
+                    transport.close()
+
+    app = FastAPI(
+        title="Tianshu Memory",
+        version="0.1.0",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=lifespan,
+    )
     if (
         not all(
             type(v) in (int, float) and math.isfinite(v) and v > 0

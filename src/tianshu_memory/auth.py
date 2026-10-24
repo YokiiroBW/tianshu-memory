@@ -10,6 +10,7 @@ import httpx
 from jsonschema.exceptions import ValidationError
 
 from .domain import Fault, OriginDenied, OriginUnavailable, parse_time, require
+from .source_http_pool import OwnerHttpPool
 
 
 def interrupted_transport(error):
@@ -37,6 +38,7 @@ class Authenticator:
 
     def __init__(self, config_path, contracts, clock, *, role_database=None):
         self.path, self.contracts, self.clock = Path(config_path), contracts, clock
+        self._http_pool = OwnerHttpPool()
         config = self.config()
         grant_path = config.get("role_grants_database_path")
         if grant_path is not None:
@@ -47,6 +49,9 @@ class Authenticator:
             self.role_grants = RoleGrants(grant_path, database=role_database)
         else:
             self.role_grants = None
+
+    def close(self):
+        self._http_pool.close()
 
     def config(self):
         return json.loads(self.path.read_text(encoding="utf-8"))
@@ -67,9 +72,32 @@ class Authenticator:
         # Shared issuer configuration and trust are established before a pure
         # origin read. Their failures cannot be attributed to optional history.
         url, credential = caller.get("issuer_url"), caller.get("issuer_token")
-        require(bool(url) and bool(credential), "dependency_unavailable", 503)
-        require(urlparse(url).scheme == "https", "dependency_unavailable", 503)
-        verify = True
+        require(
+            isinstance(url, str)
+            and not any(c.isspace() or ord(c) < 32 for c in url)
+            and isinstance(credential, str)
+            and bool(credential)
+            and all(33 <= ord(c) <= 126 for c in credential),
+            "dependency_unavailable",
+            503,
+        )
+        try:
+            parsed = urlparse(url)
+            port = parsed.port
+        except ValueError:
+            raise Fault("dependency_unavailable", 503) from None
+        require(
+            parsed.scheme == "https"
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and parsed.password is None
+            and "?" not in url
+            and "#" not in url
+            and (port is None or 0 < port <= 65535),
+            "dependency_unavailable",
+            503,
+        )
+        ca_file = None
         if "issuer_ca_file" in caller:
             ca_file = caller["issuer_ca_file"]
             require(
@@ -77,15 +105,8 @@ class Authenticator:
                 "dependency_unavailable",
                 503,
             )
-            try:
-                verify = ssl.create_default_context(cafile=ca_file)
-            except (OSError, ValueError):
-                raise Fault("dependency_unavailable", 503) from None
-
         try:
-            with httpx.Client(
-                verify=verify, timeout=5, follow_redirects=False, trust_env=False
-            ) as client:
+            with self._http_pool.client(service, url, ca_file) as client:
                 deadline = time.monotonic() + 5
                 with client.stream(
                     "POST",

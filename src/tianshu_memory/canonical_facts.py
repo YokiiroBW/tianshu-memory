@@ -4,7 +4,7 @@ import json
 
 from . import fact_names
 from .domain import canonical, fingerprint, parse_time, require
-from .fact_entities import normalize_mention
+from .fact_entities import reference_anchor
 
 FIELDS = (
     "subject",
@@ -74,12 +74,24 @@ def prepare(proposal):
 
 
 def resolve(service, db, scope, fact, quotes):
+    from .fact_semantics import source_subject
+
     value = fact["canonical"]
-    subject = dict(value["subject"])
+    subject, from_source = source_subject(fact, quotes)
+    subject = dict(subject)
     if subject["kind"] == "author":
-        return fact
-    require(any(subject["mention"] in proof["quote"] for proof in quotes), "invalid_input", 400)
-    anchor = normalize_mention(subject["mention"])
+        return (
+            dict(fact, canonical=dict(value, subject=subject), entity=None) if from_source else fact
+        )
+    inherited_subject = _target_subject(db, scope, fact)
+    require(
+        inherited_subject
+        or from_source
+        or any(subject["mention"] in proof["quote"] for proof in quotes),
+        "invalid_input",
+        400,
+    )
+    anchor = reference_anchor(subject["mention"])
     available = []
     from .fact_queries import snapshot_for_groups
     from .recall_index import eligible_groups
@@ -94,24 +106,29 @@ def resolve(service, db, scope, fact, quotes):
         if prior.get("reality", "real") != fact["reality"]:
             continue
         entity = prior.get("entity")
-        if entity and entity["kind"] == subject["type"]:
+        if entity and (from_source or entity["kind"] == subject["type"]):
             available.append((prior, entity))
     matches = {
         entity["id"]
         for prior, entity in available
-        if normalize_mention(entity["mention"]) == anchor
+        if reference_anchor(entity["mention"]) == anchor
         or (
             prior["key"].split(".")[-1] in {"name", "title"}
             and prior["value"].strip() == subject["mention"].strip()
         )
     }
+    if from_source and len(matches) == 1:
+        retained = next(entity for _, entity in available if entity["id"] in matches)
+        subject.update(id=retained["id"], type=retained["kind"])
     if subject["id"] is not None:
         known = {entity["id"] for _, entity in available}
         require(subject["id"] in known, "invalid_input", 400)
         # A short reference may reuse a uniquely known object/event, never choose
         # arbitrarily between two objects of the same type.
         require(
-            matches == {subject["id"]} or (not matches and known == {subject["id"]}),
+            inherited_subject
+            or matches == {subject["id"]}
+            or (not matches and known == {subject["id"]}),
             "invalid_input",
             400,
         )
@@ -142,6 +159,34 @@ def resolve(service, db, scope, fact, quotes):
         canonical=dict(value, subject=subject),
         entity={"id": identity, "kind": subject["type"], "mention": subject["mention"]},
     )
+
+
+def _target_subject(db, scope, fact):
+    """A control-only update may inherit its exact targets' subject evidence.
+
+    Target scope/version/currentness, property, value and modality are validated by
+    targets() before commit; this exception supplies no authority to assert or to
+    select another entity. Full source closure is inherited by fact_provenance.
+    """
+    if fact["update"]["operation"] not in {"confirm", "retract"}:
+        return False
+    subject = fact["canonical"]["subject"]
+    refs = fact["update"]["target_refs"]
+    if subject["id"] is None or not refs:
+        return False
+    for ref in refs:
+        row = db.execute(
+            "SELECT f.scope,f.payload FROM automatic_facts f WHERE f.group_id=?",
+            (ref["group_id"],),
+        ).fetchone()
+        if row is None or row["scope"] != scope:
+            return False
+        prior = json.loads(row["payload"]).get("canonical")
+        if prior is None or any(
+            prior["subject"][key] != subject[key] for key in ("id", "kind", "type")
+        ):
+            return False
+    return True
 
 
 def targets(service, db, draft, fact):

@@ -177,7 +177,8 @@ class CandidateExtraction:
         from . import canonical_facts
         from .fact_names import candidate
         from .fact_provenance import DERIVED_UPDATES
-        from .temporal_facts import sourced_times
+        from .fact_semantics import sourced_modality
+        from .temporal_facts import sourced_times, unit_time
 
         self.service.contracts.validate("memory-extraction#output", output)
         require(event["reality"] in {"real", "fictional"}, "invalid_input", 400)
@@ -194,6 +195,7 @@ class CandidateExtraction:
                 )
                 indexes.add(index)
             fact = canonical_facts.prepare(memory["fact"])
+            fact = sourced_modality(fact, evidence, content)
             # Derived updates prove inherited dates against their exact current
             # targets inside the write transaction. Independent dates must be
             # supported by this proposal's own original source.
@@ -209,7 +211,7 @@ class CandidateExtraction:
                 ),
                 conditions=memory["conditions"],
                 negations=memory["negations"],
-                valid_time=memory["valid_time"],
+                valid_time=unit_time(fact, memory["valid_time"], evidence, content),
                 uncertainty="inferred",
                 reality=event["reality"],
                 sources=[event["sources"][i] for i in sorted(indexes)],
@@ -230,6 +232,7 @@ class CandidateExtraction:
                                 event["sources"][p["source_index"]], event["scope"]
                             ),
                             quote=p["quote"],
+                            context_text=content[p["source_index"]]["text"],
                             **(
                                 {"source_text": content[p["source_index"]]["text"]}
                                 if candidate(fact)

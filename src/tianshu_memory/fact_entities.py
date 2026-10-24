@@ -72,6 +72,16 @@ def normalize_mention(value):
     return re.sub(r"\s+", "", value).strip('，。！？,.!?"“”')
 
 
+def reference_anchor(value):
+    """Compare sourced classifier descriptions without changing stored identities.
+
+    The optional attributive particle in “有银夹的那支/有银夹那支” is not a new
+    object. This is deliberately narrower than stripping 的 from names or text.
+    Callers still require a unique match among authorized same-type subjects.
+    """
+    return re.sub(r"的(?=那(?:只|支|个|本|张|台|辆|件)$)", "", normalize_mention(value))
+
+
 def ordinal(value):
     match = re.search(r"第([一二三四五六七八九十百零两0-9]+)(?:只|支|个|本|张|台|辆|件)?", value)
     if not match:

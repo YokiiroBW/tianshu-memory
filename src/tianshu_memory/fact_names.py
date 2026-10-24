@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from .domain import fingerprint, parse_time, require
 from .fact_migration import source_text_installed
 from .fact_provenance import DERIVED_UPDATES
+from .fact_source_text import ATTRIBUTION, CONDITION, PAIRS, quoted_positions
 
 KEY = "identity.name"
 KEYS = (KEY, "person.name", "author.name", "name")
@@ -23,7 +24,8 @@ SOURCE_BYTES = 65536
 INTRO = re.compile(
     r"(?P<past>我(?:以前|曾经|原来|过去|之前)(?:的名字)?(?:叫|名叫))|"
     r"(?P<dated>我(?:从|在)[0-9TtZz:+/年月日时分秒 .-]{6,50}(?:起|开始|期间)(?:名叫|叫))|"
-    r"(?:我(?:现在|目前|还是|仍然|依旧)?(?:改名|改)?(?:叫|名叫)|"
+    r"(?:我(?:现在|目前|还是|仍然|依旧|也|同样)?(?:改名|改)?(?:叫|名叫)|"
+    r"(?P<copula>我(?:就是|是))|"
     r"大家(?:都)?叫我|"
     r"(?:我的|本人的)(?:名字|姓名|昵称)(?:现在|目前|还是|仍然|依旧)?(?:改成|改为|叫|是|为)|"
     r"本人(?:现在|目前)?(?:名叫|叫|名为)|"
@@ -37,17 +39,15 @@ NEUTRAL = re.compile(
     r"(?:the\s+)?(?:author|user)\s+is\s+(?:named|called)\s+)",
     re.I,
 )
-CONDITION = re.compile(
-    r"如果|假如|假设|要是|倘若|除非|只要|只有|可能|也许|或许|万一|"
-    r"\b(?:if|unless|suppose|perhaps|maybe|might)\b",
-    re.I,
-)
-ATTRIBUTION = re.compile(
-    r"(?:说|写道|写着|问|喊|提到|告诉我|转述|said|says|wrote|asked)\s*[:：]?\s*$", re.I
-)
-PAIRS = {"“": "”", "「": "」", "『": "』", "‘": "’", '"': '"', "'": "'", "`": "`"}
 CLAUSE_END = set("，,。；;！!？?.\n\r")
 SENTENCE_END = set("。；;！!？?.\n\r")
+ROLE_DESCRIPTION = re.compile(
+    r"^(?:一[名位个]|(?:想|要|会|能|准备|打算|负责|来|在|刚|已经|正在|不会|不想))|"
+    r"^(?:医生|护士|老师|教师|学生|管理员|版主|成员|用户|负责人|同事|朋友|"
+    r"父亲|母亲|爸爸|妈妈|哥哥|姐姐|弟弟|妹妹|工程师|程序员|开发者|"
+    r"员工|客服|顾问|记者|司机|工人|作者|警察|法官|会计|保安|店主|老板|志愿者|"
+    r"机器人|人工智能|本人|自己|谁)$"
+)
 
 
 def candidate(fact):
@@ -64,29 +64,6 @@ def field_values(kind, value):
     return FIELDS if kind == "field" and value in FIELDS else (value,)
 
 
-def _positions(text):
-    stack, result = [], []
-    escaped = False
-    for index, ch in enumerate(text):
-        result.append(bool(stack))
-        if escaped:
-            escaped = False
-            continue
-        if ch == "\\":
-            escaped = True
-        elif stack and ch == stack[-1]:
-            stack.pop()
-        elif ch in PAIRS and not (
-            ch == "'"
-            and index
-            and index + 1 < len(text)
-            and text[index - 1].isalnum()
-            and text[index + 1].isalnum()
-        ):
-            stack.append(PAIRS[ch])
-    return result
-
-
 def _literal_end(text, value):
     if text.startswith(value):
         return len(value)
@@ -101,7 +78,7 @@ def _literal_end(text, value):
 
 def _claims(text, fact):
     """Return complete positive author-name claim spans, outside reported speech."""
-    quoted = _positions(text)
+    quoted = quoted_positions(text)
     value = fact["value"].strip()
     for match in INTRO.finditer(text):
         if (
@@ -133,6 +110,11 @@ def _claims(text, fact):
             continue
         label = tail[:literal]
         quoted_literal = bool(label and label[0] in PAIRS and label.endswith(PAIRS[label[0]]))
+        # Copular introductions are also used for occupations, roles and actions.
+        # Explicit “我叫…” can name any literal; “我是…” must not make the same
+        # role description an authoritative personal name.
+        if match["copula"] and not quoted_literal and ROLE_DESCRIPTION.search(value):
+            continue
         if not quoted_literal and (
             re.search(r"^(?:什么|谁|啥|怎么|哪(?:个|位))|(?:吗|么|呢|吧)$", value)
             or re.match(r"^(?:你们?|他们?|她们?|大家)(?:来|去|别|不要|帮|给|把|拿|做)", value)

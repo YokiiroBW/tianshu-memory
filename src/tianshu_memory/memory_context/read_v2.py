@@ -537,6 +537,18 @@ def verify(application, request, context, legacy_contexts):
         frame = collect(service, db, bundle, context)
         fresh = verify_snapshot(service, db, bundle, frame, context)
         checked = verify_legacy(application, request["checks"], legacy_contexts)
+        # Request-local issuer reuse cannot borrow a later lease or return a
+        # valid verification after any adopted origin expired during the work.
+        service._authorize(db, context, scope=request["requested_scope"])
+        deadline = parse_time(fresh["valid_until"])
+        for check, resolved in zip(request["checks"], legacy_contexts, strict=True):
+            payload = check["request"]
+            service._authorize(
+                db, resolved, scope=payload.get("requested_scope", payload.get("requester_scope"))
+            )
+            deadline = min(deadline, parse_time(resolved["expires_at"]))
+        now = service.clock()
+        require(deadline > now, "timeout", 408)
     return dict(
         schema_version=2,
         version_domain="memory-context/v2",
@@ -545,8 +557,8 @@ def verify(application, request, context, legacy_contexts):
         state="valid",
         bundle=fresh,
         checks=checked,
-        checked_at=fresh["verified_at"],
-        valid_until=fresh["valid_until"],
+        checked_at=utc(now),
+        valid_until=utc(deadline),
     )
 
 

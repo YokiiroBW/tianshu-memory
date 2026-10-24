@@ -92,10 +92,23 @@ def clean_query(value):
     return "".join(parts)
 
 
+def author_name_query(value):
+    """An explicit question about the requester's name, outside quoted speech."""
+    unquoted = " ".join(re.split(r"""([“「《\"'‘].*?[”」》\"'’])""", clean_query(value))[::2])
+    return bool(
+        re.fullmatch(
+            r"\s*(?:(?:你)?还记得|记得|请问|我想问)?\s*"
+            r"(?:我叫(?:什么|啥)(?:名字)?|我的(?:名字|姓名|昵称)(?:(?:是|叫)(?:什么|啥))?)"
+            r"(?:吗|呢|来着)?[？?。.!！]*\s*",
+            unquoted,
+        )
+    )
+
+
 def self_reference(value):
     """Explicit possessives outside quoted speech, not every occurrence of '我'."""
     unquoted = " ".join(re.split(r"""([“「《"'‘].*?[”」》"'’])""", clean_query(value))[::2])
-    return bool(
+    return author_name_query(value) or bool(
         re.search(
             r"我的|我家(?:的)?|我(?:这|那)(?:只|支|个|本|张|台|辆|件)|本人(?:的)?|\bmy\s+",
             unquoted,
@@ -290,6 +303,9 @@ def _object_focus(value):
 
 def query_focus(value):
     """An explicit possessive/object question supplies stronger anchors than its preamble."""
+    if author_name_query(value):
+        # Person-name aliases below own this question, not an object named 名字.
+        return None
     target = _subjectless_target(_reference_body(value))
     if target is not None:
         value = target
@@ -476,14 +492,19 @@ QUERY_ALIASES = (
 
 def query_aliases(value):
     lowered = value.casefold()
-    return sorted(object_aliases(value)) + [
-        alias
-        for group in QUERY_ALIASES
-        if any(
-            re.search(r"(?<![a-z])" + re.escape(term) + r"(?![a-z])", lowered)
-            if term.isascii()
-            else term in lowered
-            for term in group
-        )
-        for alias in group
-    ]
+    names = ["姓名", "名字", "昵称", "我叫", "name"] if author_name_query(value) else []
+    return (
+        names
+        + sorted(object_aliases(value))
+        + [
+            alias
+            for group in QUERY_ALIASES
+            if any(
+                re.search(r"(?<![a-z])" + re.escape(term) + r"(?![a-z])", lowered)
+                if term.isascii()
+                else term in lowered
+                for term in group
+            )
+            for alias in group
+        ]
+    )

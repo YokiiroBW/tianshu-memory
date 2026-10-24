@@ -7,7 +7,7 @@ from .domain import Fault, canonical, terms
 from .fact_migration import installed
 from .fact_queries import FactSnapshot, for_groups, group_queries, snapshot_for_groups
 from .postgres import GROUP_READ_BATCH, is_postgres
-from .recall_language import normalize_objects, topic_tokens
+from .recall_language import author_name_query, normalize_objects, topic_tokens
 from .recall_relevance import LexicalQuery
 
 
@@ -239,6 +239,15 @@ def rank_groups(
 ):
     if not search_terms or not eligible:
         return []
+    if author_name_query(query):
+        # The aliases express a person-name question, not an object's name.
+        # Reuse the source-proven view inside this already authorized domain.
+        if fact_snapshot is None or fact_snapshot.names is None:
+            fact_snapshot = snapshot_for_groups(db, eligible, service=service)
+        names = fact_snapshot.names if fact_snapshot is not None else None
+        eligible = [entry for entry in eligible if names and entry[0]["id"] in names.entries]
+        if not eligible:
+            return []
     # FTS metadata columns are UNINDEXED. Looking up each record separately scans
     # the whole virtual table for every record. Read only eligible scopes in bounded
     # batches, retaining exact versions before constructing the authorized corpus.

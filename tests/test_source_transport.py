@@ -126,7 +126,11 @@ def transport(tmp_path, source_owner, source_contracts, certificates):
         path.write_text(json.dumps(config), encoding="utf-8")
 
     save()
-    return SimpleNamespace(client=SourceTransport(path, source_contracts), config=config, save=save)
+    client = SourceTransport(path, source_contracts)
+    try:
+        yield SimpleNamespace(client=client, config=config, save=save)
+    finally:
+        client.close()
 
 
 def unavailable(call):

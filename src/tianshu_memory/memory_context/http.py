@@ -66,6 +66,25 @@ def preparation_contexts(auth, name, caller, request, context):
     return result
 
 
+def verification_contexts(auth, name, caller, request, context):
+    """Resolve each complete origin once in this strict verification request."""
+    cache = {canonical(request["query"]["origin"]): context}
+    result = []
+    for check in request["checks"]:
+        permission = "select_profiles" if check["kind"] == "profile" else "context_query"
+        require(permission in caller.get("operations", []))
+        origin = check["request"]["query"]["origin"]
+        key = canonical(origin)
+        if key not in cache:
+            # No optional classification or cross-request context cache. A
+            # denied/unavailable issuer and unknown outcome retain their Fault.
+            cache[key] = auth.resolve(
+                name, caller, origin["assertion_ref"], request["query"]["request_id"]
+            )
+        result.append(cache[key])
+    return result
+
+
 def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
     def endpoint_for(operation):
         async def endpoint(request: Request):
@@ -156,22 +175,9 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                             )
                             result = application.prepare_v2(payload, context, contexts)
                         elif operation == "verify_v2":
-                            contexts = []
-                            for check in payload["checks"]:
-                                required = (
-                                    "select_profiles"
-                                    if check["kind"] == "profile"
-                                    else "context_query"
-                                )
-                                require(required in current_caller.get("operations", []))
-                                contexts.append(
-                                    auth.resolve(
-                                        current_name,
-                                        current_caller,
-                                        check["request"]["query"]["origin"]["assertion_ref"],
-                                        request_id,
-                                    )
-                                )
+                            contexts = verification_contexts(
+                                auth, current_name, current_caller, payload, context
+                            )
                             result = application.verify_v2(payload, context, contexts)
                         else:
                             if operation == "profiles_v2":
