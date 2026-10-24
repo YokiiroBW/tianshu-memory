@@ -8,7 +8,7 @@ keywords and model-chosen entity IDs never constitute source evidence.
 import re
 
 from .domain import require
-from .fact_source_text import bound_contexts, quoted_positions
+from .fact_source_text import ATTRIBUTION, PAIRS, bound_contexts, quoted_positions
 
 SEPARATOR = re.compile(r"[，,。；;！!？?\n\r]")
 INTENTION = re.compile(
@@ -32,6 +32,136 @@ POSSESSION_LOCATION = re.compile(
     r"(?:收|放|挪|移|留)(?:在|到了?|到)"
     r"(?P<place>[^，,。；;！!？?\n\r]{1,60})"
 )
+UNDETERMINED = re.compile(
+    r"(?:不|不能|无法)(?:太)?确定|尚未确定|未确定|没(?:有)?确定|不知道|不清楚|没(?:有)?把握|"
+    r"是否|是不是|有没有|能不能|尚待确认|有待确认|不一定|"
+    r"\b(?:not sure|uncertain|unknown|do not know|don't know|whether)\b",
+    re.I,
+)
+PENDING_CHANGE = re.compile(
+    r"(?:改为|改成|调整为|重置为|设为)(?:暂时|暂)?(?:待定|未定|不确定|未知)"
+)
+RETIRING_ACTIONS = r"撤回|收回|撤销|停掉|停止|退出|归还|还来|还给|挪走|" + CANCELLED.pattern
+RETIREMENT_CONTROL = re.compile(
+    RETIRING_ACTIONS
+    + r"|说错|有误|不可靠|不再有效|"
+    + PENDING_CHANGE.pattern
+    + r"|\b(?:retract|withdraw|unreliable|incorrect|no longer valid)\b",
+    re.I,
+)
+AFFIRMATION = re.compile(r"确认|(?:仍然?|依然|依旧)有效|已明确|\bconfirm\b", re.I)
+CHANGE = re.compile(r"改成|改为|改用|调整为|重置为|设为|改了|改动|更正|纠正")
+NEGATED_CONTROL = re.compile(
+    r"(?:不要|不必|不用|不需要|不想|不打算|不会|不能|无需|没有|并未|不曾|没|别|不)(?:再|去)?"
+    r"(?:确认|说错|改为|改成|调整为|重置为|设为|"
+    + RETIRING_ACTIONS
+    + r")|(?:不是|并非|没有|并未|不曾|没)(?:真的|确实)?(?:说错|有误|不可靠|不再有效)|"
+    + r"\b(?:do not|don't|did not|didn't|never)\s+(?:retract|withdraw)\b",
+    re.I,
+)
+CONTROL_INTENTION = re.compile(
+    r"我(?:(?:打算|计划|准备|考虑)(?:先|去)?|想(?:要)?)(?:确认|改为|改成|" + RETIRING_ACTIONS + r")"
+)
+INTERROGATIVE = re.compile(r"是不是|有没有|能不能|要不要|该不该|是否|\bwhether\b", re.I)
+CLAIM_REFERENCE = (
+    r"(?:(?:之前|先前|刚才|原来|原先)(?:确认的)?(?:那|这)?|这|那)(?:一)?(?:条|项)|"
+    r"(?:原|旧)(?:说法|主张|记录)"
+)
+REFERENCE_CONTROL = re.compile(
+    r"^(?:(?:我现在|我|请|现在|所以|因此|就|再)\s*)*"
+    r"(?:(?:撤回|收回|撤销|确认)\s*(?:"
+    + CLAIM_REFERENCE
+    + r")|(?:"
+    + CLAIM_REFERENCE
+    + r").*(?:作废|有误|不可靠|不再有效|仍然?有效))"
+)
+
+
+def _control_syntax(text):
+    quoted = quoted_positions(text)
+    return "".join(
+        " " if quoted[i] or (ch != "'" and (ch in PAIRS or ch in PAIRS.values())) else ch
+        for i, ch in enumerate(text)
+    )
+
+
+def _control_clauses(proof):
+    """Only current quoted wording supplies a control, never inherited evidence."""
+    syntax = _control_syntax(proof["quote"])
+    for match in re.finditer(r"[^，,。；;！!？?\n\r]+", syntax):
+        clause = match.group().strip()
+        if clause:
+            yield clause, proof["quote"][match.start() : match.end()]
+
+
+def _supports_update(fact, clause, literal):
+    operation = fact["update"]["operation"]
+    if operation == "retract":
+        return bool(RETIREMENT_CONTROL.search(clause))
+    if operation == "confirm":
+        return not RETIREMENT_CONTROL.search(clause) and (
+            fact["value"] in literal or bool(AFFIRMATION.search(clause))
+        )
+    return (
+        fact["value"] in literal
+        or bool(CHANGE.search(clause))
+        or bool(RETIREMENT_CONTROL.search(clause))
+        or bool(AFFIRMATION.search(clause))
+    )
+
+
+def retirement_supported(prior, fact, quotes):
+    """A question or unknown claim cannot consume an existing known target.
+
+    Called with the validated exact target inside the write transaction. These
+    are finite source-expression checks, not general claim/target resolution.
+    Exact owner/property/version authority remains in the caller. A current
+    control quote is required; inherited target values alone prove no control.
+    """
+    if not quotes:
+        return False
+    for proof in quotes:
+        contexts = bound_contexts(proof)
+        clauses = list(_control_clauses(proof))
+        supported = [
+            (clause, literal)
+            for clause, literal in clauses
+            if _supports_update(fact, clause, literal)
+        ]
+        if not contexts or not supported:
+            return False
+        # Only an explicit old-record reference bridges an admission of not
+        # knowing to an actual withdrawal. “Dinner is now pending” supplies no
+        # such bridge for the preceding unknown email assertion. Narrowing the
+        # quote cannot remove that same sentence's unknown/question context.
+        referenced = any(REFERENCE_CONTROL.search(clause) for clause, _ in supported)
+        for sentence, safe in contexts:
+            syntax = _control_syntax(sentence)
+            if (
+                not safe
+                or not any(ch.isalnum() for ch in syntax)
+                or ATTRIBUTION.search(syntax.rstrip("，,。.;；!！?？ ：:'\"‘’“”"))
+                or NEGATED_CONTROL.search(syntax)
+                or CONTROL_INTENTION.search(syntax)
+            ):
+                return False
+            if any(
+                not UNDETERMINED.search(clause[: match.start()])
+                for clause in re.split(r"[，,]", syntax)
+                for match in INTERROGATIVE.finditer(clause)
+            ):
+                return False
+            # A declared pending value is a change, not an unknown statement
+            # about whether the old value changed. Remove only that expression.
+            if UNDETERMINED.search(PENDING_CHANGE.sub("", syntax)) and not referenced:
+                return False
+        if (
+            prior["canonical"]["modality"] in {"asserted", "observed"}
+            and fact["canonical"]["modality"] == "uncertain"
+            and not any(RETIREMENT_CONTROL.search(clause) for clause, _ in supported)
+        ):
+            return False
+    return True
 
 
 def location_property(predicate):

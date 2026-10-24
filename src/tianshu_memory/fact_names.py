@@ -76,7 +76,7 @@ def _literal_end(text, value):
     return None
 
 
-def _claims(text, fact):
+def _claims(text, fact, *, historical_only=False):
     """Return complete positive author-name claim spans, outside reported speech."""
     quoted = quoted_positions(text)
     value = fact["value"].strip()
@@ -84,6 +84,7 @@ def _claims(text, fact):
         if (
             quoted[match.start()]
             or (match["past"] and fact["state"] != "historical")
+            or (historical_only and not match["past"])
             or (match["dated"] and fact["valid_from"] is None)
         ):
             continue
@@ -149,7 +150,7 @@ def _statement(fact, unit):
     return end is not None and tail[end:].strip() in {"", "了"}
 
 
-def _supported(fact, unit, quotes):
+def _supported(fact, unit, quotes, *, historical_only=False):
     return (
         candidate(fact)
         and unit["reality"] == "real"
@@ -157,13 +158,17 @@ def _supported(fact, unit, quotes):
         and not unit["negations"]
         and _statement(fact, unit)
         and bool(quotes)
-        and all(any(_claims(quote, fact)) for quote in quotes)
+        and all(any(_claims(quote, fact, historical_only=historical_only)) for quote in quotes)
     )
 
 
-def grounded(fact, unit, proofs):
+def grounded(fact, unit, proofs, *, historical_only=False):
     """One source-bound rule for new drafts and retained original name evidence."""
-    if not _supported(fact, unit, [proof["quote"] for proof in proofs]):
+    # A current original assertion may remain evidence in a derived historical
+    # group. Only a new retirement's current proof must itself declare a past name.
+    if not _supported(
+        fact, unit, [proof["quote"] for proof in proofs], historical_only=historical_only
+    ):
         return False
     for proof in proofs:
         text, quote = proof.get("source_text"), proof["quote"]
@@ -172,7 +177,7 @@ def grounded(fact, unit, proofs):
         occurrences = [match.start() for match in re.finditer(re.escape(quote), text)]
         if not any(
             offset <= start < end <= offset + len(quote)
-            for start, end in _claims(text, fact)
+            for start, end in _claims(text, fact, historical_only=historical_only)
             for offset in occurrences
         ):
             return False

@@ -2,7 +2,7 @@
 
 import json
 
-from . import fact_names
+from . import fact_labels, fact_names
 from .domain import canonical, fingerprint, parse_time, require
 from .fact_entities import reference_anchor
 
@@ -24,6 +24,7 @@ MODALITIES = {
     "conditional": "有条件",
     "uncertain": "未确定",
 }
+CONSUMING_UPDATES = frozenset({"replace", "retract", "confirm"})
 
 
 def stored(proposal):
@@ -192,6 +193,7 @@ def _target_subject(db, scope, fact):
 def targets(service, db, draft, fact):
     """Validate exact optimistic targets before any write or semantic retirement."""
     from .fact_entities import fact_key, property_identity
+    from .fact_semantics import retirement_supported
 
     update = fact["update"]
     result = []
@@ -264,9 +266,44 @@ def targets(service, db, draft, fact):
                 "invalid_input",
                 400,
             )
+        if update["operation"] in CONSUMING_UPDATES:
+            # Reuse the existing full-source literal naming grammars. A name
+            # such as “不确定” is a value, not an unknown control statement.
+            # For retract, prepare() sets historical; those grammars require
+            # this source's actual past-name declaration, not a current name.
+            literal_name = fact_names.candidate(fact) and fact_names.grounded(
+                fact,
+                draft["units"][0],
+                draft["quotes"],
+                historical_only=update["operation"] == "retract",
+            )
+            literal_label = (
+                fact_labels.candidate(fact)
+                and bool(draft["quotes"])
+                and all(
+                    fact_labels.positive_source(fact, [proof["quote"]]) for proof in draft["quotes"]
+                )
+            )
+            if literal_label:
+                fact_labels.prepare(
+                    fact,
+                    [
+                        dict(source_index=i, quote=proof["quote"])
+                        for i, proof in enumerate(draft["quotes"])
+                    ],
+                    [
+                        dict(text=proof.get("context_text", proof["quote"]))
+                        for proof in draft["quotes"]
+                    ],
+                )
+            require(
+                literal_name or literal_label or retirement_supported(prior, fact, draft["quotes"]),
+                "invalid_input",
+                400,
+            )
         result.append((dict(row), prior))
     require(
-        update["operation"] not in {"replace", "retract", "confirm"} or bool(result),
+        update["operation"] not in CONSUMING_UPDATES or bool(result),
         "invalid_input",
         400,
     )
@@ -309,7 +346,7 @@ def targets(service, db, draft, fact):
 
 def reconcile(writer, db, draft, fact, selected, group_id, *, supersede):
     operation = fact["update"]["operation"]
-    if operation not in {"replace", "retract", "confirm"}:
+    if operation not in CONSUMING_UPDATES:
         return
     # A confirmation carries the same value and complete target provenance in
     # its new group; its targets remain auditable predecessors, not competing

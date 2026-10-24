@@ -183,6 +183,7 @@ class CandidateExtraction:
         self.service.contracts.validate("memory-extraction#output", output)
         require(event["reality"] in {"real", "fictional"}, "invalid_input", 400)
         drafts = []
+        consumed_targets = set()
         for memory in output["memories"]:
             evidence = memory["evidence"]
             indexes = set()
@@ -195,6 +196,14 @@ class CandidateExtraction:
                 )
                 indexes.add(index)
             fact = canonical_facts.prepare(memory["fact"])
+            if fact["update"]["operation"] in canonical_facts.CONSUMING_UPDATES:
+                for ref in fact["update"]["target_refs"]:
+                    identity = (ref["group_id"], ref["record_id"])
+                    # A batch names the original optimistic targets, not a
+                    # model-invented sequence of future record versions. Detect
+                    # this proposal's own conflict before any draft can write.
+                    require(identity not in consumed_targets, "invalid_input", 400)
+                    consumed_targets.add(identity)
             fact = sourced_modality(fact, evidence, content)
             # Derived updates prove inherited dates against their exact current
             # targets inside the write transaction. Independent dates must be
