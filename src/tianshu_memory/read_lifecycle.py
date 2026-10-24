@@ -27,6 +27,31 @@ def cancellable_read(abandoned):
         _current.reset(token)
 
 
+@contextmanager
+def source_read_lock(lock):
+    """Let an unstarted pure read leave the original lock queue after cancellation.
+
+    Polling bounds only cancellation observation while waiting. Live requests
+    still wait for the same RLock; started reads and all untagged work retain
+    the original blocking acquisition and completion rules.
+    """
+    read = _current.get()
+    if read is None or read.started:
+        with lock:
+            yield
+        return
+    acquired = False
+    try:
+        while not acquired:
+            if read.abandoned():
+                raise Fault("timeout", 408)
+            acquired = lock.acquire(timeout=0.1)
+        yield
+    finally:
+        if acquired:
+            lock.release()
+
+
 def begin_source_read():
     """Called with the outer source lock held, before any barrier or sync transaction.
 

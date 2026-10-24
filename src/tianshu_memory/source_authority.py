@@ -15,7 +15,7 @@ from .domain import (
     utc,
 )
 from .postgres import is_postgres
-from .read_lifecycle import begin_source_read
+from .read_lifecycle import begin_source_read, source_read_lock
 from .source_lookup_migration import require_ready
 
 
@@ -450,7 +450,7 @@ class SourceAuthority:
                 service._authorize(active["db"], kwargs["context"], scope=scope)
             yield active["db"]
             return
-        with self._operation_lock:
+        with source_read_lock(self._operation_lock):
             begin_source_read()
             with self._operation(service, scope, **kwargs) as db:
                 yield db
@@ -467,7 +467,7 @@ class SourceAuthority:
             "invalid_input",
             400,
         )
-        with self._operation_lock:
+        with source_read_lock(self._operation_lock):
             begin_source_read()
             selectors, domains = {}, set()
             with service.store.transaction() as db:

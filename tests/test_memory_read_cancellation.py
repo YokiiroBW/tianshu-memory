@@ -19,7 +19,7 @@ from test_source_sync import sync as sync
 
 from tianshu_memory.app import create_app
 from tianshu_memory.domain import Fault
-from tianshu_memory.read_lifecycle import begin_source_read, cancellable_read
+from tianshu_memory.read_lifecycle import begin_source_read, cancellable_read, source_read_lock
 from tianshu_memory.source_authority import SourceAuthority
 
 
@@ -27,15 +27,26 @@ class ObservedLock:
     def __init__(self, lock):
         self.lock = lock
         self.waiting, self.acquired = threading.Event(), threading.Event()
+        self.polled = threading.Event()
+
+    def acquire(self, *args, **kwargs):
+        self.waiting.set()
+        acquired = self.lock.acquire(*args, **kwargs)
+        if acquired:
+            self.acquired.set()
+        else:
+            self.polled.set()
+        return acquired
+
+    def release(self):
+        self.lock.release()
 
     def __enter__(self):
-        self.waiting.set()
-        self.lock.acquire()
-        self.acquired.set()
+        self.acquire()
         return self
 
     def __exit__(self, *args):
-        self.lock.release()
+        self.release()
 
 
 def read_request(h, operation):
@@ -104,23 +115,67 @@ def test_expired_queued_v2_read_does_not_start_sync_and_keeps_admission_until_ex
             try:
                 pending = asyncio.create_task(client.post(path, json=data))
                 await until(observed.waiting.is_set)
+                assert app.state.chat_requests.active == 1
+                assert (await client.post(path, json=data)).status_code == 429
                 response = await pending
                 assert response.status_code == 408, response.text
                 assert response.json()["execution_state"] == "not_started"
                 assert response.json()["retryable"] is True
+                # The original source lock is still held by this thread. The
+                # abandoned worker must exit without first acquiring it.
+                await until(lambda: app.state.chat_requests.active == 0)
                 assert not observed.acquired.is_set()
-                assert app.state.chat_requests.active == 1
-                assert (await client.post(path, json=data)).status_code == 429
             finally:
                 lock.release()
                 await until(lambda: app.state.chat_requests.active == 0)
-            assert observed.acquired.is_set()
+            assert not observed.acquired.is_set()
             assert barriers == [] and transactions_after_lock == []
             assert [kind for kind, _, _ in sync.calls if kind != "origin"] == []
             # The worker drained and returned its slot; fresh work still has its full barrier.
             recovered = await client.post(path, json=data)
             assert recovered.status_code == 200, recovered.text
             assert barriers
+
+    asyncio.run(scenario())
+
+
+def test_live_queued_read_keeps_waiting_then_reads_under_the_same_lock(sync, monkeypatch):
+    data = read_request(sync, "query")
+    authority = sync.service.source_authority
+    lock = authority._operation_lock
+    observed = ObservedLock(lock)
+    monkeypatch.setattr(authority, "_operation_lock", observed)
+    entered = threading.Event()
+    original = authority.barrier
+
+    def barrier(*args, **kwargs):
+        entered.set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(authority, "barrier", barrier)
+
+    async def scenario():
+        app = create_app(
+            service=sync.service,
+            auth=sync.client.app.state.auth,
+            execute_timeout=3,
+            max_active=1,
+        )
+        async with client_for(app) as client:
+            lock.acquire()
+            try:
+                pending = asyncio.create_task(
+                    client.post("/internal/v2/memory/context/query", json=data)
+                )
+                await until(observed.polled.is_set)
+                assert app.state.chat_requests.active == 1
+                assert not entered.is_set() and not pending.done()
+            finally:
+                lock.release()
+            response = await pending
+            assert response.status_code == 200, response.text
+            assert observed.acquired.is_set() and entered.is_set()
+            assert app.state.chat_requests.active == 0
 
     asyncio.run(scenario())
 
@@ -260,12 +315,60 @@ def test_cancel_checkpoint_precedes_every_outer_authority_transaction(bundle):
 
 def test_started_read_is_not_cancelled_between_later_boundaries_and_scope_is_reset():
     abandoned = False
+    lock = threading.RLock()
     with cancellable_read(lambda: abandoned):
-        begin_source_read()
+        with source_read_lock(lock):
+            begin_source_read()
         abandoned = True
-        begin_source_read()
+        with source_read_lock(lock):
+            begin_source_read()
     with cancellable_read(lambda: True):
         with pytest.raises(Fault):
             begin_source_read()
     # Untagged work, including writes and sync, has no cancellation checkpoint.
-    begin_source_read()
+    with source_read_lock(lock):
+        begin_source_read()
+
+
+@pytest.mark.parametrize("bundle", [False, True])
+def test_cancel_after_successful_acquire_still_hits_the_locked_guard(bundle):
+    abandoned = False
+
+    class CancelOnAcquire(ObservedLock):
+        def acquire(self, *args, **kwargs):
+            nonlocal abandoned
+            acquired = super().acquire(*args, **kwargs)
+            if acquired:
+                abandoned = True
+            return acquired
+
+    lock = CancelOnAcquire(threading.RLock())
+    authority = object.__new__(SourceAuthority)
+    authority._operation_lock, authority._bundled = lock, threading.local()
+
+    def forbidden():
+        pytest.fail("Cancelled acquired read opened a transaction")
+
+    service = SimpleNamespace(store=SimpleNamespace(transaction=forbidden))
+    with cancellable_read(lambda: abandoned):
+        with pytest.raises(Fault) as stopped:
+            with (
+                authority.bundle_operation(service, [dict(scope={})])
+                if bundle
+                else authority.operation(service, {})
+            ):
+                pytest.fail("Cancelled acquired read reached business work")
+    assert lock.acquired.is_set()
+    assert (stopped.value.code, stopped.value.status) == ("timeout", 408)
+    # A second thread can take the same lock: the cancelled acquisition released it.
+    released = threading.Event()
+
+    def probe():
+        if lock.lock.acquire(timeout=1):
+            lock.lock.release()
+            released.set()
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join(timeout=2)
+    assert not thread.is_alive() and released.is_set()
