@@ -563,7 +563,7 @@ def verify(application, request, context, legacy_contexts):
 
 
 def execute(application, request, context):
-    from ..persistent_retrieval import discard_corrupt, prepare
+    from ..persistent_retrieval import discard_corrupt, prepare, prepare_query_vector
 
     service = application.service
     require(
@@ -582,9 +582,19 @@ def execute(application, request, context):
     settings, backend_failed = None, False
     if service.retrieval is not None:
         try:
-            settings = service.retrieval.settings()
+            settings = dict(service.retrieval.settings())
         except (Fault, OSError, TimeoutError):
             backend_failed = True
+    # A bounded query embedding depends only on the caller's text and captured
+    # retrieval revision. Do it before acquiring a source boundary, so current
+    # authorized document vectors can later be ranked without any external work.
+    query_vectors = {}
+    if settings is not None:
+        deadline = time.monotonic() + 8
+        for query in request["queries"]:
+            query_vectors[query["query_id"]] = prepare_query_vector(
+                service.retrieval, query["text"], settings, deadline=deadline
+            )
     with operation(service, items) as db:
         frame = collect(service, db, request, context)
         if request["known_bundle"] is not None:
@@ -595,7 +605,15 @@ def execute(application, request, context):
         ]
         for plan in prepared:
             plan["ranking"] = (
-                prepare(db, plan["documents"], plan["lexical_ids"], settings) if settings else None
+                prepare(
+                    db,
+                    plan["documents"],
+                    plan["lexical_ids"],
+                    settings,
+                    query_vector=query_vectors[plan["subquery"]["query_id"]],
+                )
+                if settings
+                else None
             )
             if plan["ranking"] is not None:
                 discard_corrupt(db, plan["ranking"])
@@ -622,7 +640,11 @@ def execute(application, request, context):
 def rank_plans(service, prepared, backend_failed):
     from ..persistent_retrieval import rank_prepared
 
-    retrieval_deadline = time.monotonic() + 8
+    retrieval_deadline = (
+        time.monotonic() + 8
+        if any(plan["ranking"] is not None and plan["ranking"].external for plan in prepared)
+        else None
+    )
     for plan in prepared:
         by_id = {document["id"]: document for document in plan["documents"]}
         plan["ranked"] = [by_id[identity] for identity in plan["lexical_ids"] if identity in by_id]

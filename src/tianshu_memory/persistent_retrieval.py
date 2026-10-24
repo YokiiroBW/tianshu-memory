@@ -9,6 +9,35 @@ from .domain import Fault, canonical, require
 from .retrieval_vectors import vectors
 
 
+@dataclass(frozen=True)
+class PreparedQueryVector:
+    text: str
+    settings: str
+    vector: tuple | None
+
+
+def prepare_query_vector(retrieval, text, settings, *, deadline):
+    """Derive only the caller's query before opening a source/Store transaction.
+
+    None means this backend must retain its existing external ranking phase.
+    A result with no vector captures a failed bounded attempt; it must fall back
+    lexically without calling that backend again inside the source boundary.
+    """
+    bounded = getattr(retrieval.backend, "embed_query_before", None)
+    if settings["mode"] == "keyword" or settings["rerank"] or not callable(bounded):
+        return None
+    binding = canonical(settings)
+    value = None
+    try:
+        require(time.monotonic() < deadline, "dependency_unavailable", 503)
+        response = bounded(text, settings["revision"], deadline)
+        require(time.monotonic() < deadline, "dependency_unavailable", 503)
+        value = vectors(response["vectors"], 1)[0]
+    except (Fault, OSError, TimeoutError, ValueError, TypeError, KeyError):
+        pass
+    return PreparedQueryVector(text, binding, value)
+
+
 @dataclass
 class PreparedRanking:
     by_id: dict
@@ -17,13 +46,17 @@ class PreparedRanking:
     settings: dict
     available: dict
     corrupted: list
+    query_vector: PreparedQueryVector | None = None
 
     @property
     def external(self):
-        return bool(self.available or (self.settings["rerank"] and self.lexical_ids))
+        return bool(
+            (self.available and self.query_vector is None)
+            or (self.settings["rerank"] and self.lexical_ids)
+        )
 
 
-def prepare(db, documents, lexical_ids, settings):
+def prepare(db, documents, lexical_ids, settings, *, query_vector=None):
     """Read the existing vectors without calling a backend or opening another transaction."""
     by_id = {item["id"]: item for item in documents}
     available, corrupted = {}, []
@@ -55,6 +88,7 @@ def prepare(db, documents, lexical_ids, settings):
         settings,
         available,
         corrupted,
+        query_vector,
     )
 
 
@@ -83,25 +117,39 @@ def rank(retrieval, store, query, documents, lexical_ids, settings, *, deadline=
 
 def rank_prepared(retrieval, store, query, plan, *, deadline=None):
     """Use one prepared snapshot; callers release their authority transaction for external work."""
-    deadline = deadline if deadline is not None else time.monotonic() + 8
+    if plan.external and deadline is None:
+        deadline = time.monotonic() + 8
     by_id, available, settings = plan.by_id, plan.available, plan.settings
     lexical_ids, limit = plan.lexical_ids, settings["candidates"]
     scores = {}
     if available:
         try:
-            require(time.monotonic() < deadline, "dependency_unavailable", 503)
-            query_method = getattr(retrieval.backend, "embed_query", None)
-            bounded_query = getattr(retrieval.backend, "embed_query_before", None)
-            response = (
-                bounded_query(query, settings["revision"], deadline)
-                if bounded_query
-                else query_method(query, settings["revision"])
-                if query_method
-                else retrieval.backend.call(
-                    "embed", {"revision": settings["revision"], "texts": [query]}
+            if plan.query_vector is not None:
+                prepared = plan.query_vector
+                require(
+                    prepared.text == query
+                    and prepared.settings == canonical(settings)
+                    and prepared.vector is not None,
+                    "dependency_unavailable",
+                    503,
                 )
-            )
-            value = vectors(response["vectors"], 1)[0]
+                # This derived vector has no authority TTL. Waiting for a fresh
+                # source boundary does not consume a second embedding budget.
+                value = prepared.vector
+            else:
+                require(time.monotonic() < deadline, "dependency_unavailable", 503)
+                query_method = getattr(retrieval.backend, "embed_query", None)
+                bounded_query = getattr(retrieval.backend, "embed_query_before", None)
+                response = (
+                    bounded_query(query, settings["revision"], deadline)
+                    if bounded_query
+                    else query_method(query, settings["revision"])
+                    if query_method
+                    else retrieval.backend.call(
+                        "embed", {"revision": settings["revision"], "texts": [query]}
+                    )
+                )
+                value = vectors(response["vectors"], 1)[0]
             require(
                 all(len(vector) == len(value) for vector in available.values()),
                 "dependency_unavailable",
