@@ -54,7 +54,7 @@ async def served(*, service, request, operation, payload, context, module, outpu
         with record_execution(operation):
             return getattr(service, operation)(payload, context)
 
-    result = await lease.run(execute, business=True)
+    result = await lease.run(execute, business=True, read_only=operation == "check_sources")
     service.contracts.validate(f"{module}#{output_type}", result)
     return JSONResponse(
         result,

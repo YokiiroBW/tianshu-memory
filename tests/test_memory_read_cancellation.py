@@ -52,6 +52,8 @@ class ObservedLock:
 
 def read_request(h, operation):
     bundle = seeded(h)
+    if operation == "check_sources":
+        return h.check()
     if operation == "query":
         return request(h, "我喜欢什么咖啡")
     catalog = checks(h, bundle)
@@ -68,6 +70,14 @@ def read_request(h, operation):
     )
 
 
+def read_path(operation):
+    return (
+        "/internal/v1/memory/source-sync/check"
+        if operation == "check_sources"
+        else "/internal/v2/memory/context/" + operation
+    )
+
+
 def client_for(app):
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -76,7 +86,7 @@ def client_for(app):
     )
 
 
-@pytest.mark.parametrize("operation", ["query", "prepare", "verify", "profiles"])
+@pytest.mark.parametrize("operation", ["query", "prepare", "verify", "profiles", "check_sources"])
 def test_expired_queued_v2_read_does_not_start_sync_and_keeps_admission_until_exit(
     sync, monkeypatch, operation
 ):
@@ -110,7 +120,7 @@ def test_expired_queued_v2_read_does_not_start_sync_and_keeps_admission_until_ex
             execute_timeout=0.5,
             max_active=1,
         )
-        path = "/internal/v2/memory/context/" + operation
+        path = read_path(operation)
         async with client_for(app) as client:
             lock.acquire()
             try:
@@ -120,8 +130,12 @@ def test_expired_queued_v2_read_does_not_start_sync_and_keeps_admission_until_ex
                 assert (await client.post(path, json=data)).status_code == 429
                 response = await pending
                 assert response.status_code == 408, response.text
-                assert response.json()["execution_state"] == "not_started"
-                assert response.json()["retryable"] is True
+                # The legacy source-check endpoint retains its existing wire
+                # classification; pure-read cancellation does not change that.
+                assert response.json()["execution_state"] == (
+                    "unknown" if operation == "check_sources" else "not_started"
+                )
+                assert response.json()["retryable"] is (operation != "check_sources")
                 # The original source lock is still held by this thread. The
                 # abandoned worker must exit without first acquiring it.
                 await until(lambda: app.state.chat_requests.active == 0)
@@ -140,8 +154,11 @@ def test_expired_queued_v2_read_does_not_start_sync_and_keeps_admission_until_ex
     asyncio.run(scenario())
 
 
-def test_live_queued_read_keeps_waiting_then_reads_under_the_same_lock(sync, monkeypatch):
-    data = read_request(sync, "query")
+@pytest.mark.parametrize("operation", ["query", "check_sources"])
+def test_live_queued_read_keeps_waiting_then_reads_under_the_same_lock(
+    sync, monkeypatch, operation
+):
+    data = read_request(sync, operation)
     authority = sync.service.source_authority
     lock = authority._operation_lock
     observed = ObservedLock(lock)
@@ -165,9 +182,7 @@ def test_live_queued_read_keeps_waiting_then_reads_under_the_same_lock(sync, mon
         async with client_for(app) as client:
             lock.acquire()
             try:
-                pending = asyncio.create_task(
-                    client.post("/internal/v2/memory/context/query", json=data)
-                )
+                pending = asyncio.create_task(client.post(read_path(operation), json=data))
                 await until(observed.polled.is_set)
                 assert app.state.chat_requests.active == 1
                 assert not entered.is_set() and not pending.done()
@@ -181,8 +196,9 @@ def test_live_queued_read_keeps_waiting_then_reads_under_the_same_lock(sync, mon
     asyncio.run(scenario())
 
 
-def test_timed_out_v2_read_already_inside_its_barrier_still_finishes(sync, monkeypatch):
-    data = read_request(sync, "query")
+@pytest.mark.parametrize("operation", ["query", "check_sources"])
+def test_timed_out_v2_read_already_inside_its_barrier_still_finishes(sync, monkeypatch, operation):
+    data = read_request(sync, operation)
     entered, release, completed = threading.Event(), threading.Event(), threading.Event()
     authority = sync.service.source_authority
     original_barrier = authority.barrier
@@ -202,18 +218,18 @@ def test_timed_out_v2_read_already_inside_its_barrier_still_finishes(sync, monke
             execute_timeout=0.5,
             max_active=1,
         )
-        original = app.state.memory_context.query_v2
+        target = sync.service if operation == "check_sources" else app.state.memory_context
+        method = "check_sources" if operation == "check_sources" else "query_v2"
+        original = getattr(target, method)
 
-        def query(*args, **kwargs):
+        def read(*args, **kwargs):
             result = original(*args, **kwargs)
             completed.set()
             return result
 
-        monkeypatch.setattr(app.state.memory_context, "query_v2", query)
+        monkeypatch.setattr(target, method, read)
         async with client_for(app) as client:
-            pending = asyncio.create_task(
-                client.post("/internal/v2/memory/context/query", json=data)
-            )
+            pending = asyncio.create_task(client.post(read_path(operation), json=data))
             try:
                 await until(entered.is_set)
                 response = await pending
