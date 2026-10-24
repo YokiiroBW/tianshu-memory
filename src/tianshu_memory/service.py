@@ -50,6 +50,15 @@ class MemoryService:
         return admission_key(source, scope) if self.synchronized else source_key(source)
 
     @contextmanager
+    def local_commit(self):
+        if self.synchronized:
+            with self.source_authority.local_commit(self) as db:
+                yield db
+        else:
+            with self.store.transaction() as db:
+                yield db
+
+    @contextmanager
     def operation(self, scope, **kwargs):
         if self.synchronized:
             with self.source_authority.operation(self, scope, **kwargs) as db:
@@ -161,7 +170,7 @@ class MemoryService:
             }
 
     def register(self, request, context):
-        with self.store.transaction() as db:
+        with self.local_commit() as db:
             self._authorize(db, context, account=request["account"])
 
             def create():

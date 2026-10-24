@@ -437,6 +437,19 @@ class SourceAuthority:
         return result
 
     @contextmanager
+    def local_commit(self, service):
+        """Serialize a local writer's entire transaction without a remote barrier.
+
+        This owns a new outer transaction. Helpers already borrowing a business
+        database keep that database rather than entering another transaction.
+        Commit/checkpoint persistence and rollback finish before either owner
+        is released, in the same order as the source operation boundaries.
+        """
+        with self._operation_order.turn(), self._operation_lock:
+            with service.store.transaction() as db:
+                yield db
+
+    @contextmanager
     def operation(self, service, scope, **kwargs):
         active = getattr(self._bundled, "active", None)
         if active is not None:

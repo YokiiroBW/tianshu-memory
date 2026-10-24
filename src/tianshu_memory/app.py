@@ -217,7 +217,12 @@ def create_app(
                     business=True,
                 )
             else:
-                result = await lease.run(observe_alias, service.store, payload, business=True)
+                result = await lease.run(
+                    lambda: observe_alias(
+                        service.store, payload, local_commit=service.local_commit
+                    ),
+                    business=True,
+                )
             return JSONResponse(
                 {**result, "request_id": request_id}, headers={"Cache-Control": "no-store"}
             )
@@ -677,7 +682,9 @@ def configured_app():
     if config.get("observation_source") is not None:
         from .observations import ObservationLedger, PlatformVerifier
 
-        service.observations = ObservationLedger(store, PlatformVerifier(config_path))
+        service.observations = ObservationLedger(
+            store, PlatformVerifier(config_path), local_commit=service.local_commit
+        )
     auth = Authenticator(config_path, contracts, now, role_database=store.role_database)
     from .relationships import Policy, Relationships
 

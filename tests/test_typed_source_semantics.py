@@ -262,6 +262,7 @@ def test_a_location_or_object_cannot_be_the_agent_of_the_authors_intention(
     assert stored["canonical"]["subject"]["kind"] == "author"
 
 
+@pytest.mark.parametrize("modality", ["asserted", "observed"])
 @pytest.mark.parametrize(
     "text,expected",
     [
@@ -273,19 +274,96 @@ def test_a_location_or_object_cannot_be_the_agent_of_the_authors_intention(
         ("我先把门关上了。", "observed"),
         ("我想起昨天已经关上门了。", "observed"),
         ("我先去取包，刚才已经把门关上了。", "observed"),
+        ("我希望天晴，但我已经把门关上了。", "observed"),
+        ("我希望关上门，但我已经关上门了。", "observed"),
+        ("我希望把门关上，但我已经把门关上了。", "observed"),
     ],
 )
-def test_immediate_intention_and_reported_completion_remain_different(sync, text, expected):
+def test_immediate_intention_and_reported_completion_remain_different(
+    sync, text, expected, modality
+):
     setup(sync)
     job, _ = candidate(sync, text)
     value = dict(
-        fact("关上门", predicate="action.close_door", modality="observed"), state="historical"
+        fact("关上门", predicate="action.close_door", modality=modality), state="historical"
     )
     result = commit(sync, job, text, value)
     assert result["state"] == "completed", result
     value, unit = persisted(sync, result["result"]["group_ids"][0])
+    expected = "planned" if expected == "planned" else modality
     assert value["canonical"]["modality"] == expected
+    assert ("计划（不代表已执行）" in unit["statement"]) == (expected == "planned")
     assert ("来源报告已发生" in unit["statement"]) == (expected == "observed")
+    if expected == "planned" and "我先" in text:
+        assert value["canonical"]["state"] == "current"
+    assert unit["subject_person_id"] == sync.scope()["person_id"]
+    with sync.store.transaction() as db:
+        document = db.execute(
+            "SELECT text FROM memory_documents WHERE group_id=?",
+            (result["result"]["group_ids"][0],),
+        ).fetchone()
+    assert json.loads(document["text"])["modality"] == expected
+
+
+@pytest.mark.parametrize("modality", ["asserted", "observed"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "朋友说，‘我先把门关上’。",
+        "如果起风，我先把门关上。",
+        "我先把门关上吗？",
+        "我先把门关上，朋友先把门关上。",
+        "我先把门关上，朋友已经把门关上了。",
+        "我先把门关上，‘我先把门关上’只是台词。",
+        "我希望把门关上。",
+        "朋友说，‘我希望把门关上’。",
+        "但愿门关上。",
+        "我想象自己把门关上。",
+        "我希望关上门，但朋友已经关上门了。",
+        "我希望关上门，但‘我已经关上门了’只是台词。",
+        "我希望关上门，但如果起风，我已经关上门了。",
+        "我希望关上门，但我明天会已经关上门了。",
+        "我希望关上门，但我已经准备明天关上门了。",
+        "我希望关上门，但我已经“准备”关上门了。",
+        "我希望关上门，但我已经“假装”关上门了。",
+        "我希望关上门，但我已经把灯关好了。",
+        "我希望关上门，但我已经说了‘关上门’。",
+    ],
+)
+def test_action_modality_cannot_promote_a_wish_quote_condition_or_different_subject(
+    sync, text, modality
+):
+    setup(sync)
+    job, _ = candidate(sync, text)
+    value = fact("关上门", predicate="action.close_door", modality=modality)
+    assert commit(sync, job, text, value)["state"] == "rejected"
+    with sync.store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM automatic_facts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "text,predicate,value,subject",
+    [
+        ("我叫计划。", "identity.name", "计划", None),
+        (
+            "我的本子叫希望。",
+            "object.name",
+            "希望",
+            dict(kind="entity", id=None, type="notebook", mention="我的本子"),
+        ),
+        ("我希望天气好一点。", "wish.preference", "天气好一点", None),
+    ],
+)
+def test_non_action_names_and_the_wish_itself_keep_their_asserted_modality(
+    sync, text, predicate, value, subject
+):
+    setup(sync)
+    job, _ = candidate(sync, text)
+    result = commit(sync, job, text, fact(value, predicate=predicate, subject=subject))
+    assert result["state"] == "completed", result
+    stored, unit = persisted(sync, result["result"]["group_ids"][0])
+    assert stored["canonical"]["modality"] == "asserted"
+    assert "计划（不代表已执行）" not in unit["statement"]
 
 
 def test_refunded_ticket_is_not_a_completed_attendance_date(sync):

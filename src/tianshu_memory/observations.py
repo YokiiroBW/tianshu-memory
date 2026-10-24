@@ -184,8 +184,9 @@ def _request(request):
 
 
 class ObservationLedger:
-    def __init__(self, store, verifier):
+    def __init__(self, store, verifier, *, local_commit=None):
         self.store, self.verifier = store, verifier
+        self._local_commit = local_commit or store.transaction
 
     def _ready(self, db):
         row = db.execute("SELECT value FROM metadata WHERE key='observation_schema'").fetchone()
@@ -218,7 +219,7 @@ class ObservationLedger:
             "forbidden",
             403,
         )
-        with self.store.transaction() as db:
+        with self._local_commit() as db:
             self._ready(db)
             if event["schema_version"] >= 3:
                 from .qq_identity import register_observed

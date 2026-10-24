@@ -409,7 +409,7 @@ class _WorkflowBase:
             ]
 
     def acknowledge(self, event_id):
-        with self.service.store.transaction() as db:
+        with self.service.local_commit() as db:
             db.execute("UPDATE outbox SET acknowledged=1 WHERE event_id=?", (event_id,))
 
 

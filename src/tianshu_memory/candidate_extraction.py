@@ -26,7 +26,7 @@ class CandidateExtraction:
         )
         service = self.service
         require(service.synchronized, "dependency_unavailable", 503)
-        with service.store.transaction() as db:
+        with service.local_commit() as db:
             job = db.execute("SELECT * FROM jobs WHERE id=?", (request["job_id"],)).fetchone()
             require(job is not None, "not_found", 404)
             event = json.loads(job["event"])

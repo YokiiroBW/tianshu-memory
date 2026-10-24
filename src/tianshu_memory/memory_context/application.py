@@ -151,7 +151,7 @@ class MemoryContext:
         except Fault as error:
             if error.code not in {"version_conflict", "scope_changed"}:
                 raise
-            with service.store.transaction() as db:
+            with service.local_commit() as db:
                 ready(db)
                 service._authorize(db, context, scope=scope)
                 old = self._old(db, request, context)
@@ -356,7 +356,7 @@ class MemoryContext:
                 proof["accounts"] == [request["source_account"], request["target_account"]]
                 and proof["scopes"] == request["scopes"]
             )
-        with service.store.transaction() as db:
+        with service.local_commit() as db:
             ready(db)
             source = service._authorize(db, context, account=request["source_account"])
             require(source is not None)
@@ -466,7 +466,7 @@ class MemoryContext:
             proof["accounts"] == [request["source_account"], request["target_account"]]
             and len(proof["scopes"]) == 2
         )
-        with service.store.transaction() as db:
+        with service.local_commit() as db:
             ready(db)
             source = service._authorize(db, context, account=request["source_account"])
             target = service._binding(db, request["target_account"])

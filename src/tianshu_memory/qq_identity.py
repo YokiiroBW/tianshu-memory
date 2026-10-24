@@ -46,7 +46,7 @@ def _display(value):
     return value.strip()
 
 
-def observe_alias(store, payload):
+def observe_alias(store, payload, *, local_commit=None):
     require(
         type(payload) is dict
         and set(payload)
@@ -93,7 +93,7 @@ def observe_alias(store, payload):
     require(parse_time(payload["observed_at"]).tzinfo is not None, "invalid_input", 400)
     digest = fingerprint({key: value for key, value in payload.items() if key != "request_id"})
     account_key = canonical({"namespace": "qq", "immutable_account_id": account_id})
-    with store.transaction() as db:
+    with (local_commit or store.transaction)() as db:
         marker = db.execute("SELECT value FROM metadata WHERE key='qq_alias_schema'").fetchone()
         require(marker is not None and marker[0] == "1", "dependency_unavailable", 503)
         require(

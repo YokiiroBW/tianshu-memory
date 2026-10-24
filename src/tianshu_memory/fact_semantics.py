@@ -12,8 +12,10 @@ from .fact_source_text import ATTRIBUTION, PAIRS, bound_contexts, quoted_positio
 
 SEPARATOR = re.compile(r"[，,。；;！!？?\n\r]")
 INTENTION = re.compile(
-    r"^(?:我(?:先|打算|计划|准备|想|考虑)|(?:周[一二三四五六日天]|星期[一二三四五六日天])(?:打算|计划|准备|想))"
+    r"(?:我(?:先|打算|计划|准备|想(?!起|象|到|念|知道|问|说)|考虑)|"
+    r"(?:周[一二三四五六日天]|星期[一二三四五六日天])(?:打算|计划|准备|想))"
 )
+WISH = re.compile(r"我(?:只是)?(?:希望|盼望|想象)|但愿")
 COMPLETED = re.compile(
     r"已经|已(?:经)?(?:把|将|去|到|做|送|关|找)|刚才|后来|做完|好了|上了|到了|去了|过了"
 )
@@ -207,6 +209,33 @@ def _actual_attendance(clause):
     )
 
 
+def _completed_author_action(value, clause, safe):
+    """A wish exception needs a direct, literal first-person completion.
+
+    Permit the same action's object-fronting/aspect, not another subject or a
+    report about imagining, preparing or quoting that action. This deliberately
+    recognizes a finite completion frame rather than arbitrary paraphrases.
+    """
+    # Quoted modifiers are meaningful too: deleting “准备” from an otherwise
+    # first-person clause must never manufacture proof that it was completed.
+    if not safe or _control_syntax(clause) != clause:
+        return False
+    match = re.fullmatch(
+        r"(?:但|不过|可是|然而)?我(?:实际|确实)?(?:已经|已|刚才|刚刚)"
+        r"(?:实际|确实)?(?P<action>.+)",
+        clause.strip(),
+    )
+    if not match:
+        return False
+    action = re.sub(r"^(?:把|将)", "", match["action"])
+    characters = {char for char in value if char.isalnum()}
+    return (
+        bool(characters)
+        and characters <= set(action)
+        and all(char.isspace() or char in characters | {"了", "过"} for char in action)
+    )
+
+
 def source_subject(fact, quotes):
     """An explicit possessed object's location cannot belong to its author/place.
 
@@ -265,12 +294,12 @@ def source_subject(fact, quotes):
 
 
 def sourced_modality(fact, evidence, content):
-    """Do not turn an explicit immediate intention into a completed action."""
+    """The same sourced intention constrains asserted and observed actions."""
     value = fact["canonical"]
     if fact["update"]["operation"] in {"confirm", "retract"}:
         return fact
     parts = set(value["predicate"].split("."))
-    if value["modality"] != "observed" or not parts & (
+    if value["modality"] not in {"asserted", "observed"} or not parts & (
         ACTION_PROPERTIES | {"attendance", "attendance_date", "arrived_at_destination"}
     ):
         return fact
@@ -307,12 +336,22 @@ def sourced_modality(fact, evidence, content):
         ]
         require(not unsupported or actual, "invalid_input", 400)
     action_clauses = _action_clauses(value["value"], contexts)
+    if parts & ACTION_PROPERTIES:
+        # A wish can be recorded as a wish, but supplies neither an established
+        # action nor an executable plan. A separate, explicit completion of
+        # this very action by its author can still support the actual report.
+        wished = any(WISH.search(part) for part, _ in action_clauses)
+        completed = value["subject"]["kind"] == "author" and any(
+            _completed_author_action(value["value"], part, safe) for part, safe in action_clauses
+        )
+        require(not wished or completed, "invalid_input", 400)
     if (
-        value["modality"] == "observed"
-        and parts & ACTION_PROPERTIES
+        parts & ACTION_PROPERTIES
         and action_clauses
-        and any(INTENTION.match(part) for part, _ in action_clauses)
+        and any(INTENTION.search(part) for part, _ in action_clauses)
     ):
+        # Search finds quoted/attributed first-person intentions too. They must
+        # not bypass this guard just because the clause does not start with 我.
         require(
             all(safe and INTENTION.match(part) for part, safe in action_clauses),
             "invalid_input",
