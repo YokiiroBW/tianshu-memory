@@ -120,12 +120,12 @@ def test_same_room_collection_keeps_all_owners_raw_checks_and_windows_at_each_ch
     assert "checks" not in rejected.json()
     assert source_calls(sync) == ["snapshot", "current", "head"]
 
-    # The next boundary must reread all old windows and persist a real owner withdrawal.
+    # A factual read retains the complete-domain scan and durable withdrawal.
     withdraw_source(sync, jobs[0])
     sync.calls.clear()
     for values in reads.values():
         values.clear()
-    query = dict(request(sync, "海边旅行"), retrieval_mode="context")
+    query = request(sync, "海边旅行")
     query["queries"][0]["kinds"] = ["facts"]
     fresh = post(sync, "query", query)
     assert fresh.status_code == 200, fresh.text

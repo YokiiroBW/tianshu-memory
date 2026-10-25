@@ -65,14 +65,38 @@ def authorize_check(service, db, context, scope):
         raise
 
 
-def requirements(service, request, context, legacy=(), *, rejected=None, db=None, covered=None):
+def requirements(
+    service,
+    request,
+    context,
+    legacy=(),
+    *,
+    rejected=None,
+    db=None,
+    covered=None,
+    server_selection=None,
+):
     scope = request["requested_scope"]
     result = []
     with service.store.transaction() if db is None else nullcontext(db) as db:
         service._authorize(db, context, scope=scope)
         selected = None
         bundle = request.get("bundle")
-        if service.synchronized and bundle is not None and contextual(bundle):
+        if server_selection is not None:
+            # Only the new-query reader supplies this in-process selection. It
+            # has not issued a bundle yet; no wire field can bypass its HMAC.
+            require(
+                service.synchronized
+                and contextual(request)
+                and "queries" in request
+                and request.get("known_bundle") is None
+                and bundle is None,
+                "invalid_input",
+                400,
+            )
+            require_selection(server_selection["scope"] == scope)
+            selected = server_selection
+        elif service.synchronized and bundle is not None and contextual(bundle):
             require_selection(bundle["effective_scope"] == scope)
             verify_selection_proof(db, bundle)
             selected = dict(

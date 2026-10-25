@@ -11,19 +11,25 @@ from .read_lifecycle import cancellable_read
 
 
 class Requests:
-    def __init__(self, limit=8):
+    def __init__(self, limit=8, *, reserve_identity=False):
         self.limit, self.active = limit, 0
+        self.ordinary_limit = max(1, limit - 1) if reserve_identity else limit
+        self.ordinary_active = 0
 
-    def claim(self):
-        if self.active >= self.limit:
+    def claim(self, *, identity=False):
+        if self.active >= self.limit or (
+            not identity and self.ordinary_active >= self.ordinary_limit
+        ):
             raise Fault("queue_full", 429)
         self.active += 1
-        return Lease(self)
+        if not identity:
+            self.ordinary_active += 1
+        return Lease(self, identity=identity)
 
 
 class Lease:
-    def __init__(self, owner):
-        self.owner = owner
+    def __init__(self, owner, *, identity=False):
+        self.owner, self.identity = owner, identity
         self.task = None
         self.abandoned = False
         self.released = False
@@ -72,3 +78,5 @@ class Lease:
         if not self.released:
             self.released = True
             self.owner.active -= 1
+            if not self.identity:
+                self.owner.ordinary_active -= 1

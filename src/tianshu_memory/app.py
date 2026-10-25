@@ -111,7 +111,7 @@ def create_app(
         or not 1 <= max_active <= 64
     ):
         raise ValueError("Invalid chat request limits")
-    admission = Requests(max_active)
+    admission = Requests(max_active, reserve_identity=True)
     app.state.chat_requests = admission
     from .candidate_http import mount as mount_candidates
 
@@ -297,7 +297,7 @@ def create_app(
                 if service is None or auth is None:
                     await anote_authenticated("dependency_unavailable")
                     raise Fault("dependency_unavailable", 503)
-                lease = admission.claim()
+                lease = admission.claim(identity=operation == "resolve")
                 async with asyncio.timeout(execute_timeout):
                     authenticated_service, caller = await lease.run(
                         auth.authenticate, request.headers.get("authorization")

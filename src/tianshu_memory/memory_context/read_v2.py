@@ -721,7 +721,25 @@ def execute(application, request, context):
             query_vectors[query["query_id"]] = prepare_query_vector(
                 service.retrieval, query["text"], settings, deadline=deadline
             )
-    with operation(service, items) as db:
+    local_selection = (
+        service.synchronized
+        and contextual(request)
+        and request["known_bundle"] is None
+        and (
+            settings is None
+            or (
+                not settings["rerank"]
+                and (
+                    settings["mode"] == "keyword"
+                    or all(value is not None for value in query_vectors.values())
+                )
+            )
+        )
+    )
+    # Discovery is private to this request. Its local eligibility is sufficient
+    # for ranking, never for returning a body or sending one to a backend.
+    boundary = service.store.transaction() if local_selection else operation(service, items)
+    with boundary as db:
         frame = collect(service, db, request, context)
         if request["known_bundle"] is not None:
             verify_snapshot(service, db, request["known_bundle"], frame, context)
@@ -745,46 +763,73 @@ def execute(application, request, context):
             )
             if plan["ranking"] is not None:
                 discard_corrupt(db, plan["ranking"])
-        if not any(plan["ranking"] is not None and plan["ranking"].external for plan in prepared):
+        if local_selection:
+            rank_plans(service, prepared, backend_failed)
+            evidence, results, _, chosen = _select_evidence(service, db, request, frame, prepared)
+            groups, episodes, sources = dependencies(db, frame, evidence)
+            selection = dict(
+                scope=frame["scope"],
+                group_ids=[item["group"]["semantic_group_id"] for item in groups],
+                episode_ids=[item["episode_id"] for item in episodes],
+                source_keys=[item["source_key"] for item in sources],
+            )
+            for plan, result, selected_ids in zip(prepared, results, chosen, strict=True):
+                plan["ranked"] = [
+                    document for document in plan["ranked"] if document["id"] in selected_ids
+                ]
+                # The final fit may remove stale rows, but must not fill their
+                # space from candidates that this source boundary never proved.
+                plan["selection_omissions"] = [
+                    item
+                    for item in result["omissions"]
+                    if item in {"budget", "source_time_unavailable"}
+                ]
+            items = requirements(service, request, context, db=db, server_selection=selection)
+        elif not any(plan["ranking"] is not None and plan["ranking"].external for plan in prepared):
             # The evidence and its negative/selection proof are produced from this
             # same fresh source boundary. Nothing outside the transaction ran.
             rank_plans(service, prepared, backend_failed)
             return assemble(service, db, request, context, frame, prepared)
-    rank_plans(service, prepared, backend_failed)
+    if not local_selection:
+        rank_plans(service, prepared, backend_failed)
     with operation(service, items) as db:
         fresh = collect(service, db, request, context)
-        for plan in prepared:
-            eligible = prepare_query(
-                service,
-                db,
-                fresh,
-                plan["subquery"],
-                request["selection"],
-                context_mode=contextual(request),
-            )
-            domain = eligible["domain"]
-            if not contextual(request):
-                require(
-                    domain["resolution"] == plan["domain"]["resolution"]
-                    and domain["digest"] == plan["domain"]["digest"],
-                    "scope_changed",
-                    409,
-                )
-            # Eligibility (including natural expiry and current fact validity)
-            # can change without a domain/version change while the backend runs.
-            # Reuse the same preparation rules, but never add or rerank candidates.
-            documents = {item["id"]: item for item in eligible["documents"]}
-            ranked = [
-                documents[document["id"]]
-                for document in plan["ranked"]
-                if document["id"] in documents
-                and document_binding(frame, document)
-                == document_binding(fresh, documents[document["id"]])
-            ]
-            plan["stale_ranked"] = len(ranked) != len(plan["ranked"])
-            plan["ranked"] = ranked
-            plan["domain"] = domain
+        _refresh_ranked(service, db, request, frame, fresh, prepared)
         return assemble(service, db, request, context, fresh, prepared)
+
+
+def _refresh_ranked(service, db, request, frame, fresh, prepared):
+    """Reuse eligibility after a boundary; never add or rerank a document."""
+    for plan in prepared:
+        eligible = prepare_query(
+            service,
+            db,
+            fresh,
+            plan["subquery"],
+            request["selection"],
+            context_mode=contextual(request),
+        )
+        domain = eligible["domain"]
+        if not contextual(request):
+            require(
+                domain["resolution"] == plan["domain"]["resolution"]
+                and domain["digest"] == plan["domain"]["digest"],
+                "scope_changed",
+                409,
+            )
+        # Time/retention can change without a domain/version change. A new
+        # record version or an episode's changed metadata cannot reuse old rank.
+        documents = {item["id"]: item for item in eligible["documents"]}
+        ranked = [
+            documents[document["id"]]
+            for document in plan["ranked"]
+            if document["id"] in documents
+            and document_binding(frame, document)
+            == document_binding(fresh, documents[document["id"]])
+        ]
+        plan["stale_ranked"] = len(ranked) != len(plan["ranked"])
+        plan["ranked"] = ranked
+        plan["domain"] = domain
 
 
 def document_binding(frame, document):
@@ -827,8 +872,10 @@ def rank_plans(service, prepared, backend_failed):
             )
 
 
-def assemble(service, db, request, context, frame, prepared):
+def _select_evidence(service, db, request, frame, prepared):
+    """Fit complete evidence groups once, for discovery and final assembly."""
     evidence, results, constraints = [], [], []
+    chosen = []
     included = set()
     included_sources = set()
     included_owners = {canonical(frame["scope"])}
@@ -837,7 +884,8 @@ def assemble(service, db, request, context, frame, prepared):
     for plan in prepared:
         query, domain = plan["subquery"], plan["domain"]
         resolution = domain["resolution"]
-        result_ids, omissions, missing_time = [], [], 0
+        result_ids, omissions, missing_time = [], list(plan.get("selection_omissions", ())), 0
+        chosen_documents = set()
         witness_ids = [entry[0]["id"] for entry in domain["witnesses"]]
         for document in plan["ranked"]:
             batch = (
@@ -883,6 +931,7 @@ def assemble(service, db, request, context, frame, prepared):
                 omissions.append("budget")
                 continue
             evidence.extend(added)
+            chosen_documents.add(document["id"])
             included.update(item["evidence_id"] for item in added)
             included_sources.update(added_sources)
             included_owners.update(added_owners)
@@ -948,6 +997,12 @@ def assemble(service, db, request, context, frame, prepared):
                 result_status=status,
             )
         )
+        chosen.append(chosen_documents)
+    return evidence, results, constraints, chosen
+
+
+def assemble(service, db, request, context, frame, prepared):
+    evidence, results, constraints, _ = _select_evidence(service, db, request, frame, prepared)
     bundle = make_bundle(service, db, request, context, frame, evidence, constraints)
     size = len(canonical(evidence).encode()) if evidence else 0
     return dict(
