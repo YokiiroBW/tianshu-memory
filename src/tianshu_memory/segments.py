@@ -43,6 +43,38 @@ def _leaf_rows(service, db, event):
     return sources
 
 
+def _invalid_material_snapshot(db, materials):
+    """Original versions plus a durable negative, never a positive source proof."""
+    keys = sorted({row["source_key"] for row in materials})
+    marks = ",".join("?" for _ in keys)
+    current = {
+        row["key"]: row
+        for row in db.execute("SELECT * FROM sources WHERE key IN (" + marks + ")", keys)
+    }
+    suppressed = {
+        row[0]
+        for row in db.execute(
+            "SELECT source_key FROM suppression WHERE source_key IN (" + marks + ")", keys
+        )
+    }
+    snapshot, invalid = {}, False
+    for material in materials:
+        payload = json.loads(material["payload"])
+        expected = [payload["source_revision"], payload["source_epoch"]]
+        key = material["source_key"]
+        snapshot.setdefault(key, expected)
+        source = current.get(key)
+        invalid |= key in suppressed or (
+            source is not None
+            and source["scope"] == material["scope"]
+            and (
+                source["state"] == "withdrawn"
+                or (source["revision"], source["epoch"]) > tuple(expected)
+            )
+        )
+    return snapshot if invalid else None
+
+
 def _current(service, db, event, snapshot):
     rows = _leaf_rows(service, db, event)
     require(set(rows) <= set(snapshot), "scope_changed", 409)
@@ -216,20 +248,55 @@ class Segments:
             windows=[window["manifest"] for window in event["context_windows"]],
         )
 
+    def _prior_seal(self, db, request, publisher, digest):
+        prior = db.execute(
+            "SELECT * FROM memory_segments WHERE segment_id=?", (request["segment_id"],)
+        ).fetchone()
+        if prior:
+            job, _ = self._job(db, prior["job_id"], publisher)
+            require(prior["digest"] == digest, "idempotency_conflict", 409)
+            return self._sealed(request["segment_id"], job)
+
+    @staticmethod
+    def _save_segment(db, request, digest, event, state, snapshot):
+        job = dict(id=new_id("job"), state=state)
+        db.execute(
+            "INSERT INTO jobs(id,state,event,source_snapshot,extraction_schema) VALUES (?,?,?,?,6)",
+            (job["id"], state, canonical(event), canonical(snapshot)),
+        )
+        db.execute(
+            "INSERT INTO memory_segments VALUES (?,?,?,?)",
+            (request["segment_id"], job["id"], digest, canonical(request["frame"])),
+        )
+        return job
+
+    def _seal_invalidated(self, request, publisher, digest):
+        with self.service.local_commit() as db:
+            require(installed(db), "dependency_unavailable", 503)
+            prior = self._prior_seal(db, request, publisher, digest)
+            if prior:
+                return prior
+            materials = _materials(db, request["material_refs"] + request["context_refs"])
+            snapshot = _invalid_material_snapshot(db, materials)
+            if snapshot is None:
+                return None
+            event, _ = self._event(db, request, publisher)
+            job = self._save_segment(db, request, digest, event, "stale_source", snapshot)
+            self.service._emit(
+                db,
+                "memory.candidate_invalidated",
+                dict(candidate_job_ref=job["id"], state=job["state"]),
+            )
+            return self._sealed(request["segment_id"], job)
+
     def seal(self, request, publisher):
         service = self.service
         require(service.synchronized, "dependency_unavailable", 503)
         service.contracts.validate("memory-extraction#segment_seal_request", request)
         digest = fingerprint(request)
-        with service.local_commit() as db:
-            require(installed(db), "dependency_unavailable", 503)
-            prior = db.execute(
-                "SELECT * FROM memory_segments WHERE segment_id=?", (request["segment_id"],)
-            ).fetchone()
-            if prior:
-                job, _ = self._job(db, prior["job_id"], publisher)
-                require(prior["digest"] == digest, "idempotency_conflict", 409)
-                return self._sealed(request["segment_id"], job)
+        invalidated = self._seal_invalidated(request, publisher, digest)
+        if invalidated:
+            return invalidated
         # Automatic passive context is chosen only before this segment has a
         # claim. A replay always uses the original frozen input above.
         request = copy.deepcopy(request)
@@ -243,134 +310,147 @@ class Segments:
         )
         request["omitted_context"] |= omitted or archive_omitted
         with service.local_commit() as db:
-            identities = request["material_refs"] + request["context_refs"]
-            require(len(identities) == len(set(identities)), "invalid_input", 400)
-            materials = _materials(db, identities)
-            require(
-                all(row["frame"] == canonical(request["frame"]) for row in materials),
-                "forbidden",
-                403,
-            )
-            targets, members, member_sources = {}, {}, {}
-            context_materials = []
-            for row in materials:
-                member = json.loads(row["payload"])["member"]
-                require(member["source_scope"] == json.loads(row["scope"]), "scope_changed", 409)
-                authorize(publisher, member["source_scope"])
-                members[member["member_id"]] = member
-                member_sources[member["member_id"]] = row["source_key"]
-                if row["id"] in request["material_refs"]:
-                    target = targets.setdefault(
-                        row["scope"], dict(scope=member["source_scope"], new_member_ids=[])
-                    )
-                    target["new_member_ids"].append(row["id"])
-            require(1 <= len(targets) <= 8, "budget_exceeded", 413)
-            require(
-                len({target["scope"]["person_id"] for target in targets.values()}) == len(targets),
-                "invalid_input",
-                400,
-            )
-            # Preserve the complete supplied Core window, including every BOT
-            # dependency. A model's later citations never trim this closure.
-            for window in request["context_windows"]:
-                scope = window["manifest"]["scope"]
-                authorize(publisher, scope)
-                require(segment_sources.frame(scope) == request["frame"], "forbidden", 403)
-                manifest = consolidation_sources.validate_window(window, scope, service.contracts)
-                bodies = {member["member_id"]: member["text"] for member in window["members"]}
-                for original in manifest["members"]:
-                    if original["role"] == "user":
-                        from .segment_materials import identity
+            event, materials = self._event(db, request, publisher)
+        try:
+            return self._seal_current(request, publisher, digest, event, materials)
+        except Fault as error:
+            if error.code != "scope_changed" or error.status != 409:
+                raise
+            invalidated = self._seal_invalidated(request, publisher, digest)
+            if invalidated is None:
+                raise
+            return invalidated
 
-                        key = original["reference"]["source"]["message_key"]
-                        identity_value = identity(
-                            scope["actor_id"], key["channel"], key["message_id"], key["revision"]
-                        )
-                        original_key = service.source_identity(
-                            original["reference"]["source"], original["source_scope"]
-                        )
-                        alias = db.execute(
-                            "SELECT material_id FROM memory_material_aliases WHERE source_key=?",
-                            (original_key,),
-                        ).fetchone()
-                        if alias:
-                            identity_value = alias[0]
-                            context_materials.append(identity_value)
-                        member_sources[identity_value] = original_key
-                        member = human_member(
-                            identity_value,
-                            "core",
-                            original["source_scope"],
-                            original["speaker"]["account"],
-                            original["binding_version"],
-                            bodies[original["member_id"]],
-                            original["observed_at"],
-                            reality=None,
-                        )
-                    else:
-                        member = dict(
-                            member_id=original["member_id"],
-                            kind="core",
-                            role="bot",
-                            speaker=original["speaker"],
-                            source_scope=original["source_scope"],
-                            binding_version=original["binding_version"],
-                            observed_at=original["observed_at"],
-                            text=bodies[original["member_id"]],
-                            content_sha256=original["content_sha256"],
-                            reply_refs=[],
-                            mentioned_accounts=[],
-                            reality="real",
-                        )
-                    old = members.get(member["member_id"])
-                    require(
-                        old is None
-                        or all(
-                            old[key] == member[key]
-                            for key in (
-                                "role",
-                                "speaker",
-                                "source_scope",
-                                "binding_version",
-                                "observed_at",
-                                "text",
-                                "content_sha256",
-                            )
-                        ),
-                        "invalid_input",
-                        400,
+    def _event(self, db, request, publisher):
+        service = self.service
+        identities = request["material_refs"] + request["context_refs"]
+        require(len(identities) == len(set(identities)), "invalid_input", 400)
+        materials = _materials(db, identities)
+        require(
+            all(row["frame"] == canonical(request["frame"]) for row in materials),
+            "forbidden",
+            403,
+        )
+        targets, members, member_sources = {}, {}, {}
+        context_materials = []
+        for row in materials:
+            member = json.loads(row["payload"])["member"]
+            require(member["source_scope"] == json.loads(row["scope"]), "scope_changed", 409)
+            authorize(publisher, member["source_scope"])
+            members[member["member_id"]] = member
+            member_sources[member["member_id"]] = row["source_key"]
+            if row["id"] in request["material_refs"]:
+                target = targets.setdefault(
+                    row["scope"], dict(scope=member["source_scope"], new_member_ids=[])
+                )
+                target["new_member_ids"].append(row["id"])
+        require(1 <= len(targets) <= 8, "budget_exceeded", 413)
+        require(
+            len({target["scope"]["person_id"] for target in targets.values()}) == len(targets),
+            "invalid_input",
+            400,
+        )
+        # Preserve the complete supplied Core window, including every BOT
+        # dependency. A model's later citations never trim this closure.
+        for window in request["context_windows"]:
+            scope = window["manifest"]["scope"]
+            authorize(publisher, scope)
+            require(segment_sources.frame(scope) == request["frame"], "forbidden", 403)
+            manifest = consolidation_sources.validate_window(window, scope, service.contracts)
+            bodies = {member["member_id"]: member["text"] for member in window["members"]}
+            for original in manifest["members"]:
+                if original["role"] == "user":
+                    from .segment_materials import identity
+
+                    key = original["reference"]["source"]["message_key"]
+                    identity_value = identity(
+                        scope["actor_id"], key["channel"], key["message_id"], key["revision"]
                     )
-                    members.setdefault(member["member_id"], member)
-            ordered = sorted(
-                members.values(),
-                key=lambda item: (parse_time(item["observed_at"]), item["member_id"]),
-            )
-            require(
-                len(ordered) <= 32 and sum(len(item["text"].encode()) for item in ordered) <= 49152,
-                "budget_exceeded",
-                413,
-            )
-            event = dict(
-                kind="conversation_segment",
-                segment_id=request["segment_id"],
-                frame=request["frame"],
-                scope=next(iter(targets.values()))["scope"],
-                material_ids=list(dict.fromkeys([*identities, *context_materials])),
-                new_material_ids=request["material_refs"],
-                members=ordered,
-                targets=list(targets.values()),
-                member_sources=member_sources,
-                context_windows=request["context_windows"],
-                omitted_context=request["omitted_context"],
-            )
+                    original_key = service.source_identity(
+                        original["reference"]["source"], original["source_scope"]
+                    )
+                    alias = db.execute(
+                        "SELECT material_id FROM memory_material_aliases WHERE source_key=?",
+                        (original_key,),
+                    ).fetchone()
+                    if alias:
+                        identity_value = alias[0]
+                        context_materials.append(identity_value)
+                    member_sources[identity_value] = original_key
+                    member = human_member(
+                        identity_value,
+                        "core",
+                        original["source_scope"],
+                        original["speaker"]["account"],
+                        original["binding_version"],
+                        bodies[original["member_id"]],
+                        original["observed_at"],
+                        reality=None,
+                    )
+                else:
+                    member = dict(
+                        member_id=original["member_id"],
+                        kind="core",
+                        role="bot",
+                        speaker=original["speaker"],
+                        source_scope=original["source_scope"],
+                        binding_version=original["binding_version"],
+                        observed_at=original["observed_at"],
+                        text=bodies[original["member_id"]],
+                        content_sha256=original["content_sha256"],
+                        reply_refs=[],
+                        mentioned_accounts=[],
+                        reality="real",
+                    )
+                old = members.get(member["member_id"])
+                require(
+                    old is None
+                    or all(
+                        old[key] == member[key]
+                        for key in (
+                            "role",
+                            "speaker",
+                            "source_scope",
+                            "binding_version",
+                            "observed_at",
+                            "text",
+                            "content_sha256",
+                        )
+                    ),
+                    "invalid_input",
+                    400,
+                )
+                members.setdefault(member["member_id"], member)
+        ordered = sorted(
+            members.values(),
+            key=lambda item: (parse_time(item["observed_at"]), item["member_id"]),
+        )
+        require(
+            len(ordered) <= 32 and sum(len(item["text"].encode()) for item in ordered) <= 49152,
+            "budget_exceeded",
+            413,
+        )
+        event = dict(
+            kind="conversation_segment",
+            segment_id=request["segment_id"],
+            frame=request["frame"],
+            scope=next(iter(targets.values()))["scope"],
+            material_ids=list(dict.fromkeys([*identities, *context_materials])),
+            new_material_ids=request["material_refs"],
+            members=ordered,
+            targets=list(targets.values()),
+            member_sources=member_sources,
+            context_windows=request["context_windows"],
+            omitted_context=request["omitted_context"],
+        )
+        return event, materials
+
+    def _seal_current(self, request, publisher, digest, event, materials):
+        service = self.service
         with self._operation(event) as db:
-            prior = db.execute(
-                "SELECT * FROM memory_segments WHERE segment_id=?", (request["segment_id"],)
-            ).fetchone()
+            prior = self._prior_seal(db, request, publisher, digest)
             if prior:
-                job, _ = self._job(db, prior["job_id"], publisher)
-                require(prior["digest"] == digest, "idempotency_conflict", 409)
-                return self._sealed(request["segment_id"], job)
+                return prior
             rows = _leaf_rows(service, db, event)
             for member in event["members"]:
                 if member["role"] == "human":
@@ -425,27 +505,24 @@ class Segments:
                         "idempotency_conflict",
                         409,
                     )
-            job_id = new_id("job")
-            db.execute(
-                "INSERT INTO jobs(id,state,event,source_snapshot,extraction_schema) VALUES (?,'pending',?,?,6)",
-                (
-                    job_id,
-                    canonical(event),
-                    canonical({key: [row["revision"], row["epoch"]] for key, row in rows.items()}),
-                ),
-            )
-            db.execute(
-                "INSERT INTO memory_segments VALUES (?,?,?,?)",
-                (request["segment_id"], job_id, digest, canonical(request["frame"])),
+            job = self._save_segment(
+                db,
+                request,
+                digest,
+                event,
+                "pending",
+                {key: [row["revision"], row["epoch"]] for key, row in rows.items()},
             )
             for identity_value in request["material_refs"]:
                 db.execute(
-                    "INSERT INTO memory_segment_claims VALUES (?,?)", (identity_value, job_id)
+                    "INSERT INTO memory_segment_claims VALUES (?,?)", (identity_value, job["id"])
                 )
             service._emit(
-                db, "memory.candidate_accepted", dict(candidate_job_ref=job_id, extraction_schema=6)
+                db,
+                "memory.candidate_accepted",
+                dict(candidate_job_ref=job["id"], extraction_schema=6),
             )
-            return self._sealed(request["segment_id"], dict(id=job_id, state="pending"))
+            return self._sealed(request["segment_id"], job)
 
     @staticmethod
     def _sealed(segment_id, job):
@@ -453,7 +530,11 @@ class Segments:
             schema_version=1,
             segment_id=segment_id,
             job_id=job["id"],
-            state="completed" if job["state"] in {"committed", "skipped"} else "pending",
+            state="completed"
+            if job["state"] in {"committed", "skipped"}
+            else "pending"
+            if job["state"] == "pending"
+            else "invalidated",
             candidate_job_ref=job["id"],
         )
 
