@@ -91,6 +91,15 @@ class SourceAuthority:
             selected[row[0]] = json.loads(row[0])
         return [selected[k] for k in sorted(selected)]
 
+    @staticmethod
+    def _read_domain(scope, *, profile=False, group_read=False):
+        """Identity of a data query, never an authorization or source-check identity."""
+        if group_read:
+            return "group", scope["actor_id"], scope["conversation_id"]
+        if profile:
+            return "profile", scope["actor_id"], scope["audience"], scope["conversation_id"]
+        return "exact", canonical(scope)
+
     def _relations(self, name, *args):
         try:
             return getattr(self.rules, name)(*args)
@@ -166,9 +175,13 @@ class SourceAuthority:
         for _ in range(3):
             with service.store.transaction() as db:
                 m0 = self.revision(db)
-                stored = summary_sources.stored_windows(db, scope, group_read=group_read)
-                for owner, shared in summary_scopes:
+                stored, window_domains = [], set()
+                for owner, shared in ((scope, group_read), *summary_scopes):
+                    domain = self._read_domain(owner, group_read=shared)
+                    if domain in window_domains:
+                        continue
                     stored.extend(summary_sources.stored_windows(db, owner, group_read=shared))
+                    window_domains.add(domain)
                 all_windows = {item["window_id"]: item for item in (*stored, *windows)}
                 summary_selectors = summary_sources.selectors(service, db, all_windows.values())
                 selectors = self.coverage(db, scope, sources, profile, group_read)
@@ -565,7 +578,7 @@ class SourceAuthority:
         )
         with self._operation_order.turn(), source_read_lock(self._operation_lock):
             begin_source_read()
-            selectors, domains, source_checks = {}, set(), []
+            selectors, domains, source_checks, read_domains = {}, set(), [], set()
             with service.store.transaction() as db:
                 for item in requirements:
                     scope = item["scope"]
@@ -573,8 +586,11 @@ class SourceAuthority:
                         service._authorize(db, item["context"], scope=scope)
                     profile, shared = bool(item.get("profile")), bool(item.get("group_read"))
                     domains.add((canonical(scope), profile, shared))
-                    for selected in self.coverage(db, scope, (), profile, shared):
-                        selectors[canonical(selected)] = selected
+                    domain = self._read_domain(scope, profile=profile, group_read=shared)
+                    if domain not in read_domains:
+                        for selected in self.coverage(db, scope, (), profile, shared):
+                            selectors[canonical(selected)] = selected
+                        read_domains.add(domain)
                     for check in item.get("source_checks", ()):
                         require(check["scope"] == scope, "invalid_input", 400)
                         source_checks.append(check)
