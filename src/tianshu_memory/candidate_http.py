@@ -74,7 +74,7 @@ def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
                         from .segment_materials import SegmentMaterials
 
                         return SegmentMaterials(
-                            service, read_content=CandidateExtraction(service)._content
+                            service, read_content=CandidateExtraction(service).read_originals
                         ).execute(payload, publisher)
                     if request.url.path.endswith("/segments"):
                         from .segments import Segments

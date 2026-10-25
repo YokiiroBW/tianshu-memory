@@ -110,13 +110,10 @@ class CandidateExtraction:
             dict(state="completed", result=json.loads(receipt[0]), content=[]) if receipt else None
         )
 
-    def _content(
-        self, event, *, pending_job=None, protocol=3, retain_originals=False, with_metadata=False
-    ):
+    def read_originals(self, event, *, with_metadata=False):
+        """Read authenticated bodies; the caller retains its final source boundary."""
         service = self.service
         scope, sources = event["scope"], event["sources"]
-        with service.operation(scope=scope, sources=sources, event=event) as db:
-            service._source_rows(db, sources, scope, reality=event["reality"])
         authority = service.source_authority
         request = dict(
             schema_version=1,
@@ -152,6 +149,16 @@ class CandidateExtraction:
             "budget_exceeded",
             413,
         )
+        return result
+
+    def _content(
+        self, event, *, pending_job=None, protocol=3, retain_originals=False, with_metadata=False
+    ):
+        service = self.service
+        scope, sources = event["scope"], event["sources"]
+        with service.operation(scope=scope, sources=sources, event=event) as db:
+            service._source_rows(db, sources, scope, reality=event["reality"])
+        result = self.read_originals(event, with_metadata=with_metadata)
         with service.operation(scope=scope, sources=sources, event=event) as db:
             rows = service._source_rows(db, sources, scope, reality=event["reality"])
             if context_installed(db) and not retain_originals:

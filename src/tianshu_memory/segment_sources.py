@@ -260,14 +260,82 @@ def same(before, after):
     )
 
 
+def _material_inputs(db, materials, *, owners=(), verified=False):
+    """Bounded local rows for the caller's current transaction, never another proof."""
+    payloads = {material["id"]: json.loads(material["payload"]) for material in materials}
+    accounts = {canonical(value["member"]["speaker"]["account"]) for value in payloads.values()}
+    for material in materials:
+        if material["kind"] == "observation":
+            event = json.loads(material["payload"])["archive"]["event"]
+            accounts.add(
+                canonical(
+                    dict(namespace=event["namespace"], immutable_account_id=event["account_id"])
+                )
+            )
+    keys = {material["source_key"] for material in materials}
+    requests, destinations = [], []
+
+    def add(bucket, table, column, values, fields="*"):
+        values = sorted(set(values))
+        for start in range(0, len(values), 256):
+            page = values[start : start + 256]
+            requests.append(
+                (
+                    "SELECT "
+                    + fields
+                    + " FROM "
+                    + table
+                    + " WHERE "
+                    + column
+                    + " IN ("
+                    + ",".join("?" for _ in page)
+                    + ")",
+                    page,
+                )
+            )
+            destinations.append(bucket)
+
+    add("bindings", "accounts", "account_key", accounts)
+    add("sources", "sources", "key", keys)
+    add("suppressed", "suppression", "source_key", keys)
+    add("heads", "memory_observation_heads", "owner_id", owners)
+    if verified:
+        add("verified", "memory_materials", "id", payloads, "id,verified")
+    cursors = (
+        []
+        if not requests
+        else db.read_batch(requests)
+        if hasattr(db, "read_batch")
+        else [db.execute(sql, parameters) for sql, parameters in requests]
+    )
+    result = dict(
+        payloads=payloads, bindings={}, sources={}, suppressed=set(), heads={}, verified={}
+    )
+    columns = dict(bindings="account_key", sources="key", heads="owner_id")
+    for bucket, cursor in zip(destinations, cursors, strict=True):
+        for row in cursor:
+            if bucket == "suppressed":
+                result[bucket].add(row["source_key"])
+            elif bucket == "verified":
+                result[bucket][row["id"]] = row["verified"]
+            else:
+                result[bucket][row[columns[bucket]]] = row
+    return result
+
+
 def apply(service, db, observations):
+    materials = [material for observation in observations for material in observation["rows"]]
+    owners = [
+        observation["proof"]["authority"]["owner_id"]
+        for observation in observations
+        if observation["proof"]
+    ]
+    local = _material_inputs(db, materials, owners=owners, verified=True)
     for observation in observations:
         proof = observation["proof"]
         if proof:
             head = proof["authority"]
-            previous = db.execute(
-                "SELECT * FROM memory_observation_heads WHERE owner_id=?", (head["owner_id"],)
-            ).fetchone()
+            previous = local["heads"].get(head["owner_id"])
             require(
                 previous is None
                 or (
@@ -276,15 +344,22 @@ def apply(service, db, observations):
                 "dependency_unavailable",
                 503,
             )
-            db.execute(
-                "INSERT INTO memory_observation_heads VALUES (?,?,?) ON CONFLICT(owner_id) DO UPDATE SET epoch=excluded.epoch,revision=excluded.revision WHERE excluded.epoch!=memory_observation_heads.epoch OR excluded.revision!=memory_observation_heads.revision",
-                (head["owner_id"], head["epoch"], head["revision"]),
-            )
+            if previous is None or (head["epoch"], head["revision"]) != (
+                previous["epoch"],
+                previous["revision"],
+            ):
+                db.execute(
+                    "INSERT INTO memory_observation_heads VALUES (?,?,?) ON CONFLICT(owner_id) DO UPDATE SET epoch=excluded.epoch,revision=excluded.revision WHERE excluded.epoch!=memory_observation_heads.epoch OR excluded.revision!=memory_observation_heads.revision",
+                    (head["owner_id"], head["epoch"], head["revision"]),
+                )
+                local["heads"][head["owner_id"]] = dict(
+                    owner_id=head["owner_id"], epoch=head["epoch"], revision=head["revision"]
+                )
         for index, material in enumerate(observation["rows"]):
             payload = json.loads(material["payload"])
             event = payload["archive"]["event"]
             account = {"namespace": event["namespace"], "immutable_account_id": event["account_id"]}
-            binding = service._binding(db, account)
+            binding = local["bindings"].get(canonical(account))
             scope = json.loads(material["scope"])
             legal = (
                 proof is not None
@@ -308,20 +383,35 @@ def apply(service, db, observations):
                     409,
                 )
             key = material["source_key"]
-            old = db.execute("SELECT * FROM sources WHERE key=?", (key,)).fetchone()
-            suppressed = db.execute(
-                "SELECT 1 FROM suppression WHERE source_key=?", (key,)
-            ).fetchone()
+            old = local["sources"].get(key)
             if not legal:
-                db.execute(
-                    "UPDATE memory_materials SET verified=0 WHERE id=? AND verified!=0",
-                    (material["id"],),
-                )
+                if local["verified"].get(material["id"]) not in (None, 0):
+                    db.execute(
+                        "UPDATE memory_materials SET verified=0 WHERE id=? AND verified!=0",
+                        (material["id"],),
+                    )
+                    local["verified"][material["id"]] = 0
                 if old is not None and old["state"] == "active":
                     db.execute(
                         "UPDATE sources SET state='withdrawn',epoch=epoch+1 WHERE key=?", (key,)
                     )
                     service._invalidate_sources(db, [key])
+                    # The original invalidator broadcasts to exact aliases. Reload
+                    # that real closure before later rows; an old active map must
+                    # never re-verify a source just withdrawn by the same batch.
+                    affected = equivalent_keys(db, [key])
+                    changed = _material_inputs(
+                        db,
+                        [item for item in materials if item["source_key"] in affected],
+                        verified=True,
+                    )
+                    for affected_key in affected:
+                        local["sources"].pop(affected_key, None)
+                    local["sources"].update(changed["sources"])
+                    local["bindings"].update(changed["bindings"])
+                    local["suppressed"].difference_update(affected)
+                    local["suppressed"].update(changed["suppressed"])
+                    local["verified"].update(changed["verified"])
                 continue
             source = dict(
                 kind="observation",
@@ -336,17 +426,28 @@ def apply(service, db, observations):
                     "INSERT INTO sources VALUES (?,1,1,'active',?,'real',?)",
                     (key, canonical(scope), canonical(source)),
                 )
+                local["sources"][key] = dict(
+                    key=key,
+                    revision=1,
+                    epoch=1,
+                    state="active",
+                    scope=canonical(scope),
+                    reality="real",
+                    payload=canonical(source),
+                )
             else:
                 require(
                     old["scope"] == canonical(scope) and old["payload"] == canonical(source),
                     "scope_changed",
                     409,
                 )
-            if suppressed is None and (old is None or old["state"] == "active"):
-                db.execute(
-                    "UPDATE memory_materials SET verified=1 WHERE id=? AND verified!=1",
-                    (material["id"],),
-                )
+            if key not in local["suppressed"] and (old is None or old["state"] == "active"):
+                if local["verified"].get(material["id"]) not in (None, 1):
+                    db.execute(
+                        "UPDATE memory_materials SET verified=1 WHERE id=? AND verified!=1",
+                        (material["id"],),
+                    )
+                    local["verified"][material["id"]] = 1
 
 
 def current(service, db, material):
@@ -355,34 +456,9 @@ def current(service, db, material):
 
 def current_many(service, db, materials):
     """The material predicates over one bounded transaction-local input batch."""
-    bindings, sources, suppressed = {}, {}, set()
-    payloads = {material["id"]: json.loads(material["payload"]) for material in materials}
-    accounts = list(
-        {canonical(value["member"]["speaker"]["account"]) for value in payloads.values()}
-    )
-    keys = list({material["source_key"] for material in materials})
-    for start in range(0, len(accounts), 256):
-        page = accounts[start : start + 256]
-        bindings.update(
-            (row["account_key"], row)
-            for row in db.execute(
-                "SELECT * FROM accounts WHERE account_key IN (" + ",".join("?" for _ in page) + ")",
-                page,
-            )
-        )
-    for start in range(0, len(keys), 256):
-        page = keys[start : start + 256]
-        marks = ",".join("?" for _ in page)
-        sources.update(
-            (row["key"], row)
-            for row in db.execute("SELECT * FROM sources WHERE key IN (" + marks + ")", page)
-        )
-        suppressed.update(
-            row[0]
-            for row in db.execute(
-                "SELECT source_key FROM suppression WHERE source_key IN (" + marks + ")", page
-            )
-        )
+    local = _material_inputs(db, materials)
+    bindings, sources, suppressed = (local[key] for key in ("bindings", "sources", "suppressed"))
+    payloads = local["payloads"]
     result = set()
     for material in materials:
         payload = payloads[material["id"]]

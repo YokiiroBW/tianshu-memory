@@ -7,7 +7,7 @@ from jsonschema import ValidationError
 
 from . import consolidation_sources, segment_sources
 from .domain import Fault, canonical, fingerprint, parse_time, require, utc
-from .memory_documents import capture
+from .memory_documents import capture, capture_sources
 from .segment_migration import installed
 
 
@@ -144,7 +144,7 @@ class SegmentMaterials:
         for window in windows:
             consolidation_sources.validate_window(window, scope, service.contracts)
         require(self.read_content is not None, "dependency_unavailable", 503)
-        content = self.read_content(event, retain_originals=True, with_metadata=True)
+        content = self.read_content(event, with_metadata=True)
         archive_materials = self._canonical_materials(event, content, publisher)
         conflict = False
         with service.operation(
@@ -154,6 +154,7 @@ class SegmentMaterials:
             material_ids=[row["id"] for row in archive_materials.values()],
         ) as db:
             sources = service._source_rows(db, event["sources"], scope, reality=event["reality"])
+            capture_sources(service, db, event, content, sources)
             result = []
             for index, (source, row, body) in enumerate(
                 zip(event["sources"], sources, content, strict=True)
