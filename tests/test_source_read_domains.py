@@ -103,9 +103,10 @@ def test_same_room_collection_keeps_all_owners_raw_checks_and_windows_at_each_ch
     assert {canonical(item) for item in observed["selectors"]} == expected_selectors
     assert set(observed["turn_ids"]) == expected_turns
     assert reads["windows"] == [expected_windows]
-    # One union collection, one fresh primary read and the unchanged commit CAS read.
-    assert len(reads["coverage"]) == 3
-    assert len(reads["stored"]) == 1
+    # Signed context + exact raw checks prove the complete selected windows,
+    # without borrowing a full-domain coverage or historical-window scan.
+    assert reads["coverage"] == []
+    assert reads["stored"] == []
     assert source_calls(sync) == ["snapshot", "current", "head"]
 
     # Same room/owner is not permission to omit a later check's independent source.

@@ -144,6 +144,73 @@ class SourceAuthority:
         access = self.transport.current(request)
         return request, access
 
+    def _selected_plan(self, service, db, scope, read_plan):
+        """Rebuild one internal proof plan inside both original CAS transactions."""
+        extra_selectors = read_plan["source_selectors"]
+        keys = {fingerprint(item) for item in extra_selectors}
+        selectors = {canonical(item): item for item in extra_selectors}
+        materials, manifests = {}, {}
+        for selection in read_plan["selected"]:
+            required, saved = summary_sources.selected_dependencies(service, db, selection)
+            keys.update(required)
+            manifests.update((item["window_id"], item) for item in saved)
+        checked_windows = set()
+        while True:
+            unchecked = [
+                item for identity, item in manifests.items() if identity not in checked_windows
+            ]
+            for manifest in unchecked:
+                required, saved = summary_sources.selected_dependencies(
+                    service,
+                    db,
+                    dict(
+                        scope=manifest["scope"],
+                        group_ids=[],
+                        episode_ids=[],
+                        source_keys=[],
+                        windows=[manifest],
+                    ),
+                )
+                keys.update(required)
+                manifests.update((item["window_id"], item) for item in saved)
+                checked_windows.add(manifest["window_id"])
+            keys = segment_sources.equivalent_keys(db, keys)
+            for material in segment_sources.collect(
+                db,
+                scope,
+                material_ids=read_plan["material_ids"],
+                source_keys=keys,
+                required_only=True,
+            ):
+                materials[material["id"]] = material
+            material_checks, saved = segment_sources.requirements(materials.values())
+            new_windows = {item["window_id"]: item for item in saved}
+            manifests.update(new_windows)
+            if set(manifests) <= checked_windows:
+                break
+        ordered_keys = sorted(keys)
+        for start in range(0, len(ordered_keys), 256):
+            page = ordered_keys[start : start + 256]
+            for row in db.execute(
+                "SELECT selector FROM source_admissions WHERE key IN ("
+                + ",".join("?" for _ in page)
+                + ")",
+                page,
+            ):
+                selectors[row[0]] = json.loads(row[0])
+        for check in material_checks:
+            for source in check["sources"]:
+                selected = source_selector(source, check["scope"])
+                selectors[canonical(selected)] = selected
+        for selected in summary_sources.selectors(service, db, manifests.values()):
+            selectors[canonical(selected)] = selected
+        result = dict(
+            selectors=[selectors[key] for key in sorted(selectors)],
+            materials=[materials[key] for key in sorted(materials)],
+            windows=[manifests[key] for key in sorted(manifests)],
+        )
+        return result, fingerprint(result)
+
     def barrier(
         self,
         service,
@@ -161,6 +228,7 @@ class SourceAuthority:
         source_checks=(),
         material_ids=(),
         dependency_keys=(),
+        read_plan=None,
     ):
         require(
             not group_read
@@ -178,49 +246,80 @@ class SourceAuthority:
         for _ in range(3):
             with service.store.transaction() as db:
                 m0 = self.revision(db)
-                window_keys = [
-                    item["source_key"]
-                    for manifest in windows
-                    for item in summary_sources.source_dependencies(manifest)
-                ]
-                materials = segment_sources.collect(
-                    db,
-                    scope,
-                    summary_scopes,
-                    material_ids=material_ids,
-                    source_keys=(*dependency_keys, *window_keys),
-                    group_read=group_read,
-                    profile=profile,
-                )
-                material_checks, material_windows = segment_sources.requirements(materials)
-                material_selectors = [
-                    source_selector(source, item["scope"])
-                    for item in material_checks
-                    for source in item["sources"]
-                ]
-                stored, window_domains = [], set()
-                for owner, shared in ((scope, group_read), *summary_scopes):
-                    domain = self._read_domain(owner, group_read=shared)
-                    if domain in window_domains:
-                        continue
-                    stored.extend(summary_sources.stored_windows(db, owner, group_read=shared))
-                    window_domains.add(domain)
-                all_windows = {
-                    item["window_id"]: item for item in (*stored, *windows, *material_windows)
-                }
-                summary_selectors = summary_sources.selectors(service, db, all_windows.values())
-                selectors = self.coverage(db, scope, sources, profile, group_read)
-                selectors = list(
-                    {
-                        canonical(value): value
-                        for value in (
-                            *selectors,
-                            *extra_selectors,
-                            *summary_selectors,
-                            *material_selectors,
+                planned = None
+                if read_plan is not None:
+                    planned, plan_digest = self._selected_plan(service, db, scope, read_plan)
+                if read_plan is not None and not read_plan["full_read"]:
+                    materials = planned["materials"]
+                    all_windows = {item["window_id"]: item for item in planned["windows"]}
+                    selectors = planned["selectors"]
+                    material_checks, _ = segment_sources.requirements(materials)
+                    summary_selectors = material_selectors = []
+                else:
+                    window_keys = [
+                        item["source_key"]
+                        for manifest in windows
+                        for item in summary_sources.source_dependencies(manifest)
+                    ]
+                    materials = segment_sources.collect(
+                        db,
+                        scope,
+                        summary_scopes,
+                        material_ids=material_ids,
+                        source_keys=(*dependency_keys, *window_keys),
+                        group_read=group_read,
+                        profile=profile,
+                    )
+                    material_checks, material_windows = segment_sources.requirements(materials)
+                    material_selectors = [
+                        source_selector(source, item["scope"])
+                        for item in material_checks
+                        for source in item["sources"]
+                    ]
+                    stored, window_domains = [], set()
+                    for owner, shared in ((scope, group_read), *summary_scopes):
+                        domain = self._read_domain(owner, group_read=shared)
+                        if domain in window_domains:
+                            continue
+                        stored.extend(summary_sources.stored_windows(db, owner, group_read=shared))
+                        window_domains.add(domain)
+                    all_windows = {
+                        item["window_id"]: item for item in (*stored, *windows, *material_windows)
+                    }
+                    summary_selectors = summary_sources.selectors(service, db, all_windows.values())
+                    selectors = self.coverage(db, scope, sources, profile, group_read)
+                    selectors = list(
+                        {
+                            canonical(value): value
+                            for value in (
+                                *selectors,
+                                *extra_selectors,
+                                *summary_selectors,
+                                *material_selectors,
+                            )
+                        }.values()
+                    )
+                    if planned is not None:
+                        materials = list(
+                            {
+                                item["id"]: item for item in (*materials, *planned["materials"])
+                            }.values()
                         )
-                    }.values()
-                )
+                        selected_checks, _ = segment_sources.requirements(planned["materials"])
+                        material_checks = list(
+                            {
+                                canonical(item): item
+                                for item in (*material_checks, *selected_checks)
+                            }.values()
+                        )
+                        all_windows.update((item["window_id"], item) for item in planned["windows"])
+                        summary_selectors = [*summary_selectors, *planned["selectors"]]
+                        selectors = list(
+                            {
+                                canonical(item): item
+                                for item in (*selectors, *planned["selectors"])
+                            }.values()
+                        )
                 if context is not None:
                     service._authorize(db, context, scope=scope)
             turn_ids = list(
@@ -326,6 +425,8 @@ class SourceAuthority:
                         profile=profile,
                         group_read=group_read,
                         extra_selectors=(*extra_selectors, *summary_selectors, *material_selectors),
+                        read_plan=read_plan,
+                        plan_digest=plan_digest if read_plan is not None else None,
                     )
                 else:
                     result = self.sync_batches(
@@ -343,6 +444,8 @@ class SourceAuthority:
                         profile=profile,
                         group_read=group_read,
                         extra_selectors=(*extra_selectors, *summary_selectors, *material_selectors),
+                        read_plan=read_plan,
+                        plan_digest=plan_digest if read_plan is not None else None,
                     )
             except LocalRevisionChanged:
                 continue
@@ -455,6 +558,8 @@ class SourceAuthority:
         profile=False,
         group_read=False,
         extra_selectors=(),
+        read_plan=None,
+        plan_digest=None,
     ):
         """Trusted source-sync port. m0 and scope are local state, never wire authority."""
         self.contracts.validate("sync-workflow#sync_input", observation)
@@ -467,6 +572,8 @@ class SourceAuthority:
             profile=profile,
             group_read=group_read,
             extra_selectors=extra_selectors,
+            read_plan=read_plan,
+            plan_digest=plan_digest,
         )
 
     def sync_batches(
@@ -480,6 +587,8 @@ class SourceAuthority:
         profile=False,
         group_read=False,
         extra_selectors=(),
+        read_plan=None,
+        plan_digest=None,
     ):
         self.contracts.validate("sync-batch#barrier", observation)
         try:
@@ -495,6 +604,8 @@ class SourceAuthority:
             profile=profile,
             group_read=group_read,
             extra_selectors=extra_selectors,
+            read_plan=read_plan,
+            plan_digest=plan_digest,
         )
 
     def _commit_observations(
@@ -508,6 +619,8 @@ class SourceAuthority:
         profile,
         group_read=False,
         extra_selectors=(),
+        read_plan=None,
+        plan_digest=None,
     ):
         for observation in observations:
             self._relations("sync_barrier", dict(observation, now=utc(service.clock())))
@@ -521,20 +634,24 @@ class SourceAuthority:
             first["access"], grants=[g for item in observations for g in item["access"]["grants"]]
         )
         with service.store.transaction() as db:
-            if (
-                self.revision(db) != m0
-                or sorted(
-                    {
-                        canonical(value): value
-                        for value in (
-                            *self.coverage(db, scope, sources, profile, group_read),
-                            *extra_selectors,
-                        )
-                    }.values(),
-                    key=canonical,
-                )
-                != selectors
-            ):
+            if self.revision(db) != m0:
+                raise LocalRevisionChanged()
+            if read_plan is not None:
+                planned, current_digest = self._selected_plan(service, db, scope, read_plan)
+                if current_digest != plan_digest or (
+                    not read_plan["full_read"] and planned["selectors"] != selectors
+                ):
+                    raise LocalRevisionChanged()
+            if (read_plan is None or read_plan["full_read"]) and sorted(
+                {
+                    canonical(value): value
+                    for value in (
+                        *self.coverage(db, scope, sources, profile, group_read),
+                        *extra_selectors,
+                    )
+                }.values(),
+                key=canonical,
+            ) != selectors:
                 raise LocalRevisionChanged()
             viewer = access["viewer_context"]
             if viewer is not None:
@@ -598,6 +715,7 @@ class SourceAuthority:
                         "source_checks",
                         "material_ids",
                         "dependency_keys",
+                        "read_plan",
                     )
                 ),
                 "dependency_unavailable",
@@ -626,19 +744,34 @@ class SourceAuthority:
         )
         with self._operation_order.turn(), source_read_lock(self._operation_lock):
             begin_source_read()
-            selectors, domains, source_checks, read_domains = {}, set(), [], set()
+            selectors, exact_selectors, domains, source_checks, read_domains = (
+                {},
+                {},
+                set(),
+                [],
+                set(),
+            )
             dependency_keys, material_ids = set(), set()
+            # A legacy/full component keeps the entire bundle on the original
+            # full path, including its durable per-window negative handling.
+            full_read = any(not item.get("selected_only") for item in requirements)
+            selected_plans = {}
             with service.store.transaction() as db:
                 for item in requirements:
                     scope = item["scope"]
                     dependency_keys.update(item.get("dependency_keys", ()))
                     material_ids.update(item.get("material_ids", ()))
+                    if full_read and item.get("selected") is not None:
+                        dependency_keys.update(item["selected"]["source_keys"])
                     if item.get("context") is not None:
                         service._authorize(db, item["context"], scope=scope)
                     profile, shared = bool(item.get("profile")), bool(item.get("group_read"))
-                    domains.add((canonical(scope), profile, shared))
+                    if item.get("selected") is not None:
+                        selected_plans[canonical(item["selected"])] = item["selected"]
+                    if full_read:
+                        domains.add((canonical(scope), profile, shared))
                     domain = self._read_domain(scope, profile=profile, group_read=shared)
-                    if domain not in read_domains:
+                    if full_read and domain not in read_domains:
                         for selected in self.coverage(db, scope, (), profile, shared):
                             selectors[canonical(selected)] = selected
                         read_domains.add(domain)
@@ -648,7 +781,18 @@ class SourceAuthority:
                         for source in check["sources"]:
                             selected = source_selector(source, scope)
                             selectors[canonical(selected)] = selected
+                            exact_selectors[canonical(selected)] = selected
             primary = requirements[0]
+            read_plan = (
+                dict(
+                    selected=list(selected_plans.values()),
+                    source_selectors=list(exact_selectors.values()),
+                    material_ids=sorted(material_ids),
+                    full_read=full_read,
+                )
+                if selected_plans
+                else None
+            )
             with self._operation(
                 service,
                 primary["scope"],
@@ -662,6 +806,7 @@ class SourceAuthority:
                 source_checks=source_checks,
                 dependency_keys=dependency_keys,
                 material_ids=material_ids,
+                read_plan=read_plan,
             ) as db:
                 self._bundled.active = {"service": service, "domains": domains, "db": db}
                 try:

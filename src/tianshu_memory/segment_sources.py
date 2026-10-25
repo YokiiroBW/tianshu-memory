@@ -38,6 +38,7 @@ def collect(
     source_keys=(),
     group_read=False,
     profile=False,
+    required_only=False,
 ):
     if not installed(db):
         return []
@@ -46,7 +47,7 @@ def collect(
     # archive or every material ever accepted in a room. Historical raw episodes
     # are added explicitly by the v2 reader's existing material selection.
     domains = set()
-    for owner, shared in ((scope, group_read), *summary_scopes):
+    for owner, shared in () if required_only else ((scope, group_read), *summary_scopes):
         if shared:
             predicate = "json_extract(g.scope,'$.actor_id')=? AND json_extract(g.scope,'$.audience')='group' AND json_extract(g.scope,'$.conversation_id')=?"
             parameters = (owner["actor_id"], owner["conversation_id"])
@@ -66,7 +67,7 @@ def collect(
                     parameters,
                 )
             )
-    if profile:
+    if profile and not required_only:
         required.update(
             row[0]
             for row in db.execute(

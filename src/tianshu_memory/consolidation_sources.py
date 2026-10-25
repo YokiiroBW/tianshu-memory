@@ -283,6 +283,117 @@ def stored_windows(db, scope, *, group_read=False):
     return list(manifests.values())
 
 
+def selected_dependencies(service, db, selection):
+    """Current local proof obligations for a signed selection, not a new selection.
+
+    Keep the originally signed sources as well as current DB edges. A changed
+    record is rejected by the final evidence verifier; it must never introduce
+    a source or inherited window that this checkpoint did not prove.
+    """
+    from .domain import require_selection
+    from .memory_migration import installed as documents_installed
+    from .segment_sources import equivalent_keys
+
+    scope = selection["scope"]
+    if not any(
+        selection.get(key) for key in ("source_keys", "group_ids", "episode_ids", "windows")
+    ):
+        return set(), []
+    allowed = permitted_scopes(service, db, scope)
+    keys = set(selection["source_keys"])
+    episode_ids = set(selection["episode_ids"])
+    pending, seen, windows = set(selection["group_ids"]), set(), {}
+
+    def include_window(window):
+        windows[window["window_id"]] = window
+        keys.update(dep["source_key"] for dep in source_dependencies(window))
+        keys.update(
+            service.source_identity(source, owner) for source, owner, _ in human_sources(window)
+        )
+        for member in window["members"]:
+            dependencies = member["memory_dependencies"]
+            pending.update(
+                dep["group"]["semantic_group_id"]
+                for dep in dependencies["group_dependencies"]
+                if dep["group"]["semantic_group_id"] not in seen
+            )
+            episode_ids.update(dep["episode_id"] for dep in dependencies["episode_dependencies"])
+
+    for window in selection.get("windows", []):
+        include_window(window)
+    while pending:
+        page = sorted(pending)[:256]
+        pending.difference_update(page)
+        seen.update(page)
+        marks = ",".join("?" for _ in page)
+        groups = db.execute("SELECT id,scope FROM groups WHERE id IN (" + marks + ")", page)
+        found = set()
+        for group in groups:
+            found.add(group["id"])
+            require_selection(permits(scope, json.loads(group["scope"]), allowed))
+        require_selection(found == set(page))
+        keys.update(
+            row[0]
+            for row in db.execute(
+                "SELECT source_key FROM lineage WHERE group_id IN (" + marks + ")", page
+            )
+        )
+        if not installed(db):
+            continue
+        keys.update(
+            row[0]
+            for row in db.execute(
+                "SELECT source_key FROM memory_summary_sources WHERE group_id IN (" + marks + ")",
+                page,
+            )
+        )
+        for summary in metadata(db, page).values():
+            manifest = json.loads(summary["manifest"])
+            inherited = (
+                [item["manifest"] for item in manifest["context_windows"]]
+                if manifest.get("schema_version") == 6
+                else [manifest]
+            )
+            for window in inherited:
+                include_window(window)
+            refs = json.loads(summary["summary_refs"])
+            for start in range(0, len(refs), 256):
+                ids = [ref["record_id"] for ref in refs[start : start + 256]]
+                rows = db.execute(
+                    "SELECT id,group_id FROM records WHERE id IN ("
+                    + ",".join("?" for _ in ids)
+                    + ")",
+                    ids,
+                ).fetchall()
+                require_selection({row["id"] for row in rows} == set(ids))
+                pending.update(row["group_id"] for row in rows if row["group_id"] not in seen)
+    episodes = sorted(episode_ids)
+    if episodes:
+        require_selection(documents_installed(db))
+    for start in range(0, len(episodes), 256):
+        ids = episodes[start : start + 256]
+        rows = db.execute(
+            "SELECT id,scope,source_key FROM memory_documents WHERE kind='episode' AND id IN ("
+            + ",".join("?" for _ in ids)
+            + ")",
+            ids,
+        ).fetchall()
+        require_selection({row["id"] for row in rows} == set(ids))
+        for row in rows:
+            require_selection(permits(scope, json.loads(row["scope"]), allowed))
+            keys.add(row["source_key"])
+    keys = equivalent_keys(db, keys)
+    for start in range(0, len(keys), 256):
+        page = sorted(keys)[start : start + 256]
+        rows = db.execute(
+            "SELECT key,scope FROM sources WHERE key IN (" + ",".join("?" for _ in page) + ")",
+            page,
+        ).fetchall()
+        require_selection({row["key"] for row in rows} == set(page))
+        require_selection(all(permits(scope, json.loads(row["scope"]), allowed) for row in rows))
+    return keys, list(windows.values())
+
+
 def window_current(service, db, manifest, *, allowed=None, snapshot=None):
     """Known dependency changes are false; configuration and storage faults still raise."""
     allowed = permitted_scopes(service, db, manifest["scope"]) if allowed is None else allowed

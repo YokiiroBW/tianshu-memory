@@ -50,8 +50,14 @@ def invalid(request, error, check_id=None):
 
 
 def domains(items):
+    full = any(not item.get("selected_only") for item in items)
     return {
-        (canonical(item["scope"]), bool(item.get("profile")), bool(item.get("group_read")))
+        (
+            canonical(item["scope"]),
+            bool(item.get("profile")),
+            bool(item.get("group_read")),
+            "full" if full else "selected",
+        )
         for item in items
     }
 
@@ -65,6 +71,15 @@ def component_key(check):
 
 
 def execute(application, request, context, contexts):
+    # A signed selection can now fail while its exact proof is being planned,
+    # before entering the shared transaction. Keep the same primary outcome.
+    try:
+        return _execute(application, request, context, contexts)
+    except SelectionChanged as error:
+        return invalid(request, error)
+
+
+def _execute(application, request, context, contexts):
     required = catalog(request)
     service, rejected = application.service, {}
     pairs = list(zip(request["checks"], contexts, strict=True))

@@ -70,6 +70,19 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
     result = []
     with service.store.transaction() if db is None else nullcontext(db) as db:
         service._authorize(db, context, scope=scope)
+        selected = None
+        bundle = request.get("bundle")
+        if service.synchronized and bundle is not None and contextual(bundle):
+            require_selection(bundle["effective_scope"] == scope)
+            verify_selection_proof(db, bundle)
+            selected = dict(
+                scope=scope,
+                group_ids=[
+                    item["group"]["semantic_group_id"] for item in bundle["group_dependencies"]
+                ],
+                episode_ids=[item["episode_id"] for item in bundle["episode_dependencies"]],
+                source_keys=[item["source_key"] for item in bundle["source_dependencies"]],
+            )
         allowed = authorized_scopes(
             service,
             db,
@@ -80,7 +93,7 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
         )
         permitted = {canonical(item[0]) for item in allowed}
 
-        def add(target, resolved=None, profile=False, *, into=result):
+        def add(target, resolved=None, profile=False, *, into=result, selection=None):
             same_room = (
                 scope["audience"] == target["audience"] == "group"
                 and target["actor_id"] == scope["actor_id"]
@@ -95,7 +108,10 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
                     group_read=not profile and group_read(service, target),
                 )
             )
-            if not profile and ("queries" in request or "bundle" in request):
+            if selection is not None:
+                into[-1]["selected"] = selection
+                into[-1]["selected_only"] = True
+            if selection is None and not profile and ("queries" in request or "bundle" in request):
                 bundle = request.get("bundle")
                 if bundle is not None:
                     into[-1]["dependency_keys"] = [
@@ -128,9 +144,16 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
                         )
                     )
 
-        add(scope, context)
+        add(scope, context, selection=selected)
         for other, _, _ in allowed[1:]:
-            add(other)
+            add(
+                other,
+                selection=(
+                    dict(scope=other, group_ids=[], episode_ids=[], source_keys=[])
+                    if selected is not None
+                    else None
+                ),
+            )
         for check, resolved in legacy:
             raw = check["kind"] == "input_sources"
             if raw:
@@ -152,6 +175,11 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
                     resolved if rejected is None else None,
                     profile=check["kind"] == "profile",
                     into=pending,
+                    selection=(
+                        dict(scope=target, group_ids=[], episode_ids=[], source_keys=[])
+                        if raw and selected is not None
+                        else None
+                    ),
                 )
                 if raw:
                     pending[-1]["source_checks"] = [payload["source_check"]]
@@ -163,8 +191,25 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
                 if covered is not None:
                     require_dependency(
                         all(
-                            (canonical(item["scope"]), item["profile"], item["group_read"])
-                            in covered
+                            (
+                                (
+                                    canonical(item["scope"]),
+                                    item["profile"],
+                                    item["group_read"],
+                                    "full",
+                                )
+                                in covered
+                                or (
+                                    item.get("selected_only")
+                                    and (
+                                        canonical(item["scope"]),
+                                        item["profile"],
+                                        item["group_read"],
+                                        "selected",
+                                    )
+                                    in covered
+                                )
+                            )
                             for item in pending
                         )
                     )
@@ -182,7 +227,18 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
             key = (canonical(item["scope"]), item["profile"], item["group_read"])
             if key not in unique:
                 unique[key] = item
-            elif item.get("source_checks"):
+            else:
+                if not item.get("selected_only") or not unique[key].get("selected_only"):
+                    unique[key].pop("selected_only", None)
+                if "selected" in item:
+                    if "selected" not in unique[key]:
+                        unique[key]["selected"] = item["selected"]
+                    else:
+                        for field in ("group_ids", "episode_ids", "source_keys"):
+                            unique[key]["selected"][field] = sorted(
+                                set(unique[key]["selected"][field]) | set(item["selected"][field])
+                            )
+            if item.get("source_checks") and unique[key] is not item:
                 unique[key].setdefault("source_checks", []).extend(item["source_checks"])
             if item.get("dependency_keys") and unique[key] is not item:
                 unique[key].setdefault("dependency_keys", []).extend(item["dependency_keys"])
