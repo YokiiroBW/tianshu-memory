@@ -172,7 +172,12 @@ def submit(h, prepared, summary, *, portrait=None, importance="normal"):
         job_ids=prepared["job_ids"],
         batch_ref=prepared["batch_ref"],
         extraction_schema=5,
-        output=dict(summary=summary, portrait=portrait, importance=importance),
+        output=dict(
+            subject_person_id=prepared["subject_person_id"],
+            summary=summary,
+            portrait=portrait,
+            importance=importance,
+        ),
     )
     response = h.post(PATH, body)
     assert response.status_code == 200, response.text
@@ -557,7 +562,7 @@ def test_context_forget_before_commit_rejects_the_late_derived_write(sync):
         job_ids=[new],
         batch_ref=prepared["batch_ref"],
         extraction_schema=5,
-        output=dict(summary="保留被忘记的河边经历", portrait=None),
+        output=dict(subject_person_id=sync.person, summary="保留被忘记的河边经历", portrait=None),
     )
     response = sync.post(PATH, body)
     assert response.status_code == 200 and response.json()["state"] == "invalidated", response.text
@@ -577,7 +582,7 @@ def test_owner_failures_do_not_return_saved_or_advance_the_cursor(sync):
             job_ids=[job],
             batch_ref=prepared["batch_ref"],
             extraction_schema=5,
-            output=dict(summary="散步经历。", portrait=None),
+            output=dict(subject_person_id=sync.person, summary="散步经历。", portrait=None),
         ),
     )
     assert response.status_code == 503, response.text
@@ -687,7 +692,7 @@ def test_late_store_failure_rolls_back_all_summary_and_job_receipts(sync, monkey
         job_ids=jobs,
         batch_ref=prepared["batch_ref"],
         extraction_schema=5,
-        output=dict(summary="讨论过散步。", portrait=None),
+        output=dict(subject_person_id=sync.person, summary="讨论过散步。", portrait=None),
     )
     response = sync.post(PATH, body)
     assert response.status_code == 503, response.text

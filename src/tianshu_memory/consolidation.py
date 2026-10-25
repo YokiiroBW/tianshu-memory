@@ -21,10 +21,24 @@ def record_refs(db, group_id):
     ]
 
 
+def bound_portrait(batch, scope):
+    """The existing JSON column binds new batches without rewriting old inputs."""
+    value = json.loads(batch["portrait_input"])
+    if not isinstance(value, dict) or "input" not in value:
+        return False, None
+    require(
+        set(value) == {"subject_person_id", "input"}
+        and value["subject_person_id"] == scope["person_id"],
+        "scope_changed",
+        409,
+    )
+    return True, value["input"]
+
+
 def portrait_input(service, db, scope, window_sources):
     encoded = canonical(scope)
     pointer = db.execute("SELECT * FROM memory_portraits WHERE scope=?", (encoded,)).fetchone()
-    inherited, refs, current_text = {}, {}, ""
+    inherited, refs, summaries, current_text = {}, {}, [], ""
     used = set(window_sources)
 
     def fits(group_id):
@@ -40,17 +54,40 @@ def portrait_input(service, db, scope, window_sources):
         return True
 
     for row in db.execute(
-        "SELECT s.group_id FROM memory_summaries s JOIN groups g ON g.id=s.group_id WHERE s.scope=? AND s.kind='summary' AND g.state='active' ORDER BY s.recorded_at DESC,s.group_id LIMIT 16",
+        "SELECT s.group_id,s.manifest FROM memory_summaries s JOIN groups g ON g.id=s.group_id WHERE s.scope=? AND s.kind='summary' AND g.state='active' ORDER BY s.recorded_at DESC,s.group_id LIMIT 16",
         (encoded,),
     ):
-        if service._group_current(db, row[0]) and fits(row[0]):
-            for ref in record_refs(db, row[0]):
-                refs[canonical(ref)] = ref
+        if not service._group_current(db, row["group_id"]):
+            continue
+        material = dependencies.subject_material(service, db, json.loads(row["manifest"]), scope)
+        if material is None or not fits(row["group_id"]):
+            continue
+        for ref in record_refs(db, row["group_id"]):
+            refs[canonical(ref)] = ref
+            summaries.append(
+                dict(ref, subject_person_id=scope["person_id"], subject_material=material)
+            )
     if not refs:
         return None, []
     # The old portrait is an optional whole input. Never trim leaves from text
     # already supplied to the model; rebuild from recent whole summaries instead.
-    if pointer and service._group_current(db, pointer["group_id"]) and fits(pointer["group_id"]):
+    prior_batch = (
+        db.execute(
+            "SELECT b.*,j.event AS batch_event FROM memory_summaries s JOIN memory_batches b ON b.window_id=s.window_id "
+            "JOIN jobs j ON j.id=b.job_id WHERE s.group_id=? AND s.scope=?",
+            (pointer["group_id"], encoded),
+        ).fetchone()
+        if pointer
+        else None
+    )
+    if (
+        pointer
+        and prior_batch is not None
+        and json.loads(prior_batch["batch_event"])["scope"] == scope
+        and bound_portrait(prior_batch, scope)[0]
+        and service._group_current(db, pointer["group_id"])
+        and fits(pointer["group_id"])
+    ):
         prior = db.execute(
             "SELECT summary_refs FROM memory_summaries WHERE group_id=?", (pointer["group_id"],)
         ).fetchone()
@@ -62,7 +99,6 @@ def portrait_input(service, db, scope, window_sources):
                 (pointer["group_id"],),
             )
         )
-    summaries = []
     for ref in refs.values():
         row = db.execute(
             "SELECT payload,version,state FROM records WHERE id=?", (ref["record_id"],)
@@ -74,9 +110,9 @@ def portrait_input(service, db, scope, window_sources):
             "scope_changed",
             409,
         )
-        summaries.append(dict(ref, text=json.loads(row["payload"])["statement"]))
     inherited.update(refs)
     return dict(
+        subject_person_id=scope["person_id"],
         expected_revision=pointer["revision"] if pointer else 0,
         summary_refs=list(refs.values()),
         summaries=summaries,
@@ -106,7 +142,7 @@ class Consolidation:
         return dict(row), event
 
     @staticmethod
-    def _completed(db, batch):
+    def _completed(db, batch, scope):
         old = db.execute(
             "SELECT result FROM write_ledger WHERE job_id=?", (batch["job_id"],)
         ).fetchone()
@@ -116,8 +152,24 @@ class Consolidation:
                 extraction_schema=5,
                 batch_ref=batch["id"],
                 job_ids=[batch["job_id"]],
-                result=json.loads(old[0]),
+                result=dict(json.loads(old[0]), subject_person_id=scope["person_id"]),
             )
+
+    def _retire_unbound(self, db, job, batch, scope):
+        if bound_portrait(batch, scope)[0]:
+            return False
+        if job["state"] == "pending":
+            db.execute("UPDATE jobs SET state='scope_changed' WHERE id=?", (job["id"],))
+            self.service._emit(
+                db,
+                "memory.candidate_invalidated",
+                dict(candidate_job_ref=job["id"], state="scope_changed"),
+            )
+        return True
+
+    @staticmethod
+    def _invalidated(job_id):
+        return dict(state="invalidated", extraction_schema=5, job_ids=[job_id], result=None)
 
     def execute(self, request, publisher):
         service = self.service
@@ -130,7 +182,7 @@ class Consolidation:
             if batch is not None:
                 if request["output"] is not None:
                     require(request["batch_ref"] == batch["id"], "idempotency_conflict", 409)
-                old = self._completed(db, batch)
+                old = self._completed(db, batch, event["scope"])
                 if old is not None:
                     if request["output"] is not None:
                         saved = db.execute(
@@ -141,13 +193,10 @@ class Consolidation:
                             saved[0] == fingerprint(request["output"]), "idempotency_conflict", 409
                         )
                     return old
+                if self._retire_unbound(db, job, batch, event["scope"]):
+                    return self._invalidated(job["id"])
             if job["state"] != "pending":
-                return dict(
-                    state="invalidated",
-                    extraction_schema=5,
-                    job_ids=request["job_ids"],
-                    result=None,
-                )
+                return self._invalidated(job["id"])
             if job.get("extraction_schema") is None:
                 db.execute("UPDATE jobs SET extraction_schema=5 WHERE id=?", (job["id"],))
             if batch is None and request["output"] is None and request["window"] is None:
@@ -250,9 +299,11 @@ class Consolidation:
                 "SELECT * FROM memory_batches WHERE job_id=?", (job["id"],)
             ).fetchone()
             if current is not None:
-                old = self._completed(db, current)
+                old = self._completed(db, current, scope)
                 if old is not None:
                     return old
+                if self._retire_unbound(db, job, current, scope):
+                    return self._invalidated(job["id"])
                 require(current["manifest"] == canonical(manifest), "idempotency_conflict", 409)
                 batch = dict(current)
             require(job["state"] == "pending", "scope_changed", 409)
@@ -265,7 +316,9 @@ class Consolidation:
                     job_id=job["id"],
                     window_id=manifest["window_id"],
                     manifest=canonical(manifest),
-                    portrait_input=canonical(prepared),
+                    portrait_input=canonical(
+                        dict(subject_person_id=scope["person_id"], input=prepared)
+                    ),
                     portrait_basis=canonical(inherited),
                     recorded_at=utc(service.clock()),
                 )
@@ -273,13 +326,14 @@ class Consolidation:
                     "INSERT INTO memory_batches VALUES (?,?,?,?,?,?,?)", tuple(batch.values())
                 )
             else:
-                prepared = json.loads(batch["portrait_input"])
+                _, prepared = bound_portrait(batch, scope)
         return dict(
             state="pending",
             extraction_schema=5,
             batch_ref=batch["id"],
             job_ids=request["job_ids"],
             window_id=manifest["window_id"],
+            subject_person_id=scope["person_id"],
             portrait_input=prepared,
         )
 
@@ -358,18 +412,21 @@ class Consolidation:
     def _submit(self, request, publisher, event, batch):
         service = self.service
         scope, output = event["scope"], request["output"]
-        service.contracts.validate("memory-extraction#summary_output", output)
         manifest = json.loads(batch["manifest"])
         importance = output.get("importance", "normal")
         with service.operation(scope=scope, windows=[manifest]) as db:
             job, current_event = self._job(db, request, publisher)
-            old = self._completed(db, batch)
+            old = self._completed(db, batch, scope)
             if old:
                 saved = db.execute(
                     "SELECT digest FROM write_ledger WHERE job_id=?", (job["id"],)
                 ).fetchone()
                 require(saved[0] == fingerprint(output), "idempotency_conflict", 409)
                 return old
+            if self._retire_unbound(db, job, batch, scope):
+                return self._invalidated(job["id"])
+            service.contracts.validate("memory-extraction#summary_output", output)
+            require(output["subject_person_id"] == scope["person_id"], "invalid_input", 400)
             require(job["state"] == "pending", "scope_changed", 409)
             dependencies_map = dependencies.local_sources(service, db, manifest)
             source_rows = service._source_rows(
@@ -382,7 +439,7 @@ class Consolidation:
                 409,
             )
             source_map = {value["key"]: value for value in source_rows}
-            prepared = json.loads(batch["portrait_input"])
+            _, prepared = bound_portrait(batch, scope)
             basis_refs = json.loads(batch["portrait_basis"])
             for ref in basis_refs:
                 prior = db.execute(
@@ -463,6 +520,7 @@ class Consolidation:
                     ids.extend(new_ids)
                     portrait = dict(state="committed", record_refs=record_refs(db, group))
             result = dict(
+                subject_person_id=scope["person_id"],
                 state="committed" if groups else "skipped",
                 record_ids=ids,
                 group_ids=groups,

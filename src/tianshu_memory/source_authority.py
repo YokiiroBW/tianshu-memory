@@ -306,12 +306,9 @@ class SourceAuthority:
                         for item in observations
                         for turn in item["snapshot"]["turns"]
                     }
-                    failures = {
-                        identity: summary_sources.window_failure(
-                            service, db, manifest, current_turns, window_checks.get(identity)
-                        )
-                        for identity, manifest in all_windows.items()
-                    }
+                    failures = summary_sources.window_failures(
+                        service, db, all_windows.values(), current_turns, window_checks
+                    )
                     invalid = [
                         identity for identity, failure in failures.items() if failure is not None
                     ]

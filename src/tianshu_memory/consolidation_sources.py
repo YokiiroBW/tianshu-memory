@@ -156,6 +156,79 @@ def human_sources(manifest):
     return list(result.values())
 
 
+def subject_material(service, db, manifest, scope):
+    """Rebuild only this owner's human originals, never a mixed summary's prose."""
+    result, budget = [], 0
+    for member in manifest["members"]:
+        if (
+            member["role"] != "user"
+            or member["source_scope"] != scope
+            or member["speaker"]["kind"] != "person"
+            or member["speaker"]["person_id"] != scope["person_id"]
+        ):
+            continue
+        account = member["speaker"]["account"]
+        binding = service._binding(db, account)
+        if (
+            binding is None
+            or binding["person_id"] != scope["person_id"]
+            or binding["version"] != member["binding_version"]
+        ):
+            return None
+        source = member["reference"]["source"]
+        key = service.source_identity(source, scope)
+        row = db.execute(
+            "SELECT s.* FROM sources s JOIN source_admissions a ON a.key=s.key AND a.verified=1 "
+            "WHERE s.key=? AND NOT EXISTS (SELECT 1 FROM suppression w WHERE w.source_key=s.key)",
+            (key,),
+        ).fetchone()
+        if (
+            row is None
+            or row["scope"] != canonical(scope)
+            or row["state"] != "active"
+            or row["payload"] != canonical(source)
+            or row["revision"] != source["message_key"]["revision"]
+        ):
+            return None
+        body = bytearray()
+        for episode in db.execute(
+            "SELECT * FROM memory_documents WHERE kind='episode' AND source_key=? "
+            "AND source_revision=? AND source_epoch=? AND scope=? ORDER BY span_start,span_end,id",
+            (key, row["revision"], row["epoch"], canonical(scope)),
+        ):
+            part = episode["text"].encode("utf-8")
+            start, end = episode["span_start"], episode["span_end"]
+            if (
+                start < 0
+                or end != start + len(part)
+                or start > len(body)
+                or hashlib.sha256(episode["text"].encode("utf-8")).hexdigest()
+                != episode["content_hash"]
+                or bytes(body[start : min(end, len(body))]) != part[: max(0, len(body) - start)]
+            ):
+                return None
+            if end > len(body):
+                body.extend(part[len(body) - start :])
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if not text or hashlib.sha256(text.encode("utf-8")).hexdigest() != member["content_sha256"]:
+            return None
+        budget += len(text)
+        if budget > 6000:
+            return None
+        result.append(
+            dict(
+                member_id=member["member_id"],
+                speaker=member["speaker"],
+                observed_at=member["observed_at"],
+                text=text,
+            )
+        )
+    return result or None
+
+
 def source_dependencies(manifest):
     return [
         dep
@@ -198,29 +271,42 @@ def stored_windows(db, scope, *, group_read=False):
     return list(manifests.values())
 
 
-def window_current(service, db, manifest, *, allowed=None):
+def window_current(service, db, manifest, *, allowed=None, snapshot=None):
     """Known dependency changes are false; configuration and storage faults still raise."""
     allowed = permitted_scopes(service, db, manifest["scope"]) if allowed is None else allowed
     for source, scope, _ in human_sources(manifest):
         if not permits(manifest["scope"], scope, allowed):
             return False
-        row = db.execute(
-            "SELECT s.* FROM sources s JOIN source_admissions a ON a.key=s.key AND a.verified=1 WHERE s.key=?",
-            (service.source_identity(source, scope),),
-        ).fetchone()
+        key = service.source_identity(source, scope)
+        row = (
+            db.execute(
+                "SELECT s.* FROM sources s JOIN source_admissions a ON a.key=s.key AND a.verified=1 WHERE s.key=?",
+                (key,),
+            ).fetchone()
+            if snapshot is None
+            else snapshot.sources.get(key)
+        )
         if (
             row is None
             or row["scope"] != canonical(scope)
             or row["payload"] != canonical(source)
             or row["state"] != "active"
             or row["revision"] != source["message_key"]["revision"]
-            or db.execute("SELECT 1 FROM suppression WHERE source_key=?", (row["key"],)).fetchone()
+            or (
+                db.execute("SELECT 1 FROM suppression WHERE source_key=?", (row["key"],)).fetchone()
+                if snapshot is None
+                else row["suppressed"]
+            )
         ):
             return False
     for member in manifest["members"]:
         if member["role"] == "user":
             account = member["speaker"]["account"]
-            binding = service._binding(db, account)
+            binding = (
+                service._binding(db, account)
+                if snapshot is None
+                else snapshot.bindings.get(canonical(account))
+            )
             if (
                 binding is None
                 or binding["person_id"] != member["source_scope"]["person_id"]
@@ -234,32 +320,49 @@ def window_current(service, db, manifest, *, allowed=None):
         for dep in dependencies["source_dependencies"]:
             if not permits(manifest["scope"], dep["owner_scope"], allowed):
                 return False
-            row = db.execute(
-                "SELECT s.*,p.payload AS physical FROM sources s JOIN source_admissions a ON a.key=s.key AND a.verified=1 JOIN physical_sources p ON p.key=a.physical_key WHERE s.key=?",
-                (dep["source_key"],),
-            ).fetchone()
+            row = (
+                db.execute(
+                    "SELECT s.*,p.payload AS physical FROM sources s JOIN source_admissions a ON a.key=s.key AND a.verified=1 JOIN physical_sources p ON p.key=a.physical_key WHERE s.key=?",
+                    (dep["source_key"],),
+                ).fetchone()
+                if snapshot is None
+                else snapshot.sources.get(dep["source_key"])
+            )
             if (
                 row is None
+                or row["physical"] is None
                 or row["scope"] != canonical(dep["owner_scope"])
                 or row["state"] != "active"
                 or (row["revision"], row["epoch"]) != (dep["revision"], dep["epoch"])
                 or json.loads(row["physical"])["content_digest"] != dep["content_hash"]
-                or db.execute(
-                    "SELECT 1 FROM suppression WHERE source_key=?", (row["key"],)
-                ).fetchone()
+                or (
+                    db.execute(
+                        "SELECT 1 FROM suppression WHERE source_key=?", (row["key"],)
+                    ).fetchone()
+                    if snapshot is None
+                    else row["suppressed"]
+                )
             ):
                 return False
         for dep in dependencies["group_dependencies"]:
             identity = dep["group"]["semantic_group_id"]
-            group = db.execute(
-                "SELECT state,members,scope FROM groups WHERE id=?", (identity,)
-            ).fetchone()
-            projection = (
+            group = (
                 db.execute(
-                    "SELECT kind FROM memory_summaries WHERE group_id=?", (identity,)
+                    "SELECT state,members,scope FROM groups WHERE id=?", (identity,)
                 ).fetchone()
-                if installed(db)
-                else None
+                if snapshot is None
+                else snapshot.groups.get(identity)
+            )
+            projection = (
+                (
+                    db.execute(
+                        "SELECT kind FROM memory_summaries WHERE group_id=?", (identity,)
+                    ).fetchone()
+                    if installed(db)
+                    else None
+                )
+                if snapshot is None
+                else ((snapshot.kinds[identity],) if identity in snapshot.kinds else None)
             )
             superseded_portrait = (
                 projection is not None
@@ -278,9 +381,13 @@ def window_current(service, db, manifest, *, allowed=None):
             if {ref["record_id"] for ref in dep["records"]} != set(dep["group"]["record_ids"]):
                 return False
             for ref in dep["records"]:
-                record = db.execute(
-                    "SELECT group_id,version,state FROM records WHERE id=?", (ref["record_id"],)
-                ).fetchone()
+                record = (
+                    db.execute(
+                        "SELECT group_id,version,state FROM records WHERE id=?", (ref["record_id"],)
+                    ).fetchone()
+                    if snapshot is None
+                    else snapshot.records.get(ref["record_id"])
+                )
                 if (
                     record is None
                     or record["group_id"] != identity
@@ -288,20 +395,23 @@ def window_current(service, db, manifest, *, allowed=None):
                     or record["state"] != "active"
                 ):
                     return False
-            required_keys = {
-                row[0]
-                for row in db.execute(
-                    "SELECT source_key FROM lineage WHERE group_id=?", (identity,)
-                )
-            }
-            if installed(db):
-                required_keys.update(
+            if snapshot is None:
+                required_keys = {
                     row[0]
                     for row in db.execute(
-                        "SELECT source_key FROM memory_summary_sources WHERE group_id=?",
-                        (identity,),
+                        "SELECT source_key FROM lineage WHERE group_id=?", (identity,)
                     )
-                )
+                }
+                if installed(db):
+                    required_keys.update(
+                        row[0]
+                        for row in db.execute(
+                            "SELECT source_key FROM memory_summary_sources WHERE group_id=?",
+                            (identity,),
+                        )
+                    )
+            else:
+                required_keys = snapshot.lineage.get(identity, set())
             if (
                 not set(dep["source_dependency_ids"]) <= set(by_id)
                 or {by_id[key]["source_key"] for key in dep["source_dependency_ids"]}
@@ -309,9 +419,13 @@ def window_current(service, db, manifest, *, allowed=None):
             ):
                 return False
         for dep in dependencies["episode_dependencies"]:
-            episode = db.execute(
-                "SELECT * FROM memory_documents WHERE id=?", (dep["episode_id"],)
-            ).fetchone()
+            episode = (
+                db.execute(
+                    "SELECT * FROM memory_documents WHERE id=?", (dep["episode_id"],)
+                ).fetchone()
+                if snapshot is None
+                else snapshot.episodes.get(dep["episode_id"])
+            )
             source = by_id.get(dep["source_dependency_id"])
             if (
                 episode is None
@@ -357,14 +471,14 @@ def local_sources(service, db, manifest):
     return rows
 
 
-def window_failure(service, db, manifest, turns, owner_check=None):
+def window_failure(service, db, manifest, turns, owner_check=None, *, allowed=None, snapshot=None):
     invalid = set(owner_check["invalid_member_ids"] if owner_check else [])
     unclassified = bool(owner_check and owner_check["state"] == "invalid" and not invalid)
-    allowed = permitted_scopes(service, db, manifest["scope"])
+    allowed = permitted_scopes(service, db, manifest["scope"]) if allowed is None else allowed
     for member in manifest["members"]:
         identity = member["member_id"]
         if not turns_current(manifest, turns, member_ids={identity}) or not window_current(
-            service, db, dict(manifest, members=[member]), allowed=allowed
+            service, db, dict(manifest, members=[member]), allowed=allowed, snapshot=snapshot
         ):
             invalid.add(identity)
     if not invalid and not unclassified:
@@ -375,6 +489,32 @@ def window_failure(service, db, manifest, turns, owner_check=None):
         [member["member_id"] for member in manifest["members"] if member["member_id"] in invalid],
         new_inputs_valid=bool(new) and not unclassified and not new.intersection(invalid),
     )
+
+
+def window_failures(service, db, manifests, turns, owner_checks):
+    """Recheck every complete window before the caller invalidates any of them."""
+    from .consolidation_snapshot import WindowSnapshot
+
+    manifests = list(manifests)
+    snapshot = WindowSnapshot(service, db, manifests, consolidated=installed(db))
+    allowed = {}
+    failures = {}
+    for manifest in manifests:
+        scope = manifest["scope"]
+        key = canonical(scope)
+        if key not in allowed:
+            allowed[key] = permitted_scopes(service, db, scope)
+        identity = manifest["window_id"]
+        failures[identity] = window_failure(
+            service,
+            db,
+            manifest,
+            turns,
+            owner_checks.get(identity),
+            allowed=allowed[key],
+            snapshot=snapshot,
+        )
+    return failures
 
 
 def job_current(service, db, event, snapshot):
