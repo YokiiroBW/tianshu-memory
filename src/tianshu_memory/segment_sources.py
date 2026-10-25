@@ -260,7 +260,7 @@ def same(before, after):
     )
 
 
-def _material_inputs(db, materials, *, owners=(), verified=False):
+def _material_inputs(db, materials, *, source_keys=(), owners=(), verified=False):
     """Bounded local rows for the caller's current transaction, never another proof."""
     payloads = {material["id"]: json.loads(material["payload"]) for material in materials}
     accounts = {canonical(value["member"]["speaker"]["account"]) for value in payloads.values()}
@@ -272,7 +272,7 @@ def _material_inputs(db, materials, *, owners=(), verified=False):
                     dict(namespace=event["namespace"], immutable_account_id=event["account_id"])
                 )
             )
-    keys = {material["source_key"] for material in materials}
+    keys = {material["source_key"] for material in materials} | set(source_keys)
     requests, destinations = [], []
 
     def add(bucket, table, column, values, fields="*"):
@@ -456,7 +456,10 @@ def current(service, db, material):
 
 def current_many(service, db, materials):
     """The material predicates over one bounded transaction-local input batch."""
-    local = _material_inputs(db, materials)
+    return _current_materials(materials, _material_inputs(db, materials))
+
+
+def _current_materials(materials, local):
     bindings, sources, suppressed = (local[key] for key in ("bindings", "sources", "suppressed"))
     payloads = local["payloads"]
     result = set()
@@ -481,22 +484,47 @@ def current_many(service, db, materials):
     return result
 
 
-def pending_current(service, db, event, snapshot):
+def _snapshot_current(snapshot, local):
     for key, (revision, epoch) in snapshot.items():
-        row = db.execute("SELECT * FROM sources WHERE key=?", (key,)).fetchone()
+        row = local["sources"].get(key)
         if (
             row is None
             or row["state"] != "active"
             or row["revision"] != revision
             or row["epoch"] != epoch
-            or db.execute("SELECT 1 FROM suppression WHERE source_key=?", (key,)).fetchone()
+            or key in local["suppressed"]
         ):
             return False
-    for identity in event["material_ids"]:
-        material = db.execute("SELECT * FROM memory_materials WHERE id=?", (identity,)).fetchone()
-        if material is None or not current(service, db, material):
-            return False
     return bool(snapshot)
+
+
+def pending_current_many(service, db, jobs):
+    """All original pending obligations over this transaction's bounded union."""
+    if not jobs:
+        return set()
+    identities = sorted(
+        {identity for event, _ in jobs.values() for identity in event["material_ids"]}
+    )
+    materials = {}
+    for start in range(0, len(identities), 256):
+        page = identities[start : start + 256]
+        materials.update(
+            (row["id"], dict(row))
+            for row in db.execute(
+                "SELECT * FROM memory_materials WHERE id IN (" + ",".join("?" for _ in page) + ")",
+                page,
+            )
+        )
+    rows = list(materials.values())
+    keys = {key for _, snapshot in jobs.values() for key in snapshot}
+    local = _material_inputs(db, rows, source_keys=keys)
+    current = _current_materials(rows, local)
+    return {
+        job_id
+        for job_id, (event, snapshot) in jobs.items()
+        if _snapshot_current(snapshot, local)
+        and all(identity in current for identity in event["material_ids"])
+    }
 
 
 def dependency_rows(db, keys):

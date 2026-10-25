@@ -263,14 +263,24 @@ class MemoryService:
         # Bounded pending queue; invalidation frees capacity without deleting evidence.
         if not source_keys and not scopes:
             return
-        for job in db.execute("SELECT * FROM jobs WHERE state='pending'").fetchall():
-            event, snapshot = json.loads(job["event"]), json.loads(job["source_snapshot"])
-            if dict(job).get("extraction_schema") == 6:
-                from .segment_sources import pending_current
+        pending = [
+            (dict(job), json.loads(job["event"]), json.loads(job["source_snapshot"]))
+            for job in db.execute("SELECT * FROM jobs WHERE state='pending'").fetchall()
+        ]
+        checkable = {
+            job["id"]: (event, snapshot)
+            for job, event, snapshot in pending
+            if job.get("extraction_schema") == 6 and not set(source_keys).intersection(snapshot)
+        }
+        if checkable:
+            from .segment_sources import pending_current_many
 
-                if not set(source_keys).intersection(snapshot) and pending_current(
-                    self, db, event, snapshot
-                ):
+            current_jobs = pending_current_many(self, db, checkable)
+        else:
+            current_jobs = set()
+        for job, event, snapshot in pending:
+            if dict(job).get("extraction_schema") == 6:
+                if job["id"] in current_jobs:
                     continue
                 state = (
                     "stale_source" if set(source_keys).intersection(snapshot) else "scope_changed"
