@@ -169,7 +169,7 @@ class SegmentMaterials:
                         "scope_changed",
                         409,
                     )
-                    member = json.loads(material["payload"])["member"]
+                    member = json.loads(fresh["payload"])["member"]
                     if member["reality"] != row["reality"]:
                         service._invalidate_sources(
                             db, [material["source_key"]], suppress="classification_conflict"
@@ -185,7 +185,7 @@ class SegmentMaterials:
                         "INSERT OR IGNORE INTO memory_material_aliases VALUES (?,?)",
                         (row["key"], material["id"]),
                     )
-                    result.append(material)
+                    result.append(self._capture_observation(db, fresh))
                     continue
                 account = body["author"]
                 binding = service._binding(db, account)
@@ -267,7 +267,7 @@ class SegmentMaterials:
                     503,
                 )
         if references:
-            materials = self._observations(
+            materials = self._stage_observations(
                 dict(observation_refs=references), publisher, expected_actor=scope["actor_id"]
             )
             by_ref = {
@@ -502,7 +502,8 @@ class SegmentMaterials:
             selected.append(window)
         return selected, omitted
 
-    def _observations(self, request, publisher, *, expected_actor=None):
+    def _stage_observations(self, request, publisher, *, expected_actor=None):
+        """Persist archive candidates; discovery never accepts source authority."""
         service = self.service
         with service.local_commit() as db:
             archives = []
@@ -583,23 +584,44 @@ class SegmentMaterials:
                             ),
                         )
                     )
-            # Staged rows are not accepted authority. The ordinary complete barrier
-            # must reprove the immutable actor/channel and current archive sources.
-            for scope in {item["scope"] for item in staged}:
-                with service.operation(
-                    scope=json.loads(scope), material_ids=[item["id"] for item in staged]
-                ) as db:
-                    for item in staged:
-                        if item["scope"] != scope:
-                            continue
-                        current = db.execute(
-                            "SELECT * FROM memory_materials WHERE id=?", (item["id"],)
-                        ).fetchone()
-                        require(segment_sources.current(service, db, current), "scope_changed", 409)
-                        source = db.execute(
-                            "SELECT * FROM sources WHERE key=?", (current["source_key"],)
-                        ).fetchone()
-                        member = json.loads(current["payload"])["member"]
-                        capture(db, source, member["text"], member["observed_at"])
-                        result.append(dict(current))
+            result.extend(staged)
+        return result
+
+    def _capture_observation(self, db, current):
+        source = db.execute(
+            "SELECT * FROM sources WHERE key=?", (current["source_key"],)
+        ).fetchone()
+        member = json.loads(current["payload"])["member"]
+        capture(db, source, member["text"], member["observed_at"])
+        return dict(current)
+
+    def _observations(self, request, publisher, *, expected_actor=None):
+        service = self.service
+        staged = self._stage_observations(request, publisher, expected_actor=expected_actor)
+        scopes = list(dict.fromkeys(item["scope"] for item in staged))
+        requirements = [
+            dict(
+                scope=json.loads(scope),
+                material_ids=[item["id"] for item in staged if item["scope"] == scope],
+            )
+            for scope in scopes
+        ]
+        result = []
+        # Keep every owner's complete historical coverage, not just the first
+        # scope or summary-scopes collection. The same checkpoint proves the
+        # entire staged union before one atomic episode projection transaction.
+        with service.source_authority.bundle_operation(service, requirements) as db:
+            for scope in scopes:
+                for item in staged:
+                    if item["scope"] != scope:
+                        continue
+                    current = db.execute(
+                        "SELECT * FROM memory_materials WHERE id=?", (item["id"],)
+                    ).fetchone()
+                    require(
+                        current is not None and segment_sources.current(service, db, current),
+                        "scope_changed",
+                        409,
+                    )
+                    result.append(self._capture_observation(db, current))
         return result

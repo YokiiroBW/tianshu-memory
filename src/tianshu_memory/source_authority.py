@@ -614,7 +614,7 @@ class SourceAuthority:
 
     @contextmanager
     def bundle_operation(self, service, requirements):
-        """One full union barrier and transaction for a read-only verification bundle.
+        """One full union barrier and transaction for authenticated scope requirements.
 
         Requirements are assembled by the authenticated application, never accepted
         from a model or interpreted as grants. Existing component rules still run.
@@ -627,11 +627,12 @@ class SourceAuthority:
         with self._operation_order.turn(), source_read_lock(self._operation_lock):
             begin_source_read()
             selectors, domains, source_checks, read_domains = {}, set(), [], set()
-            dependency_keys = set()
+            dependency_keys, material_ids = set(), set()
             with service.store.transaction() as db:
                 for item in requirements:
                     scope = item["scope"]
                     dependency_keys.update(item.get("dependency_keys", ()))
+                    material_ids.update(item.get("material_ids", ()))
                     if item.get("context") is not None:
                         service._authorize(db, item["context"], scope=scope)
                     profile, shared = bool(item.get("profile")), bool(item.get("group_read"))
@@ -660,6 +661,7 @@ class SourceAuthority:
                 ],
                 source_checks=source_checks,
                 dependency_keys=dependency_keys,
+                material_ids=material_ids,
             ) as db:
                 self._bundled.active = {"service": service, "domains": domains, "db": db}
                 try:
