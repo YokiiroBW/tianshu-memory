@@ -238,18 +238,9 @@ def prepare_query(service, db, frame, subquery, selection, *, context_mode=False
         fact_snapshot=frame["snapshot"],
         authorized_group_ids=frozenset(frame["group_map"]),
     )
-    expired_sources = (
-        consolidation_sources.expired_sources(
-            db, [row["source_key"] for row in domain["episodes"]], service.clock
-        )
-        if not history
-        else set()
-    )
     episode_ids = {
         row["id"]
-        for row in domain["episodes"]
-        if temporal(dict(row, valid_from=None, valid_to=None), period)[0]
-        and row["source_key"] not in expired_sources
+        for row in memory_documents.eligible_episodes(service, db, domain["episodes"], subquery)
     }
     lexical_episodes = list(
         memory_documents.episode_metadata(
@@ -342,6 +333,10 @@ def fact_evidence(frame, identity):
                 importance=summary["importance"],
                 expires_at=summary["expires_at"],
             )
+            if summary["kind"] == "summary" and "memory_kind" in summary:
+                evidence.update(
+                    {key: summary[key] for key in ("memory_kind", "state", "valid_until")}
+                )
         elif value:
             evidence.update(kind="historical_fact" if historical else "current_fact", fact=value)
         else:
@@ -390,34 +385,38 @@ def dependencies(db, frame, evidence):
     for offset in range(0, len(group_ids), 256):
         batch = group_ids[offset : offset + 256]
         for row in db.execute(
-            "SELECT l.group_id,s.*,p.payload AS physical FROM lineage l JOIN sources s ON s.key=l.source_key JOIN source_admissions a ON a.key=s.key JOIN physical_sources p ON p.key=a.physical_key WHERE l.group_id IN ("
+            "SELECT l.group_id,l.source_key FROM lineage l WHERE l.group_id IN ("
             + ",".join("?" for _ in batch)
             + ")",
             batch,
         ):
-            source_rows[row["key"]] = dict(row)
-            lineage.setdefault(row["group_id"], []).append(row["key"])
+            lineage.setdefault(row["group_id"], []).append(row["source_key"])
         if consolidation_sources.installed(db):
             for row in db.execute(
-                "SELECT d.group_id,s.*,p.payload AS physical FROM memory_summary_sources d "
-                "JOIN sources s ON s.key=d.source_key JOIN source_admissions a ON a.key=s.key "
-                "JOIN physical_sources p ON p.key=a.physical_key WHERE d.group_id IN ("
+                "SELECT d.group_id,d.source_key FROM memory_summary_sources d WHERE d.group_id IN ("
                 + ",".join("?" for _ in batch)
                 + ")",
                 batch,
             ):
-                source_rows[row["key"]] = dict(row)
-                lineage.setdefault(row["group_id"], []).append(row["key"])
+                lineage.setdefault(row["group_id"], []).append(row["source_key"])
+    from ..segment_sources import dependency_rows
+
+    required_keys = sorted({key for values in lineage.values() for key in values})
+    source_rows.update(dependency_rows(db, required_keys))
+    require_selection(set(source_rows) == set(required_keys))
     episode_dependencies = []
     for item in evidence:
         if item["kind"] != "episode":
             continue
         row = db.execute(
-            "SELECT d.source_key,s.*,p.payload AS physical FROM memory_documents d JOIN sources s ON s.key=d.source_key JOIN source_admissions a ON a.key=s.key JOIN physical_sources p ON p.key=a.physical_key WHERE d.id=?",
+            "SELECT d.source_key FROM memory_documents d WHERE d.id=?",
             (item["episode_id"],),
         ).fetchone()
         require_selection(row is not None)
-        source_rows[row["key"]] = dict(row)
+        original = dependency_rows(db, [row["source_key"]]).get(row["source_key"])
+        require_selection(original is not None)
+        row = original
+        source_rows[row["key"]] = row
         episode_dependencies.append(
             dict(
                 episode_id=item["episode_id"],
@@ -434,7 +433,7 @@ def dependencies(db, frame, evidence):
             source_key=key,
             revision=row["revision"],
             epoch=row["epoch"],
-            content_hash=json.loads(row["physical"])["content_digest"],
+            content_hash=row["source_content_hash"],
             state="active",
         )
         for key, row in sorted(source_rows.items())

@@ -95,6 +95,38 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
                     group_read=not profile and group_read(service, target),
                 )
             )
+            if not profile and ("queries" in request or "bundle" in request):
+                bundle = request.get("bundle")
+                if bundle is not None:
+                    into[-1]["dependency_keys"] = [
+                        item["source_key"] for item in bundle["source_dependencies"]
+                    ]
+                else:
+                    from .. import memory_documents
+
+                    candidates = []
+                    if memory_documents.installed(db):
+                        owners = [target]
+                        if same_room:
+                            import json
+
+                            owners = [
+                                json.loads(row[0])
+                                for row in db.execute(
+                                    "SELECT DISTINCT scope FROM sources WHERE state='active' AND json_extract(scope,'$.actor_id')=? AND json_extract(scope,'$.audience')='group' AND json_extract(scope,'$.conversation_id')=?",
+                                    (target["actor_id"], target["conversation_id"]),
+                                )
+                            ]
+                        candidates = list(memory_documents.episode_metadata(service, db, owners))
+                    into[-1]["dependency_keys"] = list(
+                        dict.fromkeys(
+                            row["source_key"]
+                            for query in request.get("queries", [])
+                            for row in memory_documents.eligible_episodes(
+                                service, db, candidates, query
+                            )
+                        )
+                    )
 
         add(scope, context)
         for other, _, _ in allowed[1:]:
@@ -152,6 +184,8 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
                 unique[key] = item
             elif item.get("source_checks"):
                 unique[key].setdefault("source_checks", []).extend(item["source_checks"])
+            if item.get("dependency_keys") and unique[key] is not item:
+                unique[key].setdefault("dependency_keys", []).extend(item["dependency_keys"])
         return list(unique.values())
     return result
 

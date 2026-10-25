@@ -46,7 +46,19 @@ def execute(application, request, context):
                 "scope_changed",
                 409,
             )
-            service._source_rows(db, [json.loads(source["payload"])], scope)
+            original = json.loads(source["payload"])
+            if original.get("kind") == "observation":
+                from ..segment_sources import admitted
+
+                require(
+                    source["scope"] == canonical(scope)
+                    and source["state"] == "active"
+                    and admitted(db, source["key"]),
+                    "scope_changed",
+                    409,
+                )
+            else:
+                service._source_rows(db, [original], scope)
             service._invalidate_sources(db, [source["key"]], suppress="forget", forgotten=True)
             # The operation targets this exact episode/source, not one record
             # group. Its request digest is retained in context_operations;

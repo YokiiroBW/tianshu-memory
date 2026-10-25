@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .domain import Fault, fingerprint, require, strict_json
+from .domain import Fault, canonical, fingerprint, require, strict_json
 
 QQ = re.compile(r"^[1-9][0-9]*$")
 CONVERSATION = re.compile(r"^(group|private):[1-9][0-9]*$")
@@ -53,13 +53,16 @@ class PlatformVerifier:
                     json=request,
                     headers={"Authorization": "Bearer " + token, "Accept-Encoding": "identity"},
                 )
-            if response.status_code == 409 and len(response.content) <= 4096:
+            response_limit = (
+                262144 if request.get("operation") in {"segment", "segment_resolve"} else 4096
+            )
+            if response.status_code == 409 and len(response.content) <= response_limit:
                 denied = strict_json(response.content)
                 if isinstance(denied, dict) and denied.get("code") == "scope_changed":
                     raise Fault("scope_changed", 409)
             require(
                 response.status_code == 200
-                and len(response.content) <= 4096
+                and len(response.content) <= response_limit
                 and response.headers.get("content-type", "").split(";", 1)[0] == "application/json",
                 "dependency_unavailable",
                 503,
@@ -254,6 +257,13 @@ class ObservationLedger:
                     ),
                 )
                 state = "accepted"
+            from .segment_migration import installed
+
+            if installed(db):
+                db.execute(
+                    "INSERT OR IGNORE INTO observation_payloads VALUES (?,?)",
+                    (request["source_ref"], canonical(request)),
+                )
         return {"source_ref": request["source_ref"], "state": state, "archive_state": "archived"}
 
     def query(self, service, request):
@@ -313,8 +323,21 @@ class ObservationLedger:
                     request["limit"] + 1,
                 ),
             ).fetchall()
+        items = [dict(row) for row in rows[: request["limit"]]]
+        from .segment_migration import installed
+
+        with self.store.transaction() as db:
+            if installed(db):
+                for item in items:
+                    payload = db.execute(
+                        "SELECT payload FROM observation_payloads WHERE source_ref=?",
+                        (item["source_ref"],),
+                    ).fetchone()
+                    item["message_context"] = (
+                        strict_json(payload[0])["event"].get("message_context") if payload else None
+                    )
         return {
-            "items": [dict(row) for row in rows[: request["limit"]]],
+            "items": items,
             "next_cursor": rows[request["limit"] - 1]["source_ref"]
             if len(rows) > request["limit"]
             else None,

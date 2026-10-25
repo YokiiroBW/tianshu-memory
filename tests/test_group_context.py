@@ -34,7 +34,7 @@ def room(tmp_path, source_contracts, source_examples, certificates, monkeypatch,
         yield h
 
 
-def owner(h, *, audience="group", conversation=None):
+def owner(h, *, audience="group", conversation=None, account=None):
     """A new real binding and original admission, not a requester impersonation."""
     index = len(h.admissions)
     # add() appends sources too, so actor indices deliberately name their matching turn.
@@ -47,7 +47,7 @@ def owner(h, *, audience="group", conversation=None):
     physical, admission, grant = [
         copy.deepcopy(items[0]) for items in (h.physicals, h.admissions, h.grants)
     ]
-    account = dict(physical["author"], immutable_account_id=f"group-reader:{index}")
+    account = account or dict(physical["author"], immutable_account_id=f"group-reader:{index}")
     physical.update(
         author=account,
         key=dict(physical["key"], message_id=f"owner:{index}"),

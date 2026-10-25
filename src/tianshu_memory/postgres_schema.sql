@@ -381,3 +381,28 @@ CREATE TABLE IF NOT EXISTS memory_source_lifecycle (
  source_key TEXT NOT NULL REFERENCES sources(key) DEFERRABLE INITIALLY IMMEDIATE,
  revision BIGINT NOT NULL, importance TEXT NOT NULL, recorded_at TEXT NOT NULL,
  expires_at TEXT NOT NULL, PRIMARY KEY(source_key,revision));
+
+CREATE TABLE IF NOT EXISTS observation_payloads (
+ source_ref TEXT PRIMARY KEY REFERENCES observation_sources(source_ref) DEFERRABLE INITIALLY IMMEDIATE,
+ payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS memory_materials (
+ id TEXT PRIMARY KEY, digest TEXT NOT NULL, frame TEXT NOT NULL, scope TEXT NOT NULL,
+ source_key TEXT NOT NULL, kind TEXT NOT NULL, binding_version BIGINT NOT NULL,
+ payload TEXT NOT NULL, verified BIGINT NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS memory_material_frame ON memory_materials(frame,source_key);
+CREATE INDEX IF NOT EXISTS memory_material_source ON memory_materials(source_key);
+CREATE TABLE IF NOT EXISTS memory_material_aliases (
+ source_key TEXT PRIMARY KEY REFERENCES sources(key) DEFERRABLE INITIALLY IMMEDIATE,
+ material_id TEXT NOT NULL REFERENCES memory_materials(id) DEFERRABLE INITIALLY IMMEDIATE);
+CREATE INDEX IF NOT EXISTS memory_material_alias_target ON memory_material_aliases(material_id);
+CREATE TABLE IF NOT EXISTS memory_segments (
+ segment_id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id) DEFERRABLE INITIALLY IMMEDIATE,
+ digest TEXT NOT NULL, frame TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS memory_segment_claims (
+ material_id TEXT NOT NULL REFERENCES memory_materials(id) DEFERRABLE INITIALLY IMMEDIATE,
+ job_id TEXT NOT NULL REFERENCES jobs(id) DEFERRABLE INITIALLY IMMEDIATE, PRIMARY KEY(material_id,job_id));
+CREATE TABLE IF NOT EXISTS memory_segment_items (
+ group_id TEXT PRIMARY KEY REFERENCES groups(id) DEFERRABLE INITIALLY IMMEDIATE,
+ kind TEXT NOT NULL, state TEXT NOT NULL, retention TEXT NOT NULL, valid_until TEXT, effective_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS memory_observation_heads (
+ owner_id TEXT PRIMARY KEY, epoch BIGINT NOT NULL, revision BIGINT NOT NULL);

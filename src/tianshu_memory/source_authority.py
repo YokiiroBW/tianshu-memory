@@ -5,6 +5,7 @@ import threading
 from contextlib import contextmanager
 
 from . import consolidation_sources as summary_sources
+from . import segment_sources
 from .domain import (
     Fault,
     admission_key,
@@ -158,6 +159,8 @@ class SourceAuthority:
         windows=(),
         summary_scopes=(),
         source_checks=(),
+        material_ids=(),
+        dependency_keys=(),
     ):
         require(
             not group_read
@@ -175,6 +178,26 @@ class SourceAuthority:
         for _ in range(3):
             with service.store.transaction() as db:
                 m0 = self.revision(db)
+                window_keys = [
+                    item["source_key"]
+                    for manifest in windows
+                    for item in summary_sources.source_dependencies(manifest)
+                ]
+                materials = segment_sources.collect(
+                    db,
+                    scope,
+                    summary_scopes,
+                    material_ids=material_ids,
+                    source_keys=(*dependency_keys, *window_keys),
+                    group_read=group_read,
+                    profile=profile,
+                )
+                material_checks, material_windows = segment_sources.requirements(materials)
+                material_selectors = [
+                    source_selector(source, item["scope"])
+                    for item in material_checks
+                    for source in item["sources"]
+                ]
                 stored, window_domains = [], set()
                 for owner, shared in ((scope, group_read), *summary_scopes):
                     domain = self._read_domain(owner, group_read=shared)
@@ -182,13 +205,20 @@ class SourceAuthority:
                         continue
                     stored.extend(summary_sources.stored_windows(db, owner, group_read=shared))
                     window_domains.add(domain)
-                all_windows = {item["window_id"]: item for item in (*stored, *windows)}
+                all_windows = {
+                    item["window_id"]: item for item in (*stored, *windows, *material_windows)
+                }
                 summary_selectors = summary_sources.selectors(service, db, all_windows.values())
                 selectors = self.coverage(db, scope, sources, profile, group_read)
                 selectors = list(
                     {
                         canonical(value): value
-                        for value in (*selectors, *extra_selectors, *summary_selectors)
+                        for value in (
+                            *selectors,
+                            *extra_selectors,
+                            *summary_selectors,
+                            *material_selectors,
+                        )
                     }.values()
                 )
                 if context is not None:
@@ -203,7 +233,7 @@ class SourceAuthority:
                             if check
                             else []
                         ),
-                        *(item["turn_id"] for item in source_checks),
+                        *(item["turn_id"] for item in (*source_checks, *material_checks)),
                         *(
                             member["turn_id"]
                             for manifest in all_windows.values()
@@ -218,6 +248,7 @@ class SourceAuthority:
                 else {"origin": {"assertion_ref": context["assertion_ref"]}, "scope": scope}
             )
             observations = []
+            passive_before = segment_sources.read(service, materials)
             window_checks = {
                 identity: summary_sources.check_owner(self.transport, manifest)
                 for identity, manifest in ((item["window_id"], item) for item in windows)
@@ -281,6 +312,9 @@ class SourceAuthority:
                         "dependency_unavailable",
                         503,
                     )
+            passive_after = segment_sources.read(service, materials)
+            if not segment_sources.same(passive_before, passive_after):
+                continue
             try:
                 if len(observations) == 1:
                     result = self.sync(
@@ -291,7 +325,7 @@ class SourceAuthority:
                         sources=sources,
                         profile=profile,
                         group_read=group_read,
-                        extra_selectors=(*extra_selectors, *summary_selectors),
+                        extra_selectors=(*extra_selectors, *summary_selectors, *material_selectors),
                     )
                 else:
                     result = self.sync_batches(
@@ -308,10 +342,16 @@ class SourceAuthority:
                         sources=sources,
                         profile=profile,
                         group_read=group_read,
-                        extra_selectors=(*extra_selectors, *summary_selectors),
+                        extra_selectors=(*extra_selectors, *summary_selectors, *material_selectors),
                     )
             except LocalRevisionChanged:
                 continue
+            if passive_after:
+                with service.store.transaction() as db:
+                    if self.revision(db) != result["local_revision"]:
+                        continue
+                    segment_sources.apply(service, db, passive_after)
+                    result["local_revision"] = self.revision(db)
             if all_windows:
                 with service.store.transaction() as db:
                     if self.revision(db) != result["local_revision"]:
@@ -342,12 +382,12 @@ class SourceAuthority:
                 self._relations("actor_event", event, turn, snapshot)
             if check:
                 self._check_input_sources(check, snapshot)
-            if source_checks:
+            if source_checks or material_checks:
                 # These are the actual same-head observations already validated
                 # and committed above. A raw turn may be in any 32-turn page,
                 # and its original sources may be in any 256-selector page.
                 complete = self._merge_snapshot(observations)
-                for source_check in source_checks:
+                for source_check in (*source_checks, *material_checks):
                     self._check_input_sources(source_check, complete)
             return result, final_access.get("viewer_context")
         raise Fault("dependency_unavailable", 503)
@@ -550,7 +590,15 @@ class SourceAuthority:
                 active["service"] is service
                 and key in active["domains"]
                 and not any(
-                    kwargs.get(name) for name in ("sources", "event", "check", "source_checks")
+                    kwargs.get(name)
+                    for name in (
+                        "sources",
+                        "event",
+                        "check",
+                        "source_checks",
+                        "material_ids",
+                        "dependency_keys",
+                    )
                 ),
                 "dependency_unavailable",
                 503,
@@ -579,9 +627,11 @@ class SourceAuthority:
         with self._operation_order.turn(), source_read_lock(self._operation_lock):
             begin_source_read()
             selectors, domains, source_checks, read_domains = {}, set(), [], set()
+            dependency_keys = set()
             with service.store.transaction() as db:
                 for item in requirements:
                     scope = item["scope"]
+                    dependency_keys.update(item.get("dependency_keys", ()))
                     if item.get("context") is not None:
                         service._authorize(db, item["context"], scope=scope)
                     profile, shared = bool(item.get("profile")), bool(item.get("group_read"))
@@ -609,6 +659,7 @@ class SourceAuthority:
                     (item["scope"], bool(item.get("group_read"))) for item in requirements
                 ],
                 source_checks=source_checks,
+                dependency_keys=dependency_keys,
             ) as db:
                 self._bundled.active = {"service": service, "domains": domains, "db": db}
                 try:
@@ -916,9 +967,12 @@ class SourceAuthority:
             row["state"] == "active"
             and row["revision"] == row["required_revision"]
             and row["epoch"] == row["required_epoch"]
-            and db.execute(
-                "SELECT 1 FROM source_admissions WHERE key=? AND verified=1", (row["key"],)
-            ).fetchone()
+            and (
+                db.execute(
+                    "SELECT 1 FROM source_admissions WHERE key=? AND verified=1", (row["key"],)
+                ).fetchone()
+                or segment_sources.admitted(db, row["key"])
+            )
             and not db.execute(
                 "SELECT 1 FROM suppression WHERE source_key=?", (row["key"],)
             ).fetchone()
@@ -955,6 +1009,20 @@ class SourceAuthority:
                     batch,
                 )
             )
+            if any(key.startswith("observation:") for key in batch) and segment_sources.installed(
+                db
+            ):
+                admitted.update(
+                    row[0]
+                    for row in db.execute(
+                        "SELECT m.source_key FROM memory_materials m WHERE m.kind='observation' "
+                        "AND m.verified=1 AND m.source_key IN ("
+                        + ",".join("?" for _ in batch)
+                        + ") "
+                        "AND NOT EXISTS (SELECT 1 FROM suppression s WHERE s.source_key=m.source_key)",
+                        batch,
+                    )
+                )
         return {
             identity
             for identity, rows in candidates.items()

@@ -86,6 +86,10 @@ def main():
         help="Stop writers; upgrade typed facts, episodes and derived retrieval with backup",
     )
     migrate_memory.add_argument("--backup", required=True)
+    migrate_segments = sub.add_parser(
+        "migrate-segments", help="Stop writers; add bounded multi-person jobs with guarded backup"
+    )
+    migrate_segments.add_argument("--backup", required=True)
     reindex_memory = sub.add_parser(
         "reindex-memory",
         help="Rebuild derived documents from currently authorized original sources",
@@ -131,6 +135,7 @@ def run_local_operation(args, parser):
         "migrate-source-lookup",
         "migrate-facts",
         "migrate-memory",
+        "migrate-segments",
     }:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
         with closing(Store.from_config(config)) as store:
@@ -150,6 +155,8 @@ def run_local_operation(args, parser):
                 result = store.migrate_facts(args.backup)
             elif args.operation == "migrate-memory":
                 result = store.migrate_memory(args.backup)
+            elif args.operation == "migrate-segments":
+                result = store.migrate_segments(args.backup)
             elif args.operation == "migrate-context":
                 result = store.migrate_context(args.backup)
             elif args.operation == "migrate-qq-aliases":

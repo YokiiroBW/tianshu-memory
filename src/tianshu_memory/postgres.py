@@ -26,6 +26,15 @@ CONSOLIDATION_TABLES = {
     "memory_portraits",
     "memory_source_lifecycle",
 }
+SEGMENT_TABLES = {
+    "observation_payloads",
+    "memory_materials",
+    "memory_segments",
+    "memory_segment_claims",
+    "memory_segment_items",
+    "memory_observation_heads",
+    "memory_material_aliases",
+}
 DERIVED_TABLES = {"memory_documents", "memory_vectors", "memory_episode_index"}
 SEARCH_TABLES = {
     "search_index",
@@ -311,6 +320,11 @@ def prepare(db, source, *, files, recovery_path, state_directory, epoch):
         ).fetchone()
         if consolidation is None:
             required -= CONSOLIDATION_TABLES
+        segment = db.native(
+            "SELECT value FROM metadata WHERE key='memory_segment_schema'"
+        ).fetchone()
+        if segment is None:
+            required -= SEGMENT_TABLES
         if not required <= installed:
             raise ValueError("PostgreSQL Memory schema is incomplete; authority tables missing")
         return

@@ -312,9 +312,10 @@ def finish(service, db, request, context, candidates, result, *, witnesses=()):
     if result["coverage"]["missing_source_times"]:
         result["omissions"].append("source_time_unavailable")
     result["coverage"]["returned_groups"] = len(result["dependency_groups"])
-    result["coverage"]["complete"] &= (
-        len(ordered) <= request["limit"] and "budget" not in result["omissions"]
-    )
+    result["coverage"]["complete"] &= len(ordered) <= request["limit"] and not {
+        "budget",
+        "scope_filtered",
+    }.intersection(result["omissions"])
     service._authorize(db, context, scope=request["requested_scope"])
     verified = service.clock()
     result["verified_at"] = utc(verified)

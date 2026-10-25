@@ -40,8 +40,27 @@ class SourceTransport:
             configured_endpoint="/internal/v1/source-facts/read",
         )
 
+    def frame_check(self, request):
+        return self._post(
+            "core",
+            "/internal/v1/memory/consolidation/window/check",
+            "segment_frame",
+            request,
+            package="memory-extraction",
+            configured_endpoint="/internal/v1/source-facts/read",
+            correlate=False,
+        )
+
     def _post(
-        self, owner, endpoint, schema, request, *, package="sync-sources", configured_endpoint=None
+        self,
+        owner,
+        endpoint,
+        schema,
+        request,
+        *,
+        package="sync-sources",
+        configured_endpoint=None,
+        correlate=True,
     ):
         try:
             require(self.contracts.source_version == "1.0.0", "dependency_unavailable", 503)
@@ -132,7 +151,10 @@ class SourceTransport:
                     )
             resolved = strict_json(payload.decode("utf-8"))
             self.contracts.validate(f"{package}#{schema}_response", resolved)
-            require(resolved["request_id"] == request["request_id"], "dependency_unavailable", 503)
+            if correlate:
+                require(
+                    resolved["request_id"] == request["request_id"], "dependency_unavailable", 503
+                )
             return resolved
         except (
             httpx.HTTPError,

@@ -91,3 +91,12 @@ class WindowSnapshot:
                     self.kinds[row["group_id"]] = row["kind"]
                 else:
                     getattr(self, bucket)[row[identity[bucket]]] = row
+        from .segment_sources import dependency_rows
+
+        # A passive original has its own proof and hash; no Core physical is made.
+        missing = sorted(sources - set(self.sources))
+        for key, row in dependency_rows(db, missing).items():
+            row["suppressed"] = bool(
+                db.execute("SELECT 1 FROM suppression WHERE source_key=?", (key,)).fetchone()
+            )
+            self.sources[key] = row

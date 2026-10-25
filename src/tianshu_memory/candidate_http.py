@@ -15,6 +15,8 @@ from .domain import Fault, require, strict_json
 
 def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
     @app.post("/internal/v1/memory/candidates/process")
+    @app.post("/internal/v1/memory/candidates/materials")
+    @app.post("/internal/v1/memory/candidates/segments")
     async def process(request: Request):
         lease = None
         try:
@@ -40,7 +42,14 @@ def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
                     body.extend(chunk)
             payload = strict_json(body)
             require(isinstance(payload, dict), "invalid_input", 400)
-            require("job_ids" in payload or len(body) <= 65536, "invalid_input", 413)
+            require(
+                "job_ids" in payload
+                or payload.get("extraction_schema") == 6
+                or request.url.path.endswith(("/materials", "/segments"))
+                or len(body) <= 65536,
+                "invalid_input",
+                413,
+            )
             lease.request = request
 
             def execute():
@@ -59,6 +68,18 @@ def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
                         if auth.role_grants
                         else [],
                     )
+                    if service.contracts.extraction_version is None:
+                        service.contracts.load_memory_v2()
+                    if request.url.path.endswith("/materials"):
+                        from .segment_materials import SegmentMaterials
+
+                        return SegmentMaterials(
+                            service, read_content=CandidateExtraction(service)._content
+                        ).execute(payload, publisher)
+                    if request.url.path.endswith("/segments"):
+                        from .segments import Segments
+
+                        return Segments(service).seal(payload, publisher)
                     return CandidateExtraction(service).execute(payload, publisher)
 
             async with asyncio.timeout(execute_timeout):

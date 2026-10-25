@@ -55,6 +55,28 @@ def group_rows(db, requester, *, owners=None, selection=None, after=None, limit=
         "OR json_extract(p.payload,'$.conversation_id')!=json_extract(g.scope,'$.conversation_id')))",
     ]
     parameters = [requester["actor_id"], requester["conversation_id"]]
+    from ..segment_migration import installed as segments_installed
+
+    if segments_installed(db):
+        # Both branches are real owner proofs. In particular a private archive
+        # can never acquire a group scope by producing a projection row.
+        predicates[-1] = (
+            "NOT EXISTS (SELECT 1 FROM lineage l LEFT JOIN sources s ON s.key=l.source_key "
+            "WHERE l.group_id=g.id AND (s.scope IS NULL OR s.scope!=g.scope OR NOT ("
+            "EXISTS (SELECT 1 FROM source_admissions a JOIN physical_sources p ON p.key=a.physical_key "
+            "WHERE a.key=s.key AND a.verified=1 AND "
+            "json_extract(a.payload,'$.scope.actor_id')=json_extract(g.scope,'$.actor_id') AND "
+            "json_extract(a.payload,'$.scope.person_id')=json_extract(g.scope,'$.person_id') AND "
+            "json_extract(a.payload,'$.scope.audience')='group' AND "
+            "json_extract(a.payload,'$.scope.conversation_id')=json_extract(g.scope,'$.conversation_id') AND "
+            "json_extract(p.payload,'$.audience')='group' AND "
+            "json_extract(p.payload,'$.conversation_id')=json_extract(g.scope,'$.conversation_id')) OR "
+            "EXISTS (SELECT 1 FROM memory_materials m WHERE m.source_key=s.key AND m.scope=g.scope "
+            "AND m.kind='observation' AND m.verified=1 AND "
+            "json_extract(m.frame,'$.audience')='group' AND "
+            "json_extract(m.frame,'$.actor_id')=json_extract(g.scope,'$.actor_id') AND "
+            "json_extract(m.frame,'$.conversation_id')=json_extract(g.scope,'$.conversation_id')))))"
+        )
     if after is not None:
         predicates.append("g.id>?")
         parameters.append(after)

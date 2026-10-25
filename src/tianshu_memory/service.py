@@ -265,6 +265,23 @@ class MemoryService:
             return
         for job in db.execute("SELECT * FROM jobs WHERE state='pending'").fetchall():
             event, snapshot = json.loads(job["event"]), json.loads(job["source_snapshot"])
+            if dict(job).get("extraction_schema") == 6:
+                from .segment_sources import pending_current
+
+                if not set(source_keys).intersection(snapshot) and pending_current(
+                    self, db, event, snapshot
+                ):
+                    continue
+                state = (
+                    "stale_source" if set(source_keys).intersection(snapshot) else "scope_changed"
+                )
+                db.execute("UPDATE jobs SET state=? WHERE id=?", (state, job["id"]))
+                self._emit(
+                    db,
+                    "memory.candidate_invalidated",
+                    {"candidate_job_ref": job["id"], "state": state},
+                )
+                continue
             claimed_invalid = False
             if dict(job).get("extraction_schema") == 5:
                 claimed = db.execute(
@@ -307,8 +324,10 @@ class MemoryService:
         from .consolidation_sources import dependents
         from .memory_documents import discard
         from .memory_migration import installed
+        from .segment_sources import equivalent_keys
 
-        keys = set(keys)
+        original_keys = set(keys)
+        keys = equivalent_keys(db, original_keys)
         groups, scopes = set(), set()
         groups.update(dependents(db, sources=keys))
         for key in keys:
@@ -316,6 +335,14 @@ class MemoryService:
             if row is None:
                 continue
             scopes.add(row[0])
+            if key not in original_keys and suppress is None:
+                # An exact physical alias cannot keep learning from a stale
+                # copy while the owner invalidates its counterpart. No fuzzy
+                # equivalence or another actor's source participates here.
+                db.execute(
+                    "UPDATE sources SET state='withdrawn',epoch=epoch+1 WHERE key=? AND state='active'",
+                    (key,),
+                )
             groups.update(
                 item[0]
                 for item in db.execute("SELECT group_id FROM lineage WHERE source_key=?", (key,))
@@ -454,6 +481,27 @@ class MemoryService:
                     "SELECT source_key FROM lineage WHERE group_id=?", (row["group_id"],)
                 )
             ]
+            from .segment_migration import installed as segments_installed
+
+            if (
+                segments_installed(db)
+                and db.execute(
+                    "SELECT 1 FROM memory_segment_items WHERE group_id=?", (row["group_id"],)
+                ).fetchone()
+            ):
+                # An owner can forget their whole derived basis. Other people's
+                # context remains their source; it is never suppressed on this
+                # owner's authority.
+                keys = list(
+                    set(keys)
+                    | {
+                        value[0]
+                        for value in db.execute(
+                            "SELECT source_key FROM memory_summary_sources WHERE group_id=? AND source_scope=?",
+                            (row["group_id"], canonical(scope)),
+                        )
+                    }
+                )
             self._invalidate_sources(
                 db,
                 keys,
@@ -666,6 +714,15 @@ class MemoryService:
         used = {"tokens": 0, "bytes": 0}
         owners = set() if requester_scope is None else {requester_scope["person_id"]}
         for group, rows, group_units in eligible:
+            if any(
+                source.get("kind") == "observation"
+                for unit in group_units
+                for source in unit["sources"]
+            ):
+                # Published v1 has no passive-source representation. v2 returns
+                # its genuine source; v1 reports an omission instead of lying.
+                omissions.append("scope_filtered")
+                continue
             dependency = {
                 "semantic_group_id": group["id"],
                 "record_ids": [u["record_id"] for u in group_units],
@@ -737,6 +794,7 @@ class MemoryService:
 
     def consume(self, event, publisher):
         from .memory_context.history import source_version_retained
+        from .segment_migration import installed as segment_installed
 
         self.authorize_source_publisher(event["scope"], publisher)
         require(event["conversation_id"] == event["scope"]["conversation_id"], "invalid_input", 400)
@@ -805,7 +863,14 @@ class MemoryService:
             if prior:
                 require(prior["digest"] == input_digest, "idempotency_conflict", 409)
                 previous = json.loads(prior["result"])
-                result.update(state="duplicate", candidate_job_ref=previous["candidate_job_ref"])
+                result.update(
+                    state=(
+                        "duplicate"
+                        if previous["state"] in {"accepted", "duplicate"}
+                        else previous["state"]
+                    ),
+                    candidate_job_ref=previous["candidate_job_ref"],
+                )
             else:
                 latest_input = db.execute(
                     "SELECT MAX(revision) FROM turn_inputs WHERE turn_id=?",
@@ -827,28 +892,39 @@ class MemoryService:
                             raise
                         result["state"] = "stale_source"
                     else:
-                        pending = db.execute(
-                            "SELECT COUNT(*) FROM jobs WHERE state='pending'"
-                        ).fetchone()[0]
-                        require(pending < self.max_pending_jobs, "queue_full", 429)
-                        result["candidate_job_ref"] = new_id("candidate")
-                        snapshot = {r["key"]: [r["revision"], r["epoch"]] for r in rows}
-                        db.execute(
-                            "INSERT INTO jobs(id,state,event,source_snapshot) VALUES (?,'pending',?,?)",
-                            (
-                                result["candidate_job_ref"],
-                                canonical(event),
-                                canonical(snapshot),
-                            ),
-                        )
-                        self._emit(
-                            db,
-                            "memory.candidate_accepted",
-                            {"candidate_job_ref": result["candidate_job_ref"]},
-                        )
+                        if not segment_installed(db):
+                            pending = db.execute(
+                                "SELECT COUNT(*) FROM jobs WHERE state='pending'"
+                            ).fetchone()[0]
+                            require(pending < self.max_pending_jobs, "queue_full", 429)
+                            result["candidate_job_ref"] = new_id("candidate")
+                            snapshot = {r["key"]: [r["revision"], r["epoch"]] for r in rows}
+                            db.execute(
+                                "INSERT INTO jobs(id,state,event,source_snapshot) VALUES (?,'pending',?,?)",
+                                (
+                                    result["candidate_job_ref"],
+                                    canonical(event),
+                                    canonical(snapshot),
+                                ),
+                            )
+                            self._emit(
+                                db,
+                                "memory.candidate_accepted",
+                                {"candidate_job_ref": result["candidate_job_ref"]},
+                            )
                 db.execute(
-                    "INSERT INTO turn_inputs VALUES (?,?,?,?)",
+                    "INSERT INTO turn_inputs(turn_id,revision,digest,result) VALUES (?,?,?,?)",
                     (*turn_key, input_digest, canonical(result)),
+                )
+            if (
+                segment_installed(db)
+                and result["state"] in {"accepted", "duplicate"}
+                and (latest is None or event["aggregate_version"] >= latest)
+            ):
+                db.execute(
+                    "UPDATE turn_inputs SET event=? WHERE turn_id=? AND revision=? "
+                    "AND (event IS NULL OR CAST(json_extract(event,'$.aggregate_version') AS BIGINT)<?)",
+                    (canonical(event), *turn_key, event["aggregate_version"]),
                 )
             db.execute(
                 "INSERT INTO inbox VALUES (?,?,?)", (event["event_id"], digest, canonical(result))
@@ -858,6 +934,21 @@ class MemoryService:
                 (*aggregate_key, aggregate_digest),
             )
             return result
+
+    @staticmethod
+    def read_committed(db, turn_id):
+        """The real received event, with exact frozen-job fallback before schema 6."""
+        from .segment_migration import installed as segment_installed
+
+        event = "COALESCE(t.event,j.event)" if segment_installed(db) else "j.event"
+        row = db.execute(
+            "SELECT " + event + " FROM turn_inputs t LEFT JOIN jobs j ON "
+            "j.id=json_extract(t.result,'$.candidate_job_ref') WHERE t.turn_id=? "
+            "AND " + event + " IS NOT NULL "
+            "ORDER BY t.revision DESC LIMIT 1",
+            (turn_id,),
+        ).fetchone()
+        return row[0] if row is not None else None
 
     @staticmethod
     def authorize_source_publisher(scope, publisher):

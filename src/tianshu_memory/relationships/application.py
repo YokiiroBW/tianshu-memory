@@ -183,12 +183,9 @@ class Relationships:
             400,
         )
         with self.service.store.transaction() as db:
-            stored = db.execute(
-                "SELECT j.event FROM turn_inputs t JOIN jobs j ON j.id=json_extract(t.result,'$.candidate_job_ref') WHERE t.turn_id=? ORDER BY t.revision DESC LIMIT 1",
-                (candidate["turn_id"],),
-            ).fetchone()
+            stored = self.service.read_committed(db, candidate["turn_id"])
         require(stored is not None, "dependency_unavailable", 503)
-        committed = json.loads(stored[0])
+        committed = json.loads(stored)
         require(
             committed["scope"] == scope
             and committed["reality"] == "real"
@@ -214,13 +211,15 @@ class Relationships:
             scope,
             context=context,
             sources=committed["sources"],
-            check={"turn_id": candidate["turn_id"], "input_revision": committed["input_revision"]},
+            check={
+                "turn_id": candidate["turn_id"],
+                "input_revision": committed["input_revision"],
+                "scope": committed["scope"],
+                "sources": committed["sources"],
+            },
         ) as db:
-            current = db.execute(
-                "SELECT j.event FROM turn_inputs t JOIN jobs j ON j.id=json_extract(t.result,'$.candidate_job_ref') WHERE t.turn_id=? ORDER BY t.revision DESC LIMIT 1",
-                (candidate["turn_id"],),
-            ).fetchone()
-            require(current is not None and current[0] == stored[0], "version_conflict", 409)
+            current = self.service.read_committed(db, candidate["turn_id"])
+            require(current is not None and current == stored, "version_conflict", 409)
             require(
                 committed["scope_version"] == self.service._scope_version(db, scope),
                 "scope_changed",

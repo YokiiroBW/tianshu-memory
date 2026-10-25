@@ -227,13 +227,37 @@ def episodes(service, db, scopes, *, query_text=None, metadata_only=False, after
         else "d.*,s.payload AS source_payload,s.reality"
     )
     origin = " AND json_extract(a.payload,'$.scope.actor_id')=json_extract(d.scope,'$.actor_id') AND json_extract(a.payload,'$.scope.person_id')=json_extract(d.scope,'$.person_id') AND json_extract(a.payload,'$.scope.audience')=json_extract(d.scope,'$.audience') AND json_extract(a.payload,'$.scope.conversation_id')=json_extract(d.scope,'$.conversation_id') AND (json_extract(d.scope,'$.audience')!='group' OR (json_extract(p.payload,'$.audience')='group' AND json_extract(p.payload,'$.conversation_id')=json_extract(d.scope,'$.conversation_id')))"
+    from .segment_migration import installed as segments_installed
+
+    joins = (
+        " JOIN source_admissions a ON a.key=s.key JOIN physical_sources p ON p.key=a.physical_key "
+    )
+    admission = " AND a.verified=1" + origin
+    if segments_installed(db):
+        joins = " LEFT JOIN source_admissions a ON a.key=s.key LEFT JOIN physical_sources p ON p.key=a.physical_key "
+        admission = (
+            " AND ((a.verified=1"
+            + origin
+            + ") OR EXISTS (SELECT 1 FROM memory_materials m WHERE m.source_key=s.key AND m.scope=d.scope AND m.kind='observation' AND m.verified=1))"
+        )
+        predicate += (
+            " AND NOT EXISTS (SELECT 1 FROM memory_material_aliases x JOIN memory_materials m ON m.id=x.material_id "
+            "JOIN sources os ON os.key=m.source_key JOIN memory_documents od ON od.source_key=os.key "
+            "WHERE x.source_key=d.source_key AND m.kind='observation' AND m.verified=1 AND m.scope=d.scope "
+            "AND os.scope=d.scope AND os.state='active' AND os.revision=s.revision "
+            "AND od.kind='episode' AND od.scope=d.scope AND od.source_revision=os.revision AND od.source_epoch=os.epoch "
+            "AND od.span_start=d.span_start AND od.span_end=d.span_end AND od.content_hash=d.content_hash "
+            "AND NOT EXISTS (SELECT 1 FROM suppression oz WHERE oz.source_key=os.key))"
+        )
     rows = db.execute(
         "SELECT "
         + columns
-        + " FROM memory_documents d JOIN sources s ON s.key=d.source_key JOIN source_admissions a ON a.key=s.key JOIN physical_sources p ON p.key=a.physical_key WHERE d.kind='episode' AND d.scope IN ("
+        + " FROM memory_documents d JOIN sources s ON s.key=d.source_key"
+        + joins
+        + "WHERE d.kind='episode' AND d.scope IN ("
         + ",".join("?" for _ in keys)
-        + ") AND d.scope=s.scope AND s.state='active' AND d.source_revision=s.revision AND d.source_epoch=s.epoch AND a.verified=1 AND NOT EXISTS (SELECT 1 FROM suppression z WHERE z.source_key=s.key)"
-        + origin
+        + ") AND d.scope=s.scope AND s.state='active' AND d.source_revision=s.revision AND d.source_epoch=s.epoch AND NOT EXISTS (SELECT 1 FROM suppression z WHERE z.source_key=s.key)"
+        + admission
         + predicate
         + (
             " ORDER BY d.id LIMIT ?"
@@ -243,6 +267,33 @@ def episodes(service, db, scopes, *, query_text=None, metadata_only=False, after
         [*params, limit],
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def eligible_episodes(service, db, rows, subquery):
+    """The same temporal/retention candidate domain for proof and actual ranking."""
+    from .consolidation_sources import expired_sources
+
+    if "episodes" not in subquery["kinds"]:
+        return []
+    expired = (
+        expired_sources(db, [row["source_key"] for row in rows], service.clock)
+        if subquery["intent"] == "current"
+        else set()
+    )
+    period = subquery["time_filter"]
+    return [
+        row
+        for row in rows
+        if row["source_key"] not in expired
+        and (
+            period is None
+            or period["basis"] != "observed_at"
+            or row["observed_at"] is None
+            or parse_time(period["from"])
+            <= parse_time(row["observed_at"])
+            < parse_time(period["to"])
+        )
+    ]
 
 
 def episode_metadata(service, db, scopes, *, query_text=None):

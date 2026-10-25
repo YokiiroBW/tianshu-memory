@@ -14,6 +14,12 @@ class CandidateExtraction:
 
     def execute(self, request, publisher):
         require(type(request) is dict, "invalid_input", 400)
+        if request.get("extraction_schema") == 6:
+            from .segments import Segments
+
+            if self.service.contracts.extraction_version is None:
+                self.service.contracts.load_memory_v2()
+            return Segments(self.service).execute(request, publisher)
         if "job_ids" in request:
             from .consolidation import Consolidation
 
@@ -104,7 +110,9 @@ class CandidateExtraction:
             dict(state="completed", result=json.loads(receipt[0]), content=[]) if receipt else None
         )
 
-    def _content(self, event, *, pending_job=None, protocol=3, retain_originals=False):
+    def _content(
+        self, event, *, pending_job=None, protocol=3, retain_originals=False, with_metadata=False
+    ):
         service = self.service
         scope, sources = event["scope"], event["sources"]
         with service.operation(scope=scope, sources=sources, event=event) as db:
@@ -131,8 +139,19 @@ class CandidateExtraction:
         for index, source in enumerate(sources):
             data = physicals[canonical(source_selector(source, scope)["key"])]["content"]
             text = "\n".join(p["text"] for p in data["parts"] if p["kind"] == "text")
-            result.append(dict(index=index, text=text, sent_at=data["sent_at"]))
-        require(len(canonical(result).encode()) <= 65536, "budget_exceeded", 413)
+            item = dict(index=index, text=text, sent_at=data["sent_at"])
+            if with_metadata:
+                item.update(
+                    author=data["author"],
+                    reply_refs=data["reply_refs"],
+                    mentioned_accounts=data["mentioned_accounts"],
+                )
+            result.append(item)
+        require(
+            len(canonical(result).encode()) <= (262144 if with_metadata else 65536),
+            "budget_exceeded",
+            413,
+        )
         with service.operation(scope=scope, sources=sources, event=event) as db:
             rows = service._source_rows(db, sources, scope, reality=event["reality"])
             if context_installed(db) and not retain_originals:

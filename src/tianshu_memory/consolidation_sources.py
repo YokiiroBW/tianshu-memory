@@ -158,6 +158,13 @@ def human_sources(manifest):
 
 def subject_material(service, db, manifest, scope):
     """Rebuild only this owner's human originals, never a mixed summary's prose."""
+    if manifest.get("schema_version") == 6:
+        material = portrait_material(service, db, manifest, scope)
+        return (
+            [{key: value for key, value in item.items() if key != "reality"} for item in material]
+            if material
+            else None
+        )
     result, budget = [], 0
     for member in manifest["members"]:
         if (
@@ -267,7 +274,12 @@ def stored_windows(db, scope, *, group_read=False):
         params,
     ):
         value = json.loads(row[0])
-        manifests[value["window_id"]] = value
+        if value.get("schema_version") != 6:
+            manifests[value["window_id"]] = value
+        else:
+            for window in value["context_windows"]:
+                manifest = window["manifest"]
+                manifests[manifest["window_id"]] = manifest
     return list(manifests.values())
 
 
@@ -320,21 +332,24 @@ def window_current(service, db, manifest, *, allowed=None, snapshot=None):
         for dep in dependencies["source_dependencies"]:
             if not permits(manifest["scope"], dep["owner_scope"], allowed):
                 return False
+            from .segment_sources import dependency_rows
+
             row = (
-                db.execute(
-                    "SELECT s.*,p.payload AS physical FROM sources s JOIN source_admissions a ON a.key=s.key AND a.verified=1 JOIN physical_sources p ON p.key=a.physical_key WHERE s.key=?",
-                    (dep["source_key"],),
-                ).fetchone()
+                dependency_rows(db, [dep["source_key"]]).get(dep["source_key"])
                 if snapshot is None
                 else snapshot.sources.get(dep["source_key"])
             )
             if (
                 row is None
-                or row["physical"] is None
+                or (row["physical"] is None and not dict(row).get("source_content_hash"))
                 or row["scope"] != canonical(dep["owner_scope"])
                 or row["state"] != "active"
                 or (row["revision"], row["epoch"]) != (dep["revision"], dep["epoch"])
-                or json.loads(row["physical"])["content_digest"] != dep["content_hash"]
+                or (
+                    dict(row).get("source_content_hash")
+                    or json.loads(row["physical"])["content_digest"]
+                )
+                != dep["content_hash"]
                 or (
                     db.execute(
                         "SELECT 1 FROM suppression WHERE source_key=?", (row["key"],)
@@ -548,7 +563,7 @@ def current(service, db, group_id):
     if not installed(db):
         return True
     summary = db.execute(
-        "SELECT summary_refs FROM memory_summaries WHERE group_id=?", (group_id,)
+        "SELECT summary_refs,manifest FROM memory_summaries WHERE group_id=?", (group_id,)
     ).fetchone()
     if summary is None:
         return True
@@ -575,7 +590,12 @@ def current(service, db, group_id):
         if (
             row is None
             or row["state"] != "active"
-            or row["group_state"] != "active"
+            or row["group_state"]
+            not in (
+                {"active", "superseded"}
+                if json.loads(summary["manifest"]).get("schema_version") == 6
+                else {"active"}
+            )
             or row["version"] != ref["record_version"]
         ):
             return False
@@ -595,6 +615,19 @@ def metadata(db, group_ids):
             keys,
         ):
             result[row["group_id"]] = dict(row)
+        from .segment_migration import installed as segments_installed
+
+        if segments_installed(db):
+            for row in db.execute(
+                "SELECT * FROM memory_segment_items WHERE group_id IN ("
+                + ",".join("?" for _ in keys)
+                + ")",
+                keys,
+            ):
+                if row["group_id"] in result:
+                    result[row["group_id"]].update(
+                        memory_kind=row["kind"], state=row["state"], valid_until=row["valid_until"]
+                    )
     return result
 
 
@@ -677,3 +710,63 @@ def dependents(db, groups=(), sources=()):
                     changed = True
                     break
     return result
+
+
+def portrait_material(service, db, manifest, scope):
+    """Return raw owner messages, never a previous derived summary's prose."""
+    if manifest.get("schema_version") != 6:
+        original = subject_material(service, db, manifest, scope)
+        if original is None:
+            return None
+        members = {member["member_id"]: member for member in manifest["members"]}
+        for member in original:
+            source = members[member["member_id"]]["reference"]["source"]
+            row = db.execute(
+                "SELECT reality FROM sources WHERE key=?", (service.source_identity(source, scope),)
+            ).fetchone()
+            if row is None:
+                return None
+            member["reality"] = row[0]
+        return original
+    from . import segment_sources
+
+    result = []
+    for member in manifest["members"]:
+        if member["role"] != "human" or member["source_scope"] != scope:
+            continue
+        material = db.execute(
+            "SELECT * FROM memory_materials WHERE id=?", (member["member_id"],)
+        ).fetchone()
+        # BOT legacy window human members can be retained as context without a
+        # separately accepted material. They are never substituted into history.
+        if material is None:
+            return None
+        original = json.loads(material["payload"])["member"]
+        if (
+            not segment_sources.current(service, db, material)
+            or any(
+                original[key] != member[key]
+                for key in (
+                    "speaker",
+                    "source_scope",
+                    "binding_version",
+                    "text",
+                    "observed_at",
+                    "content_sha256",
+                    "reality",
+                )
+            )
+            or hashlib.sha256(original["text"].encode("utf-8")).hexdigest()
+            != original["content_sha256"]
+        ):
+            return None
+        result.append(
+            dict(
+                member_id=member["member_id"],
+                speaker=member["speaker"],
+                observed_at=member["observed_at"],
+                text=original["text"],
+                reality=original["reality"],
+            )
+        )
+    return result if result and sum(len(item["text"]) for item in result) <= 6000 else None
