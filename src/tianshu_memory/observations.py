@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .domain import Fault, canonical, fingerprint, require, strict_json
+from .source_http_pool import OwnerHttpPool
 
 QQ = re.compile(r"^[1-9][0-9]*$")
 CONVERSATION = re.compile(r"^(group|private):[1-9][0-9]*$")
@@ -20,6 +21,10 @@ HEX = re.compile(r"^[0-9a-f]{64}$")
 class PlatformVerifier:
     def __init__(self, config_path):
         self.config_path = Path(config_path)
+        self.pool = OwnerHttpPool()
+
+    def close(self):
+        self.pool.close()
 
     def __call__(self, request):
         try:
@@ -40,14 +45,11 @@ class PlatformVerifier:
             require(
                 isinstance(token, str) and 24 <= len(token) <= 4096, "dependency_unavailable", 503
             )
-            verify = (
-                ssl.create_default_context(cafile=config["ca_file"])
-                if config.get("ca_file")
-                else True
-            )
-            with httpx.Client(
-                verify=verify, timeout=5, follow_redirects=False, trust_env=False
-            ) as client:
+            # The existing verifier accepted relative CA paths against cwd;
+            # its explicit trust can share the same pool without changing that
+            # configuration meaning. Empty/missing CA remains one-shot system trust.
+            ca_file = str(Path(config["ca_file"]).absolute()) if config.get("ca_file") else None
+            with self.pool.client("platform", url, ca_file) as client:
                 response = client.post(
                     url,
                     json=request,

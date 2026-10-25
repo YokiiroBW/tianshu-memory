@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -61,7 +62,12 @@ class OwnerHttpPool:
         trust = path.read_bytes()
         if not trust:
             raise ValueError("Explicit owner CA must not be empty")
-        key = (url, str(path), hashlib.sha256(trust).digest())
+        endpoint = urlsplit(url)
+        port = endpoint.port
+        if port is None:
+            port = {"https": 443, "http": 80}.get(endpoint.scheme)
+        origin = (endpoint.scheme, endpoint.hostname, port)
+        key = (origin, str(path), hashlib.sha256(trust).digest())
         with self._lock:
             if self._closed:
                 raise OSError("Owner transport is closed")

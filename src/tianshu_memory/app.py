@@ -84,9 +84,16 @@ def create_app(
                 if auth is not None and hasattr(auth, "close"):
                     auth.close()
             finally:
-                transport = getattr(getattr(service, "source_authority", None), "transport", None)
-                if transport is not None and hasattr(transport, "close"):
-                    transport.close()
+                try:
+                    transport = getattr(
+                        getattr(service, "source_authority", None), "transport", None
+                    )
+                    if transport is not None and hasattr(transport, "close"):
+                        transport.close()
+                finally:
+                    verifier = getattr(getattr(service, "observations", None), "verifier", None)
+                    if verifier is not None and hasattr(verifier, "close"):
+                        verifier.close()
 
     app = FastAPI(
         title="Tianshu Memory",
