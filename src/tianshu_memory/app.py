@@ -339,21 +339,7 @@ def create_app(
                 lease.request = request
                 async with asyncio.timeout(execute_timeout):
                     if operation in {"consume", "check_sources"}:
-                        context = {
-                            "authenticated_service": authenticated_service,
-                            "allowed_scopes": caller.get("event_scopes", []),
-                            "allowed_role_actors": (
-                                auth.role_grants.active_ids()
-                                if caller.get("allow_runtime_roles") is True
-                                and auth.role_grants is not None
-                                else []
-                            ),
-                            "blocked_role_actors": (
-                                auth.role_grants.inactive_ids()
-                                if auth.role_grants is not None
-                                else []
-                            ),
-                        }
+                        context = auth.publisher(authenticated_service, caller)
                     else:
                         context = await lease.run(
                             auth.resolve,

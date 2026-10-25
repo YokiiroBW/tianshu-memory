@@ -66,6 +66,21 @@ class Authenticator:
                 return name, caller
         raise Fault("unauthorized", 401)
 
+    def publisher(self, service, caller):
+        """Project the current caller's existing source-publisher authority."""
+        return {
+            "authenticated_service": service,
+            "allowed_scopes": caller.get("event_scopes", []),
+            "allowed_role_actors": (
+                self.role_grants.active_ids()
+                if caller.get("allow_runtime_roles") is True and self.role_grants is not None
+                else []
+            ),
+            "blocked_role_actors": (
+                self.role_grants.inactive_ids() if self.role_grants is not None else []
+            ),
+        }
+
     def _remote_context(
         self, service, issuer, caller, assertion_ref, request_id, allow_unavailable
     ):

@@ -738,12 +738,7 @@ class MemoryService:
     def consume(self, event, publisher):
         from .memory_context.history import source_version_retained
 
-        require(publisher["authenticated_service"] == "companion")
-        require(event["scope"]["actor_id"] not in publisher.get("blocked_role_actors", []))
-        require(
-            event["scope"] in publisher["allowed_scopes"]
-            or event["scope"]["actor_id"] in publisher.get("allowed_role_actors", [])
-        )
+        self.authorize_source_publisher(event["scope"], publisher)
         require(event["conversation_id"] == event["scope"]["conversation_id"], "invalid_input", 400)
         with self.operation(scope=event["scope"], sources=event["sources"], event=event) as db:
             require(
@@ -864,13 +859,17 @@ class MemoryService:
             )
             return result
 
-    def check_sources(self, request, publisher):
+    @staticmethod
+    def authorize_source_publisher(scope, publisher):
         require(publisher["authenticated_service"] == "companion")
-        require(request["scope"]["actor_id"] not in publisher.get("blocked_role_actors", []))
+        require(scope["actor_id"] not in publisher.get("blocked_role_actors", []))
         require(
-            request["scope"] in publisher["allowed_scopes"]
-            or request["scope"]["actor_id"] in publisher.get("allowed_role_actors", [])
+            scope in publisher["allowed_scopes"]
+            or scope["actor_id"] in publisher.get("allowed_role_actors", [])
         )
+
+    def check_sources(self, request, publisher):
+        self.authorize_source_publisher(request["scope"], publisher)
         require(self.synchronized, "dependency_unavailable", 503)
         with self.operation(
             scope=request["scope"], sources=request["sources"], check=request

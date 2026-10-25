@@ -100,12 +100,17 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
         for other, _, _ in allowed[1:]:
             add(other)
         for check, resolved in legacy:
+            raw = check["kind"] == "input_sources"
+            if raw:
+                require(service.synchronized, "dependency_unavailable", 503)
             pending = []
             try:
                 if isinstance(resolved, (OriginDenied, OriginUnavailable)):
                     raise resolved
                 payload = check["request"]
                 target = payload.get("requested_scope", payload.get("requester_scope"))
+                if raw:
+                    require(target == payload["source_check"]["scope"], "invalid_input", 400)
                 authorize_check(service, db, resolved, target)
                 # A preparation rechecks each origin within its final transaction.
                 # Its source coverage remains complete even if an optional lease
@@ -116,7 +121,9 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
                     profile=check["kind"] == "profile",
                     into=pending,
                 )
-                if check["kind"] != "profile":
+                if raw:
+                    pending[-1]["source_checks"] = [payload["source_check"]]
+                elif check["kind"] != "profile":
                     for other, _, _ in authorized_scopes(
                         service, db, target, payload["include_associated"]
                     )[1:]:
@@ -141,7 +148,10 @@ def requirements(service, request, context, legacy=(), *, rejected=None, db=None
         unique = {}
         for item in result:
             key = (canonical(item["scope"]), item["profile"], item["group_read"])
-            unique.setdefault(key, item)
+            if key not in unique:
+                unique[key] = item
+            elif item.get("source_checks"):
+                unique[key].setdefault("source_checks", []).extend(item["source_checks"])
         return list(unique.values())
     return result
 
@@ -164,7 +174,21 @@ def verify_component(application, check, context, *, db=None):
     if db is not None:
         authorize_check(application.service, db, context, scope)
     try:
-        if check["kind"] == "profile":
+        if check["kind"] == "input_sources":
+            require(
+                application.service.synchronized and db is not None, "dependency_unavailable", 503
+            )
+            require(scope == request["source_check"]["scope"], "invalid_input", 400)
+            try:
+                application.service._source_rows(db, request["source_check"]["sources"], scope)
+            except Fault as error:
+                # Only this existing local source decision is a known negative.
+                # Owner relation, transport, authorization and CAS errors escape.
+                if error.code == "version_conflict" and error.status == 409:
+                    raise DependencyChanged() from error
+                raise
+            actual = dict(valid_until=context["expires_at"])
+        elif check["kind"] == "profile":
             actual = profiles.select(application.service, request, context)
         else:
             actual = getattr(application, "query" if check["kind"] == "select" else check["kind"])(
@@ -183,9 +207,11 @@ def verify_component(application, check, context, *, db=None):
     return actual
 
 
-def verify_legacy(application, checks, contexts):
+def verify_legacy(application, checks, contexts, *, db=None):
     result = []
     for check, context in zip(checks, contexts, strict=True):
-        verify_component(application, check, context)
+        verify_component(
+            application, check, context, db=db if check["kind"] == "input_sources" else None
+        )
         result.append(dict(check_id=check["check_id"], kind=check["kind"], status="valid"))
     return result

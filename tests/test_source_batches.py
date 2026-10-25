@@ -334,3 +334,64 @@ def test_shared_batch_schema_and_rules_accept_exact_consumer_observation(sync, m
     mutated["final_access"]["head"]["sequence"] += 1
     with pytest.raises(ValueError, match="moving_owner"):
         sync.service.contracts.source_batch_rules.batch_barrier(mutated, "2026-10-03T00:00:00Z")
+
+
+@pytest.mark.parametrize(
+    "violation,reason",
+    [
+        ("duplicate_turn", "turn_coverage"),
+        ("duplicate_within_page", "turn_coverage"),
+        ("empty_page", "batch_coverage"),
+        ("turn_limit", "turn_coverage"),
+        ("selector_limit", "batch_coverage"),
+    ],
+)
+def test_complete_batch_rules_reject_duplicate_turns_empty_pages_and_page_overflow(
+    sync, monkeypatch, violation, reason
+):
+    captured = []
+    synchronize = sync.service.source_authority.sync_batches
+
+    def observed(service, observation, **kwargs):
+        captured.append(copy.deepcopy(observation))
+        return synchronize(service, observation, **kwargs)
+
+    monkeypatch.setattr(sync.service.source_authority, "sync_batches", observed)
+    retain_history(sync, 257)
+    check = sync.check()
+    sync.service.source_authority.barrier(
+        sync.service, sync.scope(), sources=check["sources"], check=check
+    )
+    original = captured[-1]
+    rules = sync.service.contracts.source_batch_rules
+    assert rules.batch_barrier(original, "2026-10-03T00:00:00Z")
+    mutated = copy.deepcopy(original)
+    first, last = mutated["observations"]
+    if violation == "duplicate_turn":
+        last["request"]["turn_ids"] = first["request"]["turn_ids"]
+        last["snapshot"]["turns"] = first["snapshot"]["turns"]
+        last["snapshot"]["request_digest"] = fingerprint(last["request"])
+        # Each real page remains independently correlated and complete; only
+        # the full bundle reveals that one turn was presented twice.
+        for observation in mutated["observations"]:
+            sync.service.contracts.source_rules.sync_barrier(
+                dict(observation, now="2026-10-03T00:00:00Z")
+            )
+    elif violation == "empty_page":
+        last["request"].update(selectors=[], turn_ids=[])
+        last["snapshot"].update(
+            request_digest=fingerprint(last["request"]), physicals=[], admissions=[], turns=[]
+        )
+        last["access_request"]["admissions"] = []
+        last["access"].update(request_digest=fingerprint(last["access_request"]), grants=[])
+        sync.service.contracts.source_rules.sync_barrier(dict(last, now="2026-10-03T00:00:00Z"))
+    elif violation == "duplicate_within_page":
+        first["request"]["turn_ids"] *= 2
+    elif violation == "turn_limit":
+        last["request"]["turn_ids"] = [f"turn:overflow:{index}" for index in range(33)]
+    else:
+        extra = copy.deepcopy(first["request"]["selectors"][0])
+        extra["key"]["message_id"] = "source:overflow"
+        first["request"]["selectors"].append(extra)
+    with pytest.raises(ValueError, match=reason):
+        rules.batch_barrier(mutated, "2026-10-03T00:00:00Z")

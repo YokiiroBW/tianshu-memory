@@ -27,10 +27,28 @@ DEFINITIONS = {
 }
 
 
+def source_permissions(auth, name, caller, checks):
+    """A context lease does not grant the standalone source-publisher permission."""
+    raw = [check for check in checks if check["kind"] == "input_sources"]
+    if not raw:
+        return
+    require("check_sources" in caller.get("operations", []))
+    publisher = auth.publisher(name, caller)
+    from ..service import MemoryService
+
+    for check in raw:
+        payload = check["request"]
+        require(
+            payload["requested_scope"] == payload["source_check"]["scope"], "invalid_input", 400
+        )
+        MemoryService.authorize_source_publisher(payload["requested_scope"], publisher)
+
+
 def preparation_contexts(auth, name, caller, request, context):
     from .preparation import catalog
 
     required = catalog(request)
+    source_permissions(auth, name, caller, request["checks"])
     main_origin = canonical(request["query"]["origin"])
     necessary_origins = {main_origin} | {
         canonical(check["request"]["query"]["origin"])
@@ -68,6 +86,7 @@ def preparation_contexts(auth, name, caller, request, context):
 
 def verification_contexts(auth, name, caller, request, context):
     """Resolve each complete origin once in this strict verification request."""
+    source_permissions(auth, name, caller, request["checks"])
     cache = {canonical(request["query"]["origin"]): context}
     result = []
     for check in request["checks"]:

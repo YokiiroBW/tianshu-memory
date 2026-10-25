@@ -148,6 +148,7 @@ class SourceAuthority:
         extra_selectors=(),
         windows=(),
         summary_scopes=(),
+        source_checks=(),
     ):
         require(
             not group_read
@@ -189,6 +190,7 @@ class SourceAuthority:
                             if check
                             else []
                         ),
+                        *(item["turn_id"] for item in source_checks),
                         *(
                             member["turn_id"]
                             for manifest in all_windows.values()
@@ -326,20 +328,30 @@ class SourceAuthority:
                 )
                 self._relations("actor_event", event, turn, snapshot)
             if check:
-                turn = next(
-                    item for item in snapshot["turns"] if item["turn_id"] == check["turn_id"]
-                )
-                require(
-                    turn["scope"] == scope
-                    and turn["turn_id"] == check["turn_id"]
-                    and turn["input_revision"] == check["input_revision"]
-                    and turn["input_sources"] == list(sources),
-                    "dependency_unavailable",
-                    503,
-                )
-                self._relations("current_actor_sources", scope, sources, snapshot)
+                self._check_input_sources(check, snapshot)
+            if source_checks:
+                # These are the actual same-head observations already validated
+                # and committed above. A raw turn may be in any 32-turn page,
+                # and its original sources may be in any 256-selector page.
+                complete = self._merge_snapshot(observations)
+                for source_check in source_checks:
+                    self._check_input_sources(source_check, complete)
             return result, final_access.get("viewer_context")
         raise Fault("dependency_unavailable", 503)
+
+    def _check_input_sources(self, check, snapshot):
+        turn = next(
+            (item for item in snapshot["turns"] if item["turn_id"] == check["turn_id"]), None
+        )
+        require(
+            turn is not None
+            and turn["scope"] == check["scope"]
+            and turn["input_revision"] == check["input_revision"]
+            and turn["input_sources"] == list(check["sources"]),
+            "dependency_unavailable",
+            503,
+        )
+        self._relations("current_actor_sources", check["scope"], check["sources"], snapshot)
 
     def _refresh_unchanged(self, service, observation, final):
         """Double-collect the requested facts when an unrelated Core write moves its head.
@@ -451,27 +463,7 @@ class SourceAuthority:
             key=canonical,
         )
         first = observations[0]
-        physicals = {}
-        receipts = set()
-        for observation in observations:
-            for physical in observation["snapshot"]["physicals"]:
-                key = fingerprint(physical["key"])
-                require(
-                    key not in physicals or physicals[key] == physical,
-                    "dependency_unavailable",
-                    503,
-                )
-                physicals[key] = physical
-            for admission in observation["snapshot"]["admissions"]:
-                receipt = admission["source"]["receipt_id"]
-                require(receipt not in receipts, "dependency_unavailable", 503)
-                receipts.add(receipt)
-        snapshot = dict(
-            first["snapshot"],
-            physicals=list(physicals.values()),
-            admissions=[a for item in observations for a in item["snapshot"]["admissions"]],
-            turns=[turn for item in observations for turn in item["snapshot"]["turns"]],
-        )
+        snapshot = self._merge_snapshot(observations)
         access = dict(
             first["access"], grants=[g for item in observations for g in item["access"]["grants"]]
         )
@@ -498,6 +490,31 @@ class SourceAuthority:
             self.contracts.validate("sync-workflow#sync_result", result)
         return result
 
+    @staticmethod
+    def _merge_snapshot(observations):
+        """Join actual pages using the same physical and receipt consistency rules."""
+        physicals = {}
+        receipts = set()
+        for observation in observations:
+            for physical in observation["snapshot"]["physicals"]:
+                key = fingerprint(physical["key"])
+                require(
+                    key not in physicals or physicals[key] == physical,
+                    "dependency_unavailable",
+                    503,
+                )
+                physicals[key] = physical
+            for admission in observation["snapshot"]["admissions"]:
+                receipt = admission["source"]["receipt_id"]
+                require(receipt not in receipts, "dependency_unavailable", 503)
+                receipts.add(receipt)
+        return dict(
+            observations[0]["snapshot"],
+            physicals=list(physicals.values()),
+            admissions=[a for item in observations for a in item["snapshot"]["admissions"]],
+            turns=[turn for item in observations for turn in item["snapshot"]["turns"]],
+        )
+
     @contextmanager
     def local_commit(self, service):
         """Serialize a local writer's entire transaction without a remote barrier.
@@ -519,7 +536,9 @@ class SourceAuthority:
             require(
                 active["service"] is service
                 and key in active["domains"]
-                and not any(kwargs.get(name) for name in ("sources", "event", "check")),
+                and not any(
+                    kwargs.get(name) for name in ("sources", "event", "check", "source_checks")
+                ),
                 "dependency_unavailable",
                 503,
             )
@@ -546,7 +565,7 @@ class SourceAuthority:
         )
         with self._operation_order.turn(), source_read_lock(self._operation_lock):
             begin_source_read()
-            selectors, domains = {}, set()
+            selectors, domains, source_checks = {}, set(), []
             with service.store.transaction() as db:
                 for item in requirements:
                     scope = item["scope"]
@@ -556,6 +575,12 @@ class SourceAuthority:
                     domains.add((canonical(scope), profile, shared))
                     for selected in self.coverage(db, scope, (), profile, shared):
                         selectors[canonical(selected)] = selected
+                    for check in item.get("source_checks", ()):
+                        require(check["scope"] == scope, "invalid_input", 400)
+                        source_checks.append(check)
+                        for source in check["sources"]:
+                            selected = source_selector(source, scope)
+                            selectors[canonical(selected)] = selected
             primary = requirements[0]
             with self._operation(
                 service,
@@ -567,6 +592,7 @@ class SourceAuthority:
                 summary_scopes=[
                     (item["scope"], bool(item.get("group_read"))) for item in requirements
                 ],
+                source_checks=source_checks,
             ) as db:
                 self._bundled.active = {"service": service, "domains": domains, "db": db}
                 try:

@@ -661,7 +661,7 @@ def verify(application, request, context, legacy_contexts):
     with operation(service, items) as db:
         frame = collect(service, db, bundle, context)
         fresh = verify_snapshot(service, db, bundle, frame, context)
-        checked = verify_legacy(application, request["checks"], legacy_contexts)
+        checked = verify_legacy(application, request["checks"], legacy_contexts, db=db)
         # Request-local issuer reuse cannot borrow a later lease or return a
         # valid verification after any adopted origin expired during the work.
         service._authorize(db, context, scope=request["requested_scope"])
