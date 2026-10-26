@@ -90,6 +90,10 @@ def main():
         "migrate-segments", help="Stop writers; add bounded multi-person jobs with guarded backup"
     )
     migrate_segments.add_argument("--backup", required=True)
+    migrate_actor = sub.add_parser(
+        "migrate-actor-memory", help="Initialize the independent actor domain without user tables"
+    )
+    migrate_actor.add_argument("--backup", required=True)
     reindex_memory = sub.add_parser(
         "reindex-memory",
         help="Rebuild derived documents from currently authorized original sources",
@@ -125,6 +129,12 @@ def main():
 
 def run_local_operation(args, parser):
     """Every non-deployment operation, exactly as the product already ran it."""
+    if args.operation == "migrate-actor-memory":
+        from .actor_memory.store import Store as ActorStore
+
+        config = strict_json(Path(args.config).read_bytes())
+        print(json.dumps(ActorStore.initialize(config, args.backup), ensure_ascii=False, indent=2))
+        return
     if args.operation in {
         "migrate-profiles",
         "migrate-sources",

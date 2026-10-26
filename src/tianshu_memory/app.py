@@ -81,8 +81,11 @@ def create_app(
             yield
         finally:
             try:
-                if auth is not None and hasattr(auth, "close"):
-                    auth.close()
+                try:
+                    await application.state.actor_memory.aclose()
+                finally:
+                    if auth is not None and hasattr(auth, "close"):
+                        auth.close()
             finally:
                 try:
                     transport = getattr(
@@ -113,6 +116,11 @@ def create_app(
         raise ValueError("Invalid chat request limits")
     admission = Requests(max_active, reserve_identity=True)
     app.state.chat_requests = admission
+    from .actor_memory.http import mount as mount_actor_memory
+
+    mount_actor_memory(
+        app, auth, body_timeout=body_timeout, execute_timeout=execute_timeout, max_active=max_active
+    )
     from .candidate_http import mount as mount_candidates
 
     mount_candidates(
