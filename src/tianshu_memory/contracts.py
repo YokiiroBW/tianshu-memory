@@ -22,6 +22,10 @@ CONTENT_MANIFEST_SHA256 = "beecd2f75b09df089f7d20c10c1ba39cdaa79c5ba78b8db702ef5
 LIFE_MANIFEST_SHA256 = "ff7cbaf5bb9cf1330a11821c0e5f0eefb728a934e9fb8698c9b644e09f43042c"
 EXTRACTION_MANIFEST_SHA256 = "205239730bf6aa5ff320cf9f300ae9c301c15559c0147aecd1fe001e8bfe5b82"
 CONTEXT_V2_MANIFEST_SHA256 = "ec39155651f4c2d09183ccba5735cc9b9fc8ab9854de546223a89a46ff020ac9"
+GROUP_PROJECTION_MANIFEST_SHA256 = (
+    "ce97efa564962779c112a453970f8e93f340ac4366f4df641dff58fde871709b"
+)
+ARCHIVE_CHECK_MANIFEST_SHA256 = "4a99c3bda5e07c06974e9d21224230b7cdcbf3ba68490c67d0ffa4193a263260"
 
 
 def digest(data: bytes) -> str:
@@ -149,6 +153,42 @@ class Contracts:
         self._validation_lock = Lock()
         self._validation_registry = None
         self._validators = {}
+
+    def load_browser_extension(self, operation):
+        package, pin = {
+            "topics": ("group-memory-projection", GROUP_PROJECTION_MANIFEST_SHA256),
+            "archive-check": ("archive-memory-check", ARCHIVE_CHECK_MANIFEST_SHA256),
+        }[operation]
+        with self._validation_lock:
+            if package in self.schemas:
+                return package
+            directory = self.directory.parent.parent / package / "candidate-v1"
+            raw = (directory / "manifest.json").read_bytes()
+            manifest = json.loads(raw)
+            if (
+                digest(raw) != pin
+                or manifest.get("name") != package
+                or manifest.get("version") != "1.0.0-candidate.1"
+            ):
+                raise ValueError("Browser extension contract manifest mismatch")
+            for name, expected in manifest["sha256"].items():
+                path = (directory / name).resolve()
+                if (
+                    not path.is_relative_to(directory.resolve())
+                    or digest(path.read_bytes()) != expected
+                ):
+                    raise ValueError("Browser extension contract file mismatch")
+            schema = json.loads((directory / "schema.json").read_bytes())
+            if (
+                schema["$id"]
+                != "https://tianshu.local/contracts/" + package + "/candidate-v1/schema.json"
+            ):
+                raise ValueError("Browser extension schema identity mismatch")
+            self.schemas[package] = schema
+            self.registry = self.registry.with_resource(
+                schema["$id"], Resource.from_contents(schema)
+            )
+        return package
 
     def load_profiles(self):
         directory = self.directory.parent.parent / "profile-memory/v1"

@@ -5,6 +5,7 @@ from datetime import timedelta
 
 import pytest
 from test_actor_memory import actor as actor
+from test_actor_memory import actor_storage as actor_storage
 from test_actor_memory import append, execute, read, request
 
 from tianshu_memory.actor_memory.application import INTERNAL

@@ -103,6 +103,39 @@ def _current(service, db, event, snapshot):
     return rows
 
 
+def group_projection_current(service, db, event, snapshot, scope):
+    """The original sealed dependency predicate, restricted to one public group frame."""
+    expected = {key: scope[key] for key in ("actor_id", "audience", "conversation_id")}
+    if expected["audience"] != "group" or event["frame"] != expected:
+        return False
+    try:
+        rows = _current(service, db, event, snapshot)
+    except Fault as error:
+        if (error.code, error.status) in {("scope_changed", 409), ("not_found", 404)}:
+            return False
+        raise
+    if any(
+        {key: json.loads(row["scope"])[key] for key in expected} != expected
+        for row in rows.values()
+    ):
+        return False
+    windows = [window["manifest"] for window in event["context_windows"]]
+    turns = {member["turn_id"] for window in windows for member in window["members"]}
+    current_turns = {}
+    for start in range(0, len(turns), 256):
+        page = sorted(turns)[start : start + 256]
+        current_turns.update(
+            (row["key"], json.loads(row["payload"]))
+            for row in db.execute(
+                "SELECT key,payload FROM source_observations WHERE kind='turn' AND key IN ("
+                + ",".join("?" for _ in page)
+                + ")",
+                page,
+            )
+        )
+    return all(consolidation_sources.turns_current(window, current_turns) for window in windows)
+
+
 def _public(manifest):
     return {
         key: manifest[key]

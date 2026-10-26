@@ -85,13 +85,13 @@ def _cursor_key(token):
     return hashlib.sha256(("memory-browser-cursor-v1:" + token).encode("utf-8")).digest()
 
 
-def _cursor_encode(data, token):
+def encode_cursor(data, token):
     payload = canonical(data).encode("utf-8")
     signature = hmac.new(_cursor_key(token), payload, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(payload + signature).decode("ascii").rstrip("=")
 
 
-def _cursor_decode(value, token, expected):
+def decode_cursor(value, token, expected):
     if value is None:
         return None
     try:
@@ -319,27 +319,43 @@ def _subjects(service, db, scope, last, limit):
     return items, previous if more else None
 
 
+def authorize_current(auth, caller_name, caller, body):
+    """The original browser service/account/scope registration, freshly resolved."""
+    current_name, current_caller = auth.authenticate("Bearer " + caller["token"])
+    require(
+        current_name == caller_name and "browse" in current_caller.get("operations", []),
+        "forbidden",
+        403,
+    )
+    context = auth.resolve(
+        current_name, current_caller, body["origin"]["assertion_ref"], body["request_id"]
+    )
+    _registration(auth, caller_name, current_caller, context, body["scope"])
+    return context, current_caller
+
+
 @contextmanager
-def _authorized_db(service, auth, caller_name, caller, body, profile):
+def authorized_snapshot(service, auth, caller_name, caller, body):
+    """Current browser authorization over a guarded local snapshot; no source assertion."""
+    context, current_caller = authorize_current(auth, caller_name, caller, body)
+    with service.store.transaction() as db:
+        service._authorize(db, context, scope=body["scope"])
+        yield db, current_caller
+
+
+@contextmanager
+def authorized_db(service, auth, caller_name, caller, body, profile, **requirements):
     """Join owner sync, fresh Platform identity and the guarded local snapshot."""
     scope = body["scope"]
-    presented = caller["token"]
     for _ in range(3):
         # The frozen v1 verifier accepts a Companion viewer only. Owner-only sync still
         # validates every physical/admission/grant and commits negatives independently.
-        result, _ = service.source_authority.barrier(service, scope, context=None, profile=profile)
+        result, _ = service.source_authority.barrier(
+            service, scope, context=None, profile=profile, **requirements
+        )
         # Network I/O finishes before opening the SQLite transaction. A changed bearer or
         # withdrawn/reshaped origin fails here, after owner negatives have already committed.
-        current_name, current_caller = auth.authenticate("Bearer " + presented)
-        require(
-            current_name == caller_name and "browse" in current_caller.get("operations", []),
-            "forbidden",
-            403,
-        )
-        context = auth.resolve(
-            current_name, current_caller, body["origin"]["assertion_ref"], body["request_id"]
-        )
-        _registration(auth, caller_name, current_caller, context, scope)
+        context, current_caller = authorize_current(auth, caller_name, caller, body)
         with service.store.transaction() as db:
             if service.source_authority.revision(db) != result["local_revision"]:
                 continue
@@ -365,7 +381,7 @@ def read(service, auth, caller_name, caller, body, context, operation):
                 403,
             )
     require(service.synchronized, "dependency_unavailable", 503)
-    with _authorized_db(
+    with authorized_db(
         service,
         auth,
         caller_name,
@@ -404,7 +420,7 @@ def read(service, auth, caller_name, caller, body, context, operation):
             "revision": revision,
             "version": version,
         }
-        last = _cursor_decode(body.get("cursor"), current_caller["token"], expected)
+        last = decode_cursor(body.get("cursor"), current_caller["token"], expected)
         limit = body.get("limit", 20)
         if operation == "records":
             require(last is None or isinstance(last, str), "invalid_input", 400)
@@ -423,7 +439,7 @@ def read(service, auth, caller_name, caller, body, context, operation):
             items, next_last = _subjects(service, db, scope, last, limit)
         stamp.update(
             items=items,
-            next_cursor=_cursor_encode(dict(expected, last=next_last), current_caller["token"])
+            next_cursor=encode_cursor(dict(expected, last=next_last), current_caller["token"])
             if next_last is not None
             else None,
         )
@@ -439,7 +455,7 @@ def read(service, auth, caller_name, caller, body, context, operation):
                     target["kind"],
                     target.get("person_id", target.get("conversation_id")),
                 ]
-            stamp["next_cursor"] = _cursor_encode(
+            stamp["next_cursor"] = encode_cursor(
                 dict(expected, last=last_retained), current_caller["token"]
             )
         return stamp

@@ -123,7 +123,13 @@ class Owner:
 
 
 @pytest.fixture
-def actor(tmp_path, monkeypatch):
+def actor_storage():
+    """The native PG bridge may supply its already-owned ordinary storage settings."""
+    return {}
+
+
+@pytest.fixture
+def actor(tmp_path, monkeypatch, actor_storage):
     for name in ("TIANSHU_POSTGRES_URL", "TIANSHU_REDIS_URL", "TIANSHU_STORAGE_NAMESPACE"):
         monkeypatch.delenv(name, raising=False)
     directory = Path(
@@ -137,6 +143,7 @@ def actor(tmp_path, monkeypatch):
     user_path.write_bytes(b"unchanged independent user authority")
     config = dict(
         database_path=str(user_path),
+        storage_backends=actor_storage,
         actor_memory=dict(
             database_path=str(tmp_path / "actor.sqlite"), contract_directory=str(directory)
         ),

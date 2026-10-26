@@ -458,11 +458,17 @@ def create_app(
                 body = bytearray()
                 async with asyncio.timeout(body_timeout):
                     async for chunk in request.stream():
-                        if len(body) + len(chunk) > 16384:
+                        if len(body) + len(chunk) > (
+                            262144 if operation == "archive-check" else 16384
+                        ):
                             raise Fault("invalid_input", 413)
                         body.extend(chunk)
                 payload = strict_json(body)
-                browser.validate_request(operation, payload)
+                if operation in {"topics", "archive-check"}:
+                    package = service.contracts.load_browser_extension(operation)
+                    service.contracts.validate(package + "#request", payload)
+                else:
+                    browser.validate_request(operation, payload)
                 request_id = payload["request_id"]
                 lease.request = request
                 async with asyncio.timeout(execute_timeout):
@@ -483,6 +489,18 @@ def create_app(
                                 "operations", []
                             ):
                                 raise Fault("forbidden", 403)
+                            if operation == "topics":
+                                from .browser_topics import read
+
+                                return read(
+                                    service, auth, caller_name, current_caller, payload, context
+                                )
+                            if operation == "archive-check":
+                                from .browser_archive import read
+
+                                return read(
+                                    service, auth, caller_name, current_caller, payload, context
+                                )
                             return browser.read(
                                 service,
                                 auth,
@@ -525,7 +543,7 @@ def create_app(
 
     mount_role_grants(app, auth, admission, body_timeout=body_timeout)
 
-    for operation in ("overview", "subjects", "records"):
+    for operation in ("overview", "subjects", "records", "topics", "archive-check"):
         app.add_api_route(
             f"/internal/v1/memory/browser/{operation}",
             browser_endpoint_for(operation),
