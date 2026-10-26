@@ -71,26 +71,34 @@ def component_key(check):
 
 
 def execute(application, request, context, contexts):
-    # A signed selection can now fail while its exact proof is being planned,
-    # before entering the shared transaction. Keep the same primary outcome.
-    try:
-        return _execute(application, request, context, contexts)
-    except SelectionChanged as error:
-        return invalid(request, error)
+    # A child may lose its exact closure while waiting for this checkpoint.
+    # Remove only named failed children, then prove every remaining input. A
+    # primary/shared failure and every unclassified error retain their outcome.
+    rejected = {}
+    children = {
+        check["check_id"] for check in request["checks"] if check["kind"] == "context_bundle"
+    }
+    while True:
+        try:
+            return _execute(application, request, context, contexts, rejected)
+        except SelectionChanged as error:
+            failed = error.root_ids - rejected.keys()
+            if not error.root_ids or not error.root_ids <= children or not failed:
+                return invalid(request, error)
+            rejected.update((identity, DependencyChanged()) for identity in failed)
 
 
-def _execute(application, request, context, contexts):
+def _execute(application, request, context, contexts, rejected):
     required = catalog(request)
-    service, rejected = application.service, {}
+    service = application.service
     pairs = list(zip(request["checks"], contexts, strict=True))
     items = requirements(service, request, context, pairs, rejected=rejected)
     planned = domains(items)
     with operation(service, items) as db:
         try:
             require_selection(request["bundle"]["effective_scope"] == request["requested_scope"])
-            frame = read_v2.collect(service, db, request["bundle"], context)
             # Authenticate semantics and compare the current selection exactly once.
-            fresh = read_v2.verify_snapshot(service, db, request["bundle"], frame, context)
+            fresh = read_v2.verify_selected(service, db, request["bundle"], context)
         except SelectionChanged as error:
             return invalid(request, error)
         # Re-evaluate the catalog against this one final transaction. A changed
@@ -106,7 +114,13 @@ def _execute(application, request, context, contexts):
                     key = component_key(check)
                     if key not in cache:
                         try:
-                            cache[key] = verify_component(application, check, resolved, db=db)
+                            cache[key] = verify_component(
+                                application,
+                                check,
+                                resolved,
+                                db=db,
+                                verify_selected=read_v2.verify_selected,
+                            )
                         except (OriginDenied, DependencyChanged) as failure:
                             cache[key] = failure
                     actual = cache[key]

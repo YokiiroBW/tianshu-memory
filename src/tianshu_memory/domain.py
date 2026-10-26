@@ -240,7 +240,10 @@ class DependencyChanged(Fault):
 class SelectionChanged(Fault):
     """The current signed selection fails a specific fresh comparison."""
 
-    def __init__(self):
+    def __init__(self, *, root_ids=()):
+        # Local planner provenance only. None denotes the primary selection;
+        # these identities are never accepted from wire or included in a Fault.
+        self.root_ids = frozenset(root_ids)
         super().__init__("scope_changed", 409)
 
 

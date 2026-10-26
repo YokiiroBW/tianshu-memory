@@ -9,6 +9,7 @@ from ..domain import (
     Fault,
     OriginDenied,
     OriginUnavailable,
+    SelectionChanged,
     canonical,
     parse_time,
     require,
@@ -55,6 +56,21 @@ def verify_selection_proof(db, bundle):
     require_selection(hmac.compare_digest(bundle["bundle_id"], selection_proof(db, bundle)))
 
 
+def selected_bundle(db, scope, bundle, *, root_id=None):
+    """Authenticated identities only; the authority rebuilds their complete DB closure."""
+    require_selection(bundle["effective_scope"] == scope)
+    verify_selection_proof(db, bundle)
+    selected = dict(
+        scope=scope,
+        group_ids=[item["group"]["semantic_group_id"] for item in bundle["group_dependencies"]],
+        episode_ids=[item["episode_id"] for item in bundle["episode_dependencies"]],
+        source_keys=[item["source_key"] for item in bundle["source_dependencies"]],
+    )
+    if root_id is not None:
+        selected["root_id"] = root_id
+    return selected
+
+
 def authorize_check(service, db, context, scope):
     """Classify only this local scope decision, after HTTP origin integrity checks."""
     try:
@@ -97,16 +113,7 @@ def requirements(
             require_selection(server_selection["scope"] == scope)
             selected = server_selection
         elif service.synchronized and bundle is not None and contextual(bundle):
-            require_selection(bundle["effective_scope"] == scope)
-            verify_selection_proof(db, bundle)
-            selected = dict(
-                scope=scope,
-                group_ids=[
-                    item["group"]["semantic_group_id"] for item in bundle["group_dependencies"]
-                ],
-                episode_ids=[item["episode_id"] for item in bundle["episode_dependencies"]],
-                source_keys=[item["source_key"] for item in bundle["source_dependencies"]],
-            )
+            selected = selected_bundle(db, scope, bundle)
         allowed = authorized_scopes(
             service,
             db,
@@ -180,7 +187,10 @@ def requirements(
             )
         for check, resolved in legacy:
             raw = check["kind"] == "input_sources"
-            if raw:
+            inherited = check["kind"] == "context_bundle"
+            if inherited and rejected is not None and check["check_id"] in rejected:
+                continue
+            if raw or inherited:
                 require(service.synchronized, "dependency_unavailable", 503)
             pending = []
             try:
@@ -191,6 +201,15 @@ def requirements(
                 if raw:
                     require(target == payload["source_check"]["scope"], "invalid_input", 400)
                 authorize_check(service, db, resolved, target)
+                child = None
+                if inherited:
+                    require(contextual(payload["bundle"]), "invalid_input", 400)
+                    try:
+                        child = selected_bundle(
+                            db, target, payload["bundle"], root_id=check["check_id"]
+                        )
+                    except SelectionChanged as error:
+                        raise DependencyChanged() from error
                 # A preparation rechecks each origin within its final transaction.
                 # Its source coverage remains complete even if an optional lease
                 # expires while waiting for the shared operation lock.
@@ -200,7 +219,9 @@ def requirements(
                     profile=check["kind"] == "profile",
                     into=pending,
                     selection=(
-                        dict(scope=target, group_ids=[], episode_ids=[], source_keys=[])
+                        child
+                        if inherited
+                        else dict(scope=target, group_ids=[], episode_ids=[], source_keys=[])
                         if raw and selected is not None
                         else None
                     ),
@@ -209,9 +230,28 @@ def requirements(
                     pending[-1]["source_checks"] = [payload["source_check"]]
                 elif check["kind"] != "profile":
                     for other, _, _ in authorized_scopes(
-                        service, db, target, payload["include_associated"]
+                        service,
+                        db,
+                        target,
+                        payload["bundle"]["include_associated"]
+                        if inherited
+                        else payload["include_associated"],
                     )[1:]:
-                        add(other, into=pending)
+                        add(
+                            other,
+                            into=pending,
+                            selection=(
+                                dict(
+                                    scope=other,
+                                    group_ids=[],
+                                    episode_ids=[],
+                                    source_keys=[],
+                                    root_id=check["check_id"],
+                                )
+                                if inherited
+                                else None
+                            ),
+                        )
                 if covered is not None:
                     require_dependency(
                         all(
@@ -248,7 +288,12 @@ def requirements(
         # is still needed only once. Preserve the primary context, inserted first.
         unique = {}
         for item in result:
-            key = (canonical(item["scope"]), item["profile"], item["group_read"])
+            key = (
+                canonical(item["scope"]),
+                item["profile"],
+                item["group_read"],
+                item.get("selected", {}).get("root_id"),
+            )
             if key not in unique:
                 unique[key] = item
             else:
@@ -280,7 +325,7 @@ def operation(service, items):
             yield db
 
 
-def verify_component(application, check, context, *, db=None):
+def verify_component(application, check, context, *, db=None, verify_selected=None):
     from .. import profiles
 
     request, expected = check["request"], check["expected"]
@@ -288,7 +333,19 @@ def verify_component(application, check, context, *, db=None):
     if db is not None:
         authorize_check(application.service, db, context, scope)
     try:
-        if check["kind"] == "input_sources":
+        if check["kind"] == "context_bundle":
+            require(
+                application.service.synchronized and db is not None and verify_selected is not None,
+                "dependency_unavailable",
+                503,
+            )
+            require(contextual(request["bundle"]), "invalid_input", 400)
+            try:
+                fresh = verify_selected(application.service, db, request["bundle"], context)
+            except SelectionChanged as error:
+                raise DependencyChanged() from error
+            actual = dict(valid_until=fresh["valid_until"])
+        elif check["kind"] == "input_sources":
             require(
                 application.service.synchronized and db is not None, "dependency_unavailable", 503
             )
@@ -321,11 +378,15 @@ def verify_component(application, check, context, *, db=None):
     return actual
 
 
-def verify_legacy(application, checks, contexts, *, db=None):
+def verify_legacy(application, checks, contexts, *, db=None, verify_selected=None):
     result = []
     for check, context in zip(checks, contexts, strict=True):
         verify_component(
-            application, check, context, db=db if check["kind"] == "input_sources" else None
+            application,
+            check,
+            context,
+            db=db if check["kind"] in {"input_sources", "context_bundle"} else None,
+            verify_selected=verify_selected,
         )
         result.append(dict(check_id=check["check_id"], kind=check["kind"], status="valid"))
     return result

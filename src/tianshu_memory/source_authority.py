@@ -8,6 +8,7 @@ from . import consolidation_sources as summary_sources
 from . import segment_sources
 from .domain import (
     Fault,
+    SelectionChanged,
     admission_key,
     canonical,
     fingerprint,
@@ -147,22 +148,47 @@ class SourceAuthority:
     def _selected_plan(self, service, db, scope, read_plan):
         """Rebuild one internal proof plan inside both original CAS transactions."""
         extra_selectors = read_plan["source_selectors"]
-        keys = {fingerprint(item) for item in extra_selectors}
+        # Explicit/raw roots belong to the primary checkpoint. Each selected
+        # root below already returns its complete alias closure independently.
+        keys = segment_sources.equivalent_keys(db, {fingerprint(item) for item in extra_selectors})
         selectors = {canonical(item): item for item in extra_selectors}
         materials, manifests = {}, {}
-        for selection in read_plan["selected"]:
-            required, saved = summary_sources.selected_dependencies(service, db, selection)
+        key_roots = {key: {None} for key in keys}
+        window_roots, selections, checked_windows = {}, {}, set()
+
+        def include(roots, required, saved):
             keys.update(required)
-            manifests.update((item["window_id"], item) for item in saved)
-        checked_windows = set()
+            for key in required:
+                key_roots.setdefault(key, set()).update(roots)
+            for item in saved:
+                manifests[item["window_id"]] = item
+                current = window_roots.setdefault(item["window_id"], set())
+                if not roots <= current:
+                    current.update(roots)
+                    checked_windows.discard(item["window_id"])
+
+        def dependencies(selection, roots):
+            try:
+                return summary_sources.selected_dependencies(service, db, selection)
+            except SelectionChanged as error:
+                raise SelectionChanged(root_ids=roots) from error
+
+        for selection in read_plan["selected"]:
+            value = {key: item for key, item in selection.items() if key != "root_id"}
+            identity = canonical(value)
+            if identity not in selections:
+                selections[identity] = value, set()
+            selections[identity][1].add(selection.get("root_id"))
+        for selection, roots in selections.values():
+            required, saved = dependencies(selection, roots)
+            include(roots, required, saved)
         while True:
             unchecked = [
                 item for identity, item in manifests.items() if identity not in checked_windows
             ]
             for manifest in unchecked:
-                required, saved = summary_sources.selected_dependencies(
-                    service,
-                    db,
+                roots = window_roots[manifest["window_id"]]
+                required, saved = dependencies(
                     dict(
                         scope=manifest["scope"],
                         group_ids=[],
@@ -170,11 +196,10 @@ class SourceAuthority:
                         source_keys=[],
                         windows=[manifest],
                     ),
+                    roots,
                 )
-                keys.update(required)
-                manifests.update((item["window_id"], item) for item in saved)
+                include(roots, required, saved)
                 checked_windows.add(manifest["window_id"])
-            keys = segment_sources.equivalent_keys(db, keys)
             for material in segment_sources.collect(
                 db,
                 scope,
@@ -183,9 +208,15 @@ class SourceAuthority:
                 required_only=True,
             ):
                 materials[material["id"]] = material
-            material_checks, saved = segment_sources.requirements(materials.values())
-            new_windows = {item["window_id"]: item for item in saved}
-            manifests.update(new_windows)
+            checks = {}
+            for material in materials.values():
+                roots = set(key_roots.get(material["source_key"], {None}))
+                if material["id"] in read_plan["material_ids"]:
+                    roots.add(None)
+                current, saved = segment_sources.requirements([material])
+                checks.update((canonical(item), item) for item in current)
+                include(roots, (), saved)
+            material_checks = list(checks.values())
             if set(manifests) <= checked_windows:
                 break
         ordered_keys = sorted(keys)

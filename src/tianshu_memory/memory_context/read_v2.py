@@ -645,6 +645,11 @@ def verify_snapshot(service, db, bundle, frame, context):
     return fresh
 
 
+def verify_selected(service, db, bundle, context):
+    """Rebuild and verify an existing selection within the caller's checkpoint."""
+    return verify_snapshot(service, db, bundle, collect(service, db, bundle, context), context)
+
+
 def verify(application, request, context, legacy_contexts):
     service = application.service
     bundle = request["bundle"]
@@ -658,9 +663,10 @@ def verify(application, request, context, legacy_contexts):
         service, request, context, list(zip(request["checks"], legacy_contexts, strict=True))
     )
     with operation(service, items) as db:
-        frame = collect(service, db, bundle, context)
-        fresh = verify_snapshot(service, db, bundle, frame, context)
-        checked = verify_legacy(application, request["checks"], legacy_contexts, db=db)
+        fresh = verify_selected(service, db, bundle, context)
+        checked = verify_legacy(
+            application, request["checks"], legacy_contexts, db=db, verify_selected=verify_selected
+        )
         # Request-local issuer reuse cannot borrow a later lease or return a
         # valid verification after any adopted origin expired during the work.
         service._authorize(db, context, scope=request["requested_scope"])
