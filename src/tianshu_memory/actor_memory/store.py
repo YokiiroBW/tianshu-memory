@@ -18,6 +18,8 @@ TABLES = (
     "actor_dependencies",
     "actor_sources",
     "actor_receipts",
+    "actor_derived",
+    "actor_derived_basis",
 )
 DDL = (
     "CREATE TABLE actor_metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL)",
@@ -27,16 +29,20 @@ DDL = (
     "CREATE INDEX actor_dependency_source ON actor_dependencies(actor_id,producer,object_id)",
     "CREATE TABLE actor_sources (actor_id TEXT NOT NULL,producer TEXT NOT NULL,object_id TEXT NOT NULL,source TEXT NOT NULL,generation TEXT NOT NULL,sequence INTEGER NOT NULL,access_version TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(actor_id,producer,object_id))",
     "CREATE TABLE actor_receipts (caller TEXT NOT NULL,actor_id TEXT NOT NULL,command TEXT NOT NULL,idempotency_key TEXT NOT NULL,digest TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(caller,actor_id,command,idempotency_key))",
+    "CREATE TABLE actor_derived (id TEXT PRIMARY KEY,actor_id TEXT NOT NULL,revision INTEGER NOT NULL,state TEXT NOT NULL,identity TEXT NOT NULL UNIQUE,payload TEXT NOT NULL,recorded_at TEXT NOT NULL,expires_at TEXT NOT NULL)",
+    "CREATE INDEX actor_derived_owner ON actor_derived(actor_id,state,recorded_at)",
+    "CREATE TABLE actor_derived_basis (derived_id TEXT NOT NULL REFERENCES actor_derived(id),actor_id TEXT NOT NULL,episode_id TEXT NOT NULL REFERENCES actor_episodes(id),episode_revision INTEGER NOT NULL,PRIMARY KEY(derived_id,episode_id))",
+    "CREATE INDEX actor_derived_episode ON actor_derived_basis(episode_id,derived_id)",
 )
 
 
 def checkpoint(db):
     metadata = dict(db.execute("SELECT key,value FROM actor_metadata"))
-    require(metadata.get("schema") == "1", "dependency_unavailable", 503)
+    require(metadata.get("schema") == "2", "dependency_unavailable", 503)
     try:
         return {
             "domain": "actor-memory",
-            "schema": 1,
+            "schema": 2,
             "instance": metadata["instance"],
             "revision": int(metadata["revision"]),
             "recovery": metadata["recovery"],
@@ -139,7 +145,7 @@ class Store:
         for statement in DDL:
             db.execute(statement)
         for key, value in {
-            "schema": "1",
+            "schema": "2",
             "instance": uuid4().hex,
             "revision": "1",
             "recovery": uuid4().hex,
@@ -193,7 +199,7 @@ class Store:
         ):
             with closing(cls(config)) as store, store.transaction() as db:
                 return {
-                    "actor_memory_schema": 1,
+                    "actor_memory_schema": 2,
                     "already_installed": True,
                     "domain_version": store.version(db),
                 }
@@ -210,7 +216,7 @@ class Store:
             os.fsync(stream.fileno())
         with closing(cls(config, initialize=True)) as store:
             return {
-                "actor_memory_schema": 1,
+                "actor_memory_schema": 2,
                 "backup": str(backup),
                 "backend": store.database.backend,
             }

@@ -29,6 +29,10 @@ OPERATIONS = [
     "get_receipt",
     "withdraw_episode",
     "apply_source_revision",
+    "append_derived",
+    "query",
+    "check_memory",
+    "withdraw_memory",
 ]
 
 
@@ -63,6 +67,7 @@ class Owner:
 
     def actor(self, request):
         require(self.allowed and request["role_version"] == self.role_version, "forbidden", 403)
+        require(request["operation"] in OPERATIONS, "forbidden", 403)
         return dict(
             schema_version=1,
             request_id=request["request_id"],

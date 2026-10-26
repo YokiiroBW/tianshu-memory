@@ -1,35 +1,20 @@
-"""Six actor episode operations, one guarded commit and exact original receipts."""
+"""Actor source checkpoints, guarded commits and exact original command receipts."""
 
 import json
 from uuid import uuid4
 
 from ..domain import canonical, fingerprint, now, require, utc
+from .facts import INTERNAL, identity, permitted, source_refs, version_tuple
+from .memories import OPERATIONS as MEMORY_OPERATIONS
+from .memories import Memories, invalidate_derived
 
-INTERNAL = {"purpose": "management", "audience": {"kind": "actor_only"}}
-COMMANDS = {"append_episode", "withdraw_episode", "apply_source_revision"}
-
-
-def identity(actor, source, perspective):
-    return fingerprint({"actor": actor, "source": source, "perspective": perspective})
-
-
-def version_tuple(row):
-    return tuple(row[key] for key in ("source_generation", "source_sequence", "access_version"))
-
-
-def source_refs(fact):
-    return [fact["source"], *(entry["content_ref"] for entry in fact["content_reads"])]
-
-
-def permitted(fact, context):
-    restriction, audience = fact["source_constraints"], context["audience"]
-    if audience["kind"] == "actor_only":
-        return True
-    if restriction["kind"] == "public":
-        return True
-    return restriction["kind"] == audience["kind"] and all(
-        audience.get(key) == value for key, value in restriction.items()
-    )
+COMMANDS = {
+    "append_episode",
+    "withdraw_episode",
+    "apply_source_revision",
+    "append_derived",
+    "withdraw_memory",
+}
 
 
 class Application:
@@ -72,7 +57,10 @@ class Application:
             revision=revision,
             domain_version=self.store.version(db),
         )
-        self.contracts.validate("command_receipt", result)
+        return self._record_receipt(db, caller, request, result, "command_receipt")
+
+    def _record_receipt(self, db, caller, request, result, definition):
+        self.contracts.validate(definition, result)
         digest = fingerprint({key: value for key, value in request.items() if key != "request_id"})
         db.execute(
             "INSERT INTO actor_receipts VALUES (?,?,?,?,?,?)",
@@ -188,11 +176,12 @@ class Application:
     @staticmethod
     def _apply(db, changes):
         updates, invalidated = changes
-        for identity in sorted(invalidated):
+        for episode_id in sorted(invalidated):
             db.execute(
                 "UPDATE actor_episodes SET state='unavailable',revision=revision+1 WHERE id=? AND state='active'",
-                (identity,),
+                (episode_id,),
             )
+        invalidate_derived(db, invalidated)
         for row in updates:
             db.execute(
                 "INSERT INTO actor_sources VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(actor_id,producer,object_id) DO UPDATE SET source=excluded.source,generation=excluded.generation,sequence=excluded.sequence,access_version=excluded.access_version,state=excluded.state",
@@ -204,7 +193,8 @@ class Application:
         require(recheck() == caller, "forbidden", 403)
         operation = request["operation"]
         require(
-            operation in COMMANDS | {"get_episode", "check_episode", "get_receipt"},
+            operation
+            in COMMANDS | MEMORY_OPERATIONS | {"get_episode", "check_episode", "get_receipt"},
             "invalid_input",
             400,
         )
@@ -217,6 +207,8 @@ class Application:
                     self._refresh(request, {}, [], INTERNAL, actor, recheck, caller)
                     return receipt
                 require(operation != "get_receipt", "not_found", 404)
+            if operation in MEMORY_OPERATIONS:
+                return Memories(self).execute(request, actor=actor, caller=caller, recheck=recheck)
             if operation == "withdraw_episode":
                 self._refresh(request, {}, [], INTERNAL, actor, recheck, caller)
                 with self.store.transaction(write=True) as db:
@@ -230,6 +222,7 @@ class Application:
                         "UPDATE actor_episodes SET state='withdrawn',revision=revision+1 WHERE id=?",
                         (row["id"],),
                     )
+                    invalidate_derived(db, [row["id"]])
                     return self._save_receipt(
                         db,
                         caller,
@@ -271,33 +264,17 @@ class Application:
                     )
                 refs = list({canonical(ref): ref for ref in source_refs(fact)}.values())
             require(len(refs) <= 64 * 33, "invalid_input", 400)
-            before = self._observe(request, refs, context) if refs else {}
-            if facts:
-                require(
-                    version_tuple(fact) == version_tuple(before[canonical(refs[0])]),
-                    "source_changed",
-                    409,
-                )
-            observed = self._refresh(request, before, refs, context, actor, recheck, caller)
-            require(
-                canonical(self.authority.context(request, context)) == canonical(context_before),
-                "source_changed",
-                409,
+            observed, initial_version, invalidated = self._prove(
+                request,
+                refs,
+                context,
+                actor,
+                caller,
+                recheck,
+                initial_version,
+                context_before,
+                fact=fact if facts else None,
             )
-            # Negatives are authoritative independently of the requested positive command.
-            invalidated = False
-            if observed:
-                with self.store.transaction() as db:
-                    require(self.store.version(db) == initial_version, "source_changed", 409)
-                    changes = self._source_changes(db, request["actor_id"], observed)
-                    invalidated = bool(changes[1])
-                if any(changes):
-                    with self.store.transaction(write=True) as db:
-                        require(
-                            self.store.version(db) == initial_version + 1, "source_changed", 409
-                        )
-                        self._apply(db, changes)
-                        initial_version = self.store.version(db)
             if operation == "append_episode":
                 require(
                     all(
@@ -453,6 +430,37 @@ class Application:
                     )
                 self.contracts.validate(operation + "_result", result)
                 return result
+
+    def _prove(
+        self, request, refs, context, actor, caller, recheck, version, context_before, *, fact=None
+    ):
+        """One current source/context checkpoint for episode and derived operations."""
+        before = self._observe(request, refs, context) if refs else {}
+        if fact is not None:
+            require(
+                version_tuple(fact) == version_tuple(before[canonical(fact["source"])]),
+                "source_changed",
+                409,
+            )
+        observed = self._refresh(request, before, refs, context, actor, recheck, caller)
+        require(
+            canonical(self.authority.context(request, context)) == canonical(context_before),
+            "source_changed",
+            409,
+        )
+        invalidated = False
+        # Stable negatives commit even when the requested positive operation is rejected.
+        if observed:
+            with self.store.transaction() as db:
+                require(self.store.version(db) == version, "source_changed", 409)
+                changes = self._source_changes(db, request["actor_id"], observed)
+                invalidated = bool(changes[1])
+            if any(changes):
+                with self.store.transaction(write=True) as db:
+                    require(self.store.version(db) == version + 1, "source_changed", 409)
+                    self._apply(db, changes)
+                    version = self.store.version(db)
+        return observed, version, invalidated
 
     def close(self):
         try:

@@ -3,9 +3,9 @@
 The actor domain is part of Memory, with independent storage identity `actor-memory`, logical
 database `main`, metadata, restore guard, SQL lock, source watermarks, receipts and admission.
 It does not create a bot person or use the user Store, records, jobs or source revision.
-The first slice implements the six episode operations from actor-self-memory candidate.2.
-The candidate also describes later query/derived operations; those are not yet implemented by
-this slice and must not be granted in a caller's `actor_memory_operations`.
+The domain implements the six episode operations and the four query/derived operations from
+actor-self-memory candidate.2. Each granted operation must appear explicitly in the caller's
+`actor_memory_operations`.
 
 An actor endpoint is installed at `POST /internal/v1/actor-self-memory/operate`. Existing
 service credentials are authenticated normally. A caller additionally needs the exact operation
@@ -41,7 +41,9 @@ tianshu-memory --config <private-config.json> migrate-actor-memory --backup <new
 This records that the actor domain was absent and initializes only the new logical source.
 An already installed domain is verified without recreating it. A missing or mismatching guard,
 lost tables or a partially initialized binding fails closed; this command is not approval to
-restore an old backup. SQLite and PG use the same actor state and receipt rules. Referenced
+restore an old backup. The initial domain schema is 2. The unpublished AL02 schema-1 component
+databases are rejected; there is no deployed actor data to migrate from that local draft.
+SQLite and PG use the same actor state and receipt rules. Referenced
 content and source owners are checked over the real configured ports; SQLite component peers
 do not constitute actual PG or cross-product acceptance.
 
@@ -67,3 +69,24 @@ Source negatives commit independently of a subsequently rejected positive comman
 actor forgetting is local to that actor episode and never deletes a user's original source.
 Current role, caller and external context are rechecked before return/commit. No check is a
 future authorization lease.
+
+Derived memories are one level of understanding, preference, reflection or autobiography over
+exact current episode revisions. Their own text is a derived interpretation; the underlying
+episode fact, provenance, outcome and coverage remain unchanged. Every episode and content
+source is rechecked before append/read, using the same checkpoint as the episode operations.
+Replacing only explicitly named current derived records retires those records; it never
+rewrites or retires an episode. Forgetting an episode or learning a stable source withdrawal
+invalidates its derived records in the same local transaction. Explicitly forgetting a derived
+record leaves the underlying episode available.
+
+Query uses the existing NFKC/CJK lexical tokenizer over at most the latest 256 active episodes
+and 256 active derived records of this actor. It is a bounded positive projection, not a claim
+that no older matching memory exists. It ranks locally, admits whole items within the requested
+limit and byte budget, and proves only the selected exact episode/source closure. After that
+checkpoint it may remove an invalid selected item, and never adds unproved replacement text.
+The response exposes actual episode/source refs. External disclosure requires every basis to
+permit the current audience; a public basis cannot broaden another private basis.
+
+Importance is stored separately from retention. Short/medium/long derived retention uses the
+existing product defaults of 7/30/180 days; reads do not renew it. Expiry omits a derived record
+and makes its explicit check unavailable, without suppressing the original episode or content.
