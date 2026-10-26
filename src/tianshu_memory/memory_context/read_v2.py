@@ -807,6 +807,7 @@ def execute(application, request, context):
 def _refresh_ranked(service, db, request, frame, fresh, prepared):
     """Reuse eligibility after a boundary; never add or rerank a document."""
     for plan in prepared:
+        _selection_units(frame, plan, context_mode=contextual(request))
         eligible = prepare_query(
             service,
             db,
@@ -833,6 +834,15 @@ def _refresh_ranked(service, db, request, frame, fresh, prepared):
             and document_binding(frame, document)
             == document_binding(fresh, documents[document["id"]])
         ]
+        if "selection_units" in plan:
+            current_ids = {document["id"] for document in ranked}
+            complete_ids = {
+                identity
+                for unit in plan["selection_units"]
+                if set(unit) <= current_ids
+                for identity in unit
+            }
+            ranked = [document for document in ranked if document["id"] in complete_ids]
         plan["stale_ranked"] = len(ranked) != len(plan["ranked"])
         plan["ranked"] = ranked
         plan["domain"] = domain
@@ -878,6 +888,59 @@ def rank_plans(service, prepared, backend_failed):
             )
 
 
+def _summary_selection_key(frame, document):
+    if document["kind"] == "episode":
+        return None
+    identity = document["group_id"]
+    summary = frame["summaries"].get(identity)
+    if summary is None or summary["kind"] != "summary":
+        return None
+    group, _, units = frame["group_map"][identity]
+    return (
+        summary["window_id"],
+        canonical(json.loads(group["scope"])),
+        tuple(sorted({unit["subject_person_id"] for unit in units})),
+    )
+
+
+def _selection_units(frame, plan, *, context_mode):
+    """Fit one owner's eligible summaries from a frozen window together.
+
+    Ranking still chooses which unit to try first. Companion summaries keep
+    their own records and states; sharing a budget unit never merges facts.
+    The first membership is retained across the final source boundary.
+    """
+    if not context_mode or plan["subquery"]["intent"] != "current":
+        return [[document] for document in plan["ranked"]]
+    if "selection_units" not in plan:
+        companions = {}
+        for document in plan["documents"]:
+            key = _summary_selection_key(frame, document)
+            if key is not None:
+                companions.setdefault(key, []).append(document)
+        units, seen = [], set()
+        positions = {document["id"]: index for index, document in enumerate(plan["ranked"])}
+        for document in plan["ranked"]:
+            if document["id"] in seen:
+                continue
+            key = _summary_selection_key(frame, document)
+            members = companions.get(key, [document]) if key is not None else [document]
+            members = sorted(
+                members,
+                key=lambda member: (positions.get(member["id"], len(positions)), member["id"]),
+            )
+            units.append(members)
+            seen.update(member["id"] for member in members)
+        plan["selection_units"] = [tuple(member["id"] for member in unit) for unit in units]
+        plan["ranked"] = [member for unit in units for member in unit]
+    documents = {document["id"]: document for document in plan["ranked"]}
+    return [
+        [documents[identity] for identity in unit]
+        for unit in plan["selection_units"]
+        if all(identity in documents for identity in unit)
+    ]
+
+
 def _select_evidence(service, db, request, frame, prepared):
     """Fit complete evidence groups once, for discovery and final assembly."""
     evidence, results, constraints = [], [], []
@@ -893,15 +956,17 @@ def _select_evidence(service, db, request, frame, prepared):
         result_ids, omissions, missing_time = [], list(plan.get("selection_omissions", ())), 0
         chosen_documents = set()
         witness_ids = [entry[0]["id"] for entry in domain["witnesses"]]
-        for document in plan["ranked"]:
-            batch = (
+        for documents in _selection_units(frame, plan, context_mode=contextual(request)):
+            batches = [
                 fact_evidence(frame, document["group_id"])
                 if document["kind"] != "episode"
                 else [episode_evidence(db, document)]
-            )
-            if not batch:
+                for document in documents
+            ]
+            if any(not batch for batch in batches):
                 omissions.append("source_time_unavailable")
                 continue
+            batch = [item for members in batches for item in members]
             accepted = []
             for item in batch:
                 keep, missing = temporal(item, query["time_filter"])
@@ -937,7 +1002,7 @@ def _select_evidence(service, db, request, frame, prepared):
                 omissions.append("budget")
                 continue
             evidence.extend(added)
-            chosen_documents.add(document["id"])
+            chosen_documents.update(document["id"] for document in documents)
             included.update(item["evidence_id"] for item in added)
             included_sources.update(added_sources)
             included_owners.update(added_owners)
