@@ -2,7 +2,9 @@
 
 import json
 import threading
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager, nullcontext
+from contextvars import copy_context
 
 from . import consolidation_sources as summary_sources
 from . import segment_sources
@@ -118,7 +120,7 @@ class SourceAuthority:
         )
         return [ordered[index : index + 256] for index in range(0, len(ordered), 256)] or [[]]
 
-    def _read_batch(self, selectors, turn_ids, viewer):
+    def _read_snapshot(self, selectors, turn_ids):
         request = dict(
             schema_version=1,
             request_id=new_id("facts"),
@@ -129,6 +131,10 @@ class SourceAuthority:
         )
         snapshot = self.transport.facts(request)
         self._relations("source_snapshot", request, snapshot)
+        return request, snapshot
+
+    def _read_batch(self, selectors, turn_ids, viewer, *, initial=None):
+        request, snapshot = self._read_snapshot(selectors, turn_ids) if initial is None else initial
         access_request, access = self._read_access(snapshot, viewer)
         return dict(
             request=request, snapshot=snapshot, access_request=access_request, access=access
@@ -144,6 +150,133 @@ class SourceAuthority:
         )
         access = self.transport.current(request)
         return request, access
+
+    def _check_windows(self, windows):
+        return {
+            item["window_id"]: summary_sources.check_owner(self.transport, item) for item in windows
+        }
+
+    def _checkpoint_observations(
+        self,
+        service,
+        scope,
+        selectors,
+        turn_ids,
+        viewer,
+        materials,
+        windows,
+        sources,
+        *,
+        context,
+        parallel,
+    ):
+        """Observe one checkpoint; the gate and every local decision stay on its owner.
+
+        Only independent remote reads may overlap. Platform current must be after
+        every before-read and before every after-read, preserving a common proof
+        interval. A failed speculative after-read is consumed only at its original
+        position; a changed Core snapshot still retries before that position.
+        """
+        with ThreadPoolExecutor(max_workers=3) if parallel else nullcontext() as workers:
+            if workers is not None:
+                selector_batches = self.batches(selectors, sources, scope)
+                before = workers.submit(
+                    copy_context().run, segment_sources.read, service, materials
+                )
+                checked = workers.submit(copy_context().run, self._check_windows, windows)
+                core = workers.submit(
+                    copy_context().run, self._read_snapshot, selector_batches[0], turn_ids
+                )
+                wait((before, checked, core))
+                # Read failures retain the original passive/windows/Core order.
+                passive_before, window_checks, initial = (
+                    before.result(),
+                    checked.result(),
+                    core.result(),
+                )
+            else:
+                passive_before = segment_sources.read(service, materials)
+                window_checks = self._check_windows(windows)
+                initial = None
+                selector_batches = self.batches(selectors, sources, scope)
+
+            observations = []
+            for index in range(max(len(selector_batches), (len(turn_ids) + 31) // 32)):
+                batch = selector_batches[index] if index < len(selector_batches) else []
+                observation = self._read_batch(
+                    batch, turn_ids[index * 32 : (index + 1) * 32], viewer, initial=initial
+                )
+                self._relations(
+                    "current_access",
+                    observation["access_request"],
+                    observation["access"],
+                    observation["snapshot"],
+                    utc(service.clock()),
+                )
+                observations.append(observation)
+            first = observations[0]
+            if any(
+                item["snapshot"]["head"] != first["snapshot"]["head"]
+                or item["access"]["head"] != first["access"]["head"]
+                for item in observations
+            ):
+                return None
+            final_access_request, final_access = first["access_request"], first["access"]
+            if len(observations) > 1:
+                final_access_request, final_access = self._read_access({"admissions": []}, viewer)
+                self._relations(
+                    "current_access",
+                    final_access_request,
+                    final_access,
+                    {"admissions": [], "physicals": []},
+                    utc(service.clock()),
+                )
+                if final_access["head"] != first["access"]["head"]:
+                    return None
+            final_request = dict(
+                schema_version=1,
+                request_id=new_id("head"),
+                mode="head",
+                selectors=[],
+                turn_ids=[],
+                include_content=False,
+            )
+            if workers is not None:
+                final_core = workers.submit(copy_context().run, self.transport.facts, final_request)
+                after = workers.submit(copy_context().run, segment_sources.read, service, materials)
+                wait((final_core, after))
+                final = final_core.result()
+            else:
+                final = self.transport.facts(final_request)
+            self._relations("source_snapshot", final_request, final)
+            if first["snapshot"]["head"] != final["head"]:
+                if len(observations) != 1 or not self._refresh_unchanged(service, first, final):
+                    return None
+                final = first["snapshot"]
+            for observation in observations:
+                observation["final_head"] = final["head"]
+                current = observation["access"]["viewer_context"]
+                if context is not None:
+                    require(
+                        current["verified_account"] == context["verified_account"]
+                        and current["verified_channel"] == context["verified_channel"]
+                        and current == final_access["viewer_context"],
+                        "dependency_unavailable",
+                        503,
+                    )
+            passive_after = (
+                after.result() if workers is not None else segment_sources.read(service, materials)
+            )
+            if not segment_sources.same(passive_before, passive_after):
+                return None
+            return dict(
+                observations=observations,
+                window_checks=window_checks,
+                passive_after=passive_after,
+                final_access_request=final_access_request,
+                final_access=final_access,
+                final=final,
+            )
 
     def _selected_plan(self, service, db, scope, read_plan):
         """Rebuild one internal proof plan inside both original CAS transactions."""
@@ -260,6 +393,7 @@ class SourceAuthority:
         material_ids=(),
         dependency_keys=(),
         read_plan=None,
+        remote_overlap=False,
     ):
         require(
             not group_read
@@ -377,74 +511,33 @@ class SourceAuthority:
                 if context is None
                 else {"origin": {"assertion_ref": context["assertion_ref"]}, "scope": scope}
             )
-            observations = []
-            passive_before = segment_sources.read(service, materials)
-            window_checks = {
-                identity: summary_sources.check_owner(self.transport, manifest)
-                for identity, manifest in ((item["window_id"], item) for item in windows)
-            }
-            selector_batches = self.batches(selectors, sources, scope)
-            for index in range(max(len(selector_batches), (len(turn_ids) + 31) // 32)):
-                batch = selector_batches[index] if index < len(selector_batches) else []
-                observation = self._read_batch(
-                    batch, turn_ids[index * 32 : (index + 1) * 32], viewer
-                )
-                self._relations(
-                    "current_access",
-                    observation["access_request"],
-                    observation["access"],
-                    observation["snapshot"],
-                    utc(service.clock()),
-                )
-                observations.append(observation)
-            first = observations[0]
-            # All batches must describe the same owner states. No prefix is committed.
-            if any(
-                item["snapshot"]["head"] != first["snapshot"]["head"]
-                or item["access"]["head"] != first["access"]["head"]
-                for item in observations
-            ):
-                continue
-            final_access_request, final_access = first["access_request"], first["access"]
-            if len(observations) > 1:
-                final_access_request, final_access = self._read_access({"admissions": []}, viewer)
-                self._relations(
-                    "current_access",
-                    final_access_request,
-                    final_access,
-                    {"admissions": [], "physicals": []},
-                    utc(service.clock()),
-                )
-                if final_access["head"] != first["access"]["head"]:
-                    continue
-            final_request = dict(
-                schema_version=1,
-                request_id=new_id("head"),
-                mode="head",
-                selectors=[],
-                turn_ids=[],
-                include_content=False,
+            parallel = (
+                remote_overlap
+                and len(turn_ids) <= 32
+                and len(selectors) <= 256
+                and len(sources) <= 256
             )
-            final = self.transport.facts(final_request)
-            self._relations("source_snapshot", final_request, final)
-            if first["snapshot"]["head"] != final["head"]:
-                if len(observations) != 1 or not self._refresh_unchanged(service, first, final):
-                    continue
-                final = first["snapshot"]
-            for observation in observations:
-                observation["final_head"] = final["head"]
-                current = observation["access"]["viewer_context"]
-                if context is not None:
-                    require(
-                        current["verified_account"] == context["verified_account"]
-                        and current["verified_channel"] == context["verified_channel"]
-                        and current == final_access["viewer_context"],
-                        "dependency_unavailable",
-                        503,
-                    )
-            passive_after = segment_sources.read(service, materials)
-            if not segment_sources.same(passive_before, passive_after):
+            observed = self._checkpoint_observations(
+                service,
+                scope,
+                selectors,
+                turn_ids,
+                viewer,
+                materials,
+                windows,
+                sources,
+                context=context,
+                parallel=parallel,
+            )
+            if observed is None:
                 continue
+            observations = observed["observations"]
+            first = observations[0]
+            window_checks = observed["window_checks"]
+            passive_after = observed["passive_after"]
+            final_access_request = observed["final_access_request"]
+            final_access = observed["final_access"]
+            final = observed["final"]
             try:
                 if len(observations) == 1:
                     result = self.sync(
@@ -848,7 +941,9 @@ class SourceAuthority:
     @contextmanager
     def _operation(self, service, scope, **kwargs):
         for _ in range(3):
-            result, viewer = self.barrier(service, scope, **kwargs)
+            # Only the gated operation owner opts in; direct barrier readers
+            # retain their original serial observation boundary.
+            result, viewer = self.barrier(service, scope, remote_overlap=True, **kwargs)
             with service.store.transaction() as db:
                 if self.revision(db) != result["local_revision"]:
                     continue
