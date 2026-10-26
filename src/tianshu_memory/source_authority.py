@@ -2,7 +2,7 @@
 
 import json
 import threading
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import contextmanager
 
 from . import consolidation_sources as summary_sources
 from . import segment_sources
@@ -242,7 +242,7 @@ class SourceAuthority:
         )
         return result, fingerprint(result)
 
-    def _collect_proof(
+    def barrier(
         self,
         service,
         scope,
@@ -274,353 +274,256 @@ class SourceAuthority:
             "dependency_unavailable",
             503,
         )
-        with service.store.transaction() as db:
-            m0 = self.revision(db)
-            planned = None
-            plan_digest = None
-            if read_plan is not None:
-                planned, plan_digest = self._selected_plan(service, db, scope, read_plan)
-            if read_plan is not None and not read_plan["full_read"]:
-                materials = planned["materials"]
-                all_windows = {item["window_id"]: item for item in planned["windows"]}
-                selectors = planned["selectors"]
-                material_checks, _ = segment_sources.requirements(materials)
-                summary_selectors = material_selectors = []
-            else:
-                window_keys = [
-                    item["source_key"]
-                    for manifest in windows
-                    for item in summary_sources.source_dependencies(manifest)
-                ]
-                materials = segment_sources.collect(
-                    db,
-                    scope,
-                    summary_scopes,
-                    material_ids=material_ids,
-                    source_keys=(*dependency_keys, *window_keys),
-                    group_read=group_read,
-                    profile=profile,
-                )
-                material_checks, material_windows = segment_sources.requirements(materials)
-                material_selectors = [
-                    source_selector(source, item["scope"])
-                    for item in material_checks
-                    for source in item["sources"]
-                ]
-                stored, window_domains = [], set()
-                for owner, shared in ((scope, group_read), *summary_scopes):
-                    domain = self._read_domain(owner, group_read=shared)
-                    if domain in window_domains:
-                        continue
-                    stored.extend(summary_sources.stored_windows(db, owner, group_read=shared))
-                    window_domains.add(domain)
-                all_windows = {
-                    item["window_id"]: item for item in (*stored, *windows, *material_windows)
-                }
-                summary_selectors = summary_sources.selectors(service, db, all_windows.values())
-                selectors = self.coverage(db, scope, sources, profile, group_read)
-                selectors = list(
-                    {
-                        canonical(value): value
-                        for value in (
-                            *selectors,
-                            *extra_selectors,
-                            *summary_selectors,
-                            *material_selectors,
-                        )
-                    }.values()
-                )
-                if planned is not None:
-                    materials = list(
-                        {item["id"]: item for item in (*materials, *planned["materials"])}.values()
+        for _ in range(3):
+            with service.store.transaction() as db:
+                m0 = self.revision(db)
+                planned = None
+                if read_plan is not None:
+                    planned, plan_digest = self._selected_plan(service, db, scope, read_plan)
+                if read_plan is not None and not read_plan["full_read"]:
+                    materials = planned["materials"]
+                    all_windows = {item["window_id"]: item for item in planned["windows"]}
+                    selectors = planned["selectors"]
+                    material_checks, _ = segment_sources.requirements(materials)
+                    summary_selectors = material_selectors = []
+                else:
+                    window_keys = [
+                        item["source_key"]
+                        for manifest in windows
+                        for item in summary_sources.source_dependencies(manifest)
+                    ]
+                    materials = segment_sources.collect(
+                        db,
+                        scope,
+                        summary_scopes,
+                        material_ids=material_ids,
+                        source_keys=(*dependency_keys, *window_keys),
+                        group_read=group_read,
+                        profile=profile,
                     )
-                    selected_checks, _ = segment_sources.requirements(planned["materials"])
-                    material_checks = list(
-                        {
-                            canonical(item): item for item in (*material_checks, *selected_checks)
-                        }.values()
-                    )
-                    all_windows.update((item["window_id"], item) for item in planned["windows"])
-                    summary_selectors = [*summary_selectors, *planned["selectors"]]
+                    material_checks, material_windows = segment_sources.requirements(materials)
+                    material_selectors = [
+                        source_selector(source, item["scope"])
+                        for item in material_checks
+                        for source in item["sources"]
+                    ]
+                    stored, window_domains = [], set()
+                    for owner, shared in ((scope, group_read), *summary_scopes):
+                        domain = self._read_domain(owner, group_read=shared)
+                        if domain in window_domains:
+                            continue
+                        stored.extend(summary_sources.stored_windows(db, owner, group_read=shared))
+                        window_domains.add(domain)
+                    all_windows = {
+                        item["window_id"]: item for item in (*stored, *windows, *material_windows)
+                    }
+                    summary_selectors = summary_sources.selectors(service, db, all_windows.values())
+                    selectors = self.coverage(db, scope, sources, profile, group_read)
                     selectors = list(
                         {
-                            canonical(item): item for item in (*selectors, *planned["selectors"])
+                            canonical(value): value
+                            for value in (
+                                *selectors,
+                                *extra_selectors,
+                                *summary_selectors,
+                                *material_selectors,
+                            )
                         }.values()
                     )
-            if context is not None:
-                service._authorize(db, context, scope=scope)
-        turn_ids = list(
-            dict.fromkeys(
-                [
-                    *([event["aggregate_id"]] if event else [check["turn_id"]] if check else []),
-                    *(item["turn_id"] for item in (*source_checks, *material_checks)),
-                    *(
-                        member["turn_id"]
-                        for manifest in all_windows.values()
-                        for member in manifest["members"]
-                    ),
-                ]
+                    if planned is not None:
+                        materials = list(
+                            {
+                                item["id"]: item for item in (*materials, *planned["materials"])
+                            }.values()
+                        )
+                        selected_checks, _ = segment_sources.requirements(planned["materials"])
+                        material_checks = list(
+                            {
+                                canonical(item): item
+                                for item in (*material_checks, *selected_checks)
+                            }.values()
+                        )
+                        all_windows.update((item["window_id"], item) for item in planned["windows"])
+                        summary_selectors = [*summary_selectors, *planned["selectors"]]
+                        selectors = list(
+                            {
+                                canonical(item): item
+                                for item in (*selectors, *planned["selectors"])
+                            }.values()
+                        )
+                if context is not None:
+                    service._authorize(db, context, scope=scope)
+            turn_ids = list(
+                dict.fromkeys(
+                    [
+                        *(
+                            [event["aggregate_id"]]
+                            if event
+                            else [check["turn_id"]]
+                            if check
+                            else []
+                        ),
+                        *(item["turn_id"] for item in (*source_checks, *material_checks)),
+                        *(
+                            member["turn_id"]
+                            for manifest in all_windows.values()
+                            for member in manifest["members"]
+                        ),
+                    ]
+                )
             )
-        )
-        viewer = (
-            None
-            if context is None
-            else {"origin": {"assertion_ref": context["assertion_ref"]}, "scope": scope}
-        )
-        return dict(
-            m0=m0,
-            scope=scope,
-            sources=sources,
-            context=context,
-            profile=profile,
-            group_read=group_read,
-            event=event,
-            check=check,
-            windows=windows,
-            source_checks=source_checks,
-            read_plan=read_plan,
-            plan_digest=plan_digest,
-            materials=materials,
-            all_windows=all_windows,
-            selectors=selectors,
-            material_checks=material_checks,
-            turn_ids=turn_ids,
-            viewer=viewer,
-            extra_selectors=(*extra_selectors, *summary_selectors, *material_selectors),
-        )
-
-    def _observe_proof(self, service, collected, *, defer_local_head=False):
-        """Independent complete owner observations; no live Memory transaction."""
-        scope = collected["scope"]
-        context = collected["context"]
-        materials = collected["materials"]
-        windows = collected["windows"]
-        selectors = collected["selectors"]
-        sources = collected["sources"]
-        turn_ids = collected["turn_ids"]
-        viewer = collected["viewer"]
-        before_refresh_head = None
-        observations = []
-        passive_before = segment_sources.read(service, materials)
-        window_checks = {
-            identity: summary_sources.check_owner(self.transport, manifest)
-            for identity, manifest in ((item["window_id"], item) for item in windows)
-        }
-        selector_batches = self.batches(selectors, sources, scope)
-        for index in range(max(len(selector_batches), (len(turn_ids) + 31) // 32)):
-            batch = selector_batches[index] if index < len(selector_batches) else []
-            observation = self._read_batch(batch, turn_ids[index * 32 : (index + 1) * 32], viewer)
-            self._relations(
-                "current_access",
-                observation["access_request"],
-                observation["access"],
-                observation["snapshot"],
-                utc(service.clock()),
+            viewer = (
+                None
+                if context is None
+                else {"origin": {"assertion_ref": context["assertion_ref"]}, "scope": scope}
             )
-            observations.append(observation)
-        first = observations[0]
-        # All batches must describe the same owner states. No prefix is committed.
-        if any(
-            item["snapshot"]["head"] != first["snapshot"]["head"]
-            or item["access"]["head"] != first["access"]["head"]
-            for item in observations
-        ):
-            raise LocalRevisionChanged()
-        final_access_request, final_access = first["access_request"], first["access"]
-        if len(observations) > 1:
-            final_access_request, final_access = self._read_access({"admissions": []}, viewer)
-            self._relations(
-                "current_access",
-                final_access_request,
-                final_access,
-                {"admissions": [], "physicals": []},
-                utc(service.clock()),
-            )
-            if final_access["head"] != first["access"]["head"]:
-                raise LocalRevisionChanged()
-        final_request = dict(
-            schema_version=1,
-            request_id=new_id("head"),
-            mode="head",
-            selectors=[],
-            turn_ids=[],
-            include_content=False,
-        )
-        final = self.transport.facts(final_request)
-        self._relations("source_snapshot", final_request, final)
-        if first["snapshot"]["head"] != final["head"]:
-            old_head = first["snapshot"]["head"]
-            if len(observations) != 1 or not self._refresh_unchanged(
-                service, first, final, defer_local=defer_local_head
+            observations = []
+            passive_before = segment_sources.read(service, materials)
+            window_checks = {
+                identity: summary_sources.check_owner(self.transport, manifest)
+                for identity, manifest in ((item["window_id"], item) for item in windows)
+            }
+            selector_batches = self.batches(selectors, sources, scope)
+            for index in range(max(len(selector_batches), (len(turn_ids) + 31) // 32)):
+                batch = selector_batches[index] if index < len(selector_batches) else []
+                observation = self._read_batch(
+                    batch, turn_ids[index * 32 : (index + 1) * 32], viewer
+                )
+                self._relations(
+                    "current_access",
+                    observation["access_request"],
+                    observation["access"],
+                    observation["snapshot"],
+                    utc(service.clock()),
+                )
+                observations.append(observation)
+            first = observations[0]
+            # All batches must describe the same owner states. No prefix is committed.
+            if any(
+                item["snapshot"]["head"] != first["snapshot"]["head"]
+                or item["access"]["head"] != first["access"]["head"]
+                for item in observations
             ):
-                raise LocalRevisionChanged()
-            final = first["snapshot"]
-            if defer_local_head:
-                before_refresh_head = old_head
-        for observation in observations:
-            observation["final_head"] = final["head"]
-            current = observation["access"]["viewer_context"]
-            if context is not None:
-                require(
-                    current["verified_account"] == context["verified_account"]
-                    and current["verified_channel"] == context["verified_channel"]
-                    and current == final_access["viewer_context"],
-                    "dependency_unavailable",
-                    503,
-                )
-        passive_after = segment_sources.read(service, materials)
-        if not segment_sources.same(passive_before, passive_after):
-            raise LocalRevisionChanged()
-        return dict(
-            observations=observations,
-            final_access_request=final_access_request,
-            final_access=final_access,
-            final=final,
-            passive_after=passive_after,
-            window_checks=window_checks,
-            before_refresh_head=before_refresh_head,
-        )
-
-    def _commit_proof(self, service, collected, observed):
-        """Original sync, durable negatives and final semantic checks, under the gate."""
-        m0 = collected["m0"]
-        scope = collected["scope"]
-        sources = collected["sources"]
-        profile = collected["profile"]
-        group_read = collected["group_read"]
-        extra_selectors = collected["extra_selectors"]
-        read_plan = collected["read_plan"]
-        plan_digest = collected["plan_digest"]
-        all_windows = collected["all_windows"]
-        windows = collected["windows"]
-        event = collected["event"]
-        check = collected["check"]
-        source_checks = collected["source_checks"]
-        material_checks = collected["material_checks"]
-        observations = observed["observations"]
-        final_access_request = observed["final_access_request"]
-        final_access = observed["final_access"]
-        final = observed["final"]
-        passive_after = observed["passive_after"]
-        window_checks = observed["window_checks"]
-        first = observations[0]
-        deferred_head = (
-            {"before_refresh_head": observed["before_refresh_head"]}
-            if observed["before_refresh_head"] is not None
-            else {}
-        )
-        if len(observations) == 1:
-            result = self.sync(
-                service,
-                first,
-                m0=m0,
-                scope=scope,
-                sources=sources,
-                profile=profile,
-                group_read=group_read,
-                extra_selectors=extra_selectors,
-                read_plan=read_plan,
-                plan_digest=plan_digest if read_plan is not None else None,
-                **deferred_head,
-            )
-        else:
-            result = self.sync_batches(
-                service,
-                dict(
-                    schema_version=1,
-                    observations=observations,
-                    final_access_request=final_access_request,
-                    final_access=final_access,
-                    final_core_head=final["head"],
-                ),
-                m0=m0,
-                scope=scope,
-                sources=sources,
-                profile=profile,
-                group_read=group_read,
-                extra_selectors=extra_selectors,
-                read_plan=read_plan,
-                plan_digest=plan_digest if read_plan is not None else None,
-                **deferred_head,
-            )
-        if passive_after:
-            with service.store.transaction() as db:
-                if self.revision(db) != result["local_revision"]:
-                    raise LocalRevisionChanged()
-                segment_sources.apply(service, db, passive_after)
-                result["local_revision"] = self.revision(db)
-        if all_windows:
-            with service.store.transaction() as db:
-                if self.revision(db) != result["local_revision"]:
-                    raise LocalRevisionChanged()
-                current_turns = {
-                    turn["turn_id"]: turn
-                    for item in observations
-                    for turn in item["snapshot"]["turns"]
-                }
-                failures = summary_sources.window_failures(
-                    service, db, all_windows.values(), current_turns, window_checks
-                )
-                invalid = [
-                    identity for identity, failure in failures.items() if failure is not None
-                ]
-                summary_sources.invalidate_windows(service, db, invalid)
-                result["local_revision"] = self.revision(db)
-            for item in windows:
-                failure = failures[item["window_id"]]
-                if failure is not None:
-                    raise failure
-        # Negatives are durable before a later bad event or scope conflict is rejected.
-        snapshot = first["snapshot"]
-        if event:
-            turn = next(
-                item for item in snapshot["turns"] if item["turn_id"] == event["aggregate_id"]
-            )
-            self._relations("actor_event", event, turn, snapshot)
-        if check:
-            self._check_input_sources(check, snapshot)
-        if source_checks or material_checks:
-            # These are the actual same-head observations already validated
-            # and committed above. A raw turn may be in any 32-turn page,
-            # and its original sources may be in any 256-selector page.
-            complete = self._merge_snapshot(observations)
-            for source_check in (*source_checks, *material_checks):
-                self._check_input_sources(source_check, complete)
-        return result, final_access.get("viewer_context")
-
-    def barrier(self, service, scope, **kwargs):
-        """Original serial boundary, using the same three proof phases."""
-        for _ in range(3):
-            try:
-                collected = self._collect_proof(service, scope, **kwargs)
-                observed = self._observe_proof(service, collected)
-                return self._commit_proof(service, collected, observed)
-            except LocalRevisionChanged:
                 continue
-        raise Fault("dependency_unavailable", 503)
-
-    @contextmanager
-    def _read_barrier(self, service, requirements):
-        """Pure selected readers release only remote I/O, never final authority work."""
-        for _ in range(3):
-            with self._operation_order.turn(), source_read_lock(self._operation_lock):
-                begin_source_read()
-                kwargs, _ = self._bundle_plan(service, requirements)
-                collected = self._collect_proof(service, requirements[0]["scope"], **kwargs)
-            try:
-                observed = self._observe_proof(service, collected, defer_local_head=True)
-            except LocalRevisionChanged:
-                continue
-            with self._operation_order.turn(), source_read_lock(self._operation_lock):
-                try:
-                    result = self._commit_proof(service, collected, observed)
-                except LocalRevisionChanged:
+            final_access_request, final_access = first["access_request"], first["access"]
+            if len(observations) > 1:
+                final_access_request, final_access = self._read_access({"admissions": []}, viewer)
+                self._relations(
+                    "current_access",
+                    final_access_request,
+                    final_access,
+                    {"admissions": [], "physicals": []},
+                    utc(service.clock()),
+                )
+                if final_access["head"] != first["access"]["head"]:
                     continue
-                # This context remains owned through _operation's final database
-                # and the caller's business yield. No entered lock crosses a
-                # normal-function return or a worker/thread boundary.
-                yield result
-                return
+            final_request = dict(
+                schema_version=1,
+                request_id=new_id("head"),
+                mode="head",
+                selectors=[],
+                turn_ids=[],
+                include_content=False,
+            )
+            final = self.transport.facts(final_request)
+            self._relations("source_snapshot", final_request, final)
+            if first["snapshot"]["head"] != final["head"]:
+                if len(observations) != 1 or not self._refresh_unchanged(service, first, final):
+                    continue
+                final = first["snapshot"]
+            for observation in observations:
+                observation["final_head"] = final["head"]
+                current = observation["access"]["viewer_context"]
+                if context is not None:
+                    require(
+                        current["verified_account"] == context["verified_account"]
+                        and current["verified_channel"] == context["verified_channel"]
+                        and current == final_access["viewer_context"],
+                        "dependency_unavailable",
+                        503,
+                    )
+            passive_after = segment_sources.read(service, materials)
+            if not segment_sources.same(passive_before, passive_after):
+                continue
+            try:
+                if len(observations) == 1:
+                    result = self.sync(
+                        service,
+                        first,
+                        m0=m0,
+                        scope=scope,
+                        sources=sources,
+                        profile=profile,
+                        group_read=group_read,
+                        extra_selectors=(*extra_selectors, *summary_selectors, *material_selectors),
+                        read_plan=read_plan,
+                        plan_digest=plan_digest if read_plan is not None else None,
+                    )
+                else:
+                    result = self.sync_batches(
+                        service,
+                        dict(
+                            schema_version=1,
+                            observations=observations,
+                            final_access_request=final_access_request,
+                            final_access=final_access,
+                            final_core_head=final["head"],
+                        ),
+                        m0=m0,
+                        scope=scope,
+                        sources=sources,
+                        profile=profile,
+                        group_read=group_read,
+                        extra_selectors=(*extra_selectors, *summary_selectors, *material_selectors),
+                        read_plan=read_plan,
+                        plan_digest=plan_digest if read_plan is not None else None,
+                    )
+            except LocalRevisionChanged:
+                continue
+            if passive_after:
+                with service.store.transaction() as db:
+                    if self.revision(db) != result["local_revision"]:
+                        continue
+                    segment_sources.apply(service, db, passive_after)
+                    result["local_revision"] = self.revision(db)
+            if all_windows:
+                with service.store.transaction() as db:
+                    if self.revision(db) != result["local_revision"]:
+                        continue
+                    current_turns = {
+                        turn["turn_id"]: turn
+                        for item in observations
+                        for turn in item["snapshot"]["turns"]
+                    }
+                    failures = summary_sources.window_failures(
+                        service, db, all_windows.values(), current_turns, window_checks
+                    )
+                    invalid = [
+                        identity for identity, failure in failures.items() if failure is not None
+                    ]
+                    summary_sources.invalidate_windows(service, db, invalid)
+                    result["local_revision"] = self.revision(db)
+                for item in windows:
+                    failure = failures[item["window_id"]]
+                    if failure is not None:
+                        raise failure
+            # Negatives are durable before a later bad event or scope conflict is rejected.
+            snapshot = first["snapshot"]
+            if event:
+                turn = next(
+                    item for item in snapshot["turns"] if item["turn_id"] == event["aggregate_id"]
+                )
+                self._relations("actor_event", event, turn, snapshot)
+            if check:
+                self._check_input_sources(check, snapshot)
+            if source_checks or material_checks:
+                # These are the actual same-head observations already validated
+                # and committed above. A raw turn may be in any 32-turn page,
+                # and its original sources may be in any 256-selector page.
+                complete = self._merge_snapshot(observations)
+                for source_check in (*source_checks, *material_checks):
+                    self._check_input_sources(source_check, complete)
+            return result, final_access.get("viewer_context")
         raise Fault("dependency_unavailable", 503)
 
     def _check_input_sources(self, check, snapshot):
@@ -637,17 +540,7 @@ class SourceAuthority:
         )
         self._relations("current_actor_sources", check["scope"], check["sources"], snapshot)
 
-    @staticmethod
-    def _check_core_head(db, head):
-        old = db.execute("SELECT * FROM owner_heads WHERE owner='core'").fetchone()
-        if old:
-            require(
-                head["generation"] == old["generation"] and head["sequence"] >= old["sequence"],
-                "dependency_unavailable",
-                503,
-            )
-
-    def _refresh_unchanged(self, service, observation, final, *, defer_local=False):
+    def _refresh_unchanged(self, service, observation, final):
         """Double-collect the requested facts when an unrelated Core write moves its head.
 
         The Platform read sits between the two Core snapshots. Equal versioned facts
@@ -658,9 +551,14 @@ class SourceAuthority:
         """
         before = observation["snapshot"]
         head = before["head"]
-        if not defer_local:
-            with service.store.transaction() as db:
-                self._check_core_head(db, head)
+        with service.store.transaction() as db:
+            old = db.execute("SELECT * FROM owner_heads WHERE owner='core'").fetchone()
+            if old:
+                require(
+                    head["generation"] == old["generation"] and head["sequence"] >= old["sequence"],
+                    "dependency_unavailable",
+                    503,
+                )
         require(
             final["head"]["generation"] == head["generation"]
             and final["head"]["sequence"] >= head["sequence"],
@@ -693,7 +591,6 @@ class SourceAuthority:
         extra_selectors=(),
         read_plan=None,
         plan_digest=None,
-        before_refresh_head=None,
     ):
         """Trusted source-sync port. m0 and scope are local state, never wire authority."""
         self.contracts.validate("sync-workflow#sync_input", observation)
@@ -708,7 +605,6 @@ class SourceAuthority:
             extra_selectors=extra_selectors,
             read_plan=read_plan,
             plan_digest=plan_digest,
-            before_refresh_head=before_refresh_head,
         )
 
     def sync_batches(
@@ -724,7 +620,6 @@ class SourceAuthority:
         extra_selectors=(),
         read_plan=None,
         plan_digest=None,
-        before_refresh_head=None,
     ):
         self.contracts.validate("sync-batch#barrier", observation)
         try:
@@ -742,7 +637,6 @@ class SourceAuthority:
             extra_selectors=extra_selectors,
             read_plan=read_plan,
             plan_digest=plan_digest,
-            before_refresh_head=before_refresh_head,
         )
 
     def _commit_observations(
@@ -758,7 +652,6 @@ class SourceAuthority:
         extra_selectors=(),
         read_plan=None,
         plan_digest=None,
-        before_refresh_head=None,
     ):
         for observation in observations:
             self._relations("sync_barrier", dict(observation, now=utc(service.clock())))
@@ -774,8 +667,6 @@ class SourceAuthority:
         with service.store.transaction() as db:
             if self.revision(db) != m0:
                 raise LocalRevisionChanged()
-            if before_refresh_head is not None:
-                self._check_core_head(db, before_refresh_head)
             if read_plan is not None:
                 planned, current_digest = self._selected_plan(service, db, scope, read_plan)
                 if current_digest != plan_digest or (
@@ -870,109 +761,101 @@ class SourceAuthority:
             with self._operation(service, scope, **kwargs) as db:
                 yield db
 
-    def _bundle_plan(self, service, requirements):
-        selectors, exact_selectors, domains, source_checks, read_domains = (
-            {},
-            {},
-            set(),
-            [],
-            set(),
-        )
-        dependency_keys, material_ids = set(), set()
-        # A legacy/full component keeps the entire bundle on the original
-        # full path, including its durable per-window negative handling.
-        full_read = any(not item.get("selected_only") for item in requirements)
-        selected_plans = {}
-        with service.store.transaction() as db:
-            for item in requirements:
-                scope = item["scope"]
-                dependency_keys.update(item.get("dependency_keys", ()))
-                material_ids.update(item.get("material_ids", ()))
-                if full_read and item.get("selected") is not None:
-                    dependency_keys.update(item["selected"]["source_keys"])
-                if item.get("context") is not None:
-                    service._authorize(db, item["context"], scope=scope)
-                profile, shared = bool(item.get("profile")), bool(item.get("group_read"))
-                if item.get("selected") is not None:
-                    selected_plans[canonical(item["selected"])] = item["selected"]
-                if full_read:
-                    domains.add((canonical(scope), profile, shared))
-                domain = self._read_domain(scope, profile=profile, group_read=shared)
-                if full_read and domain not in read_domains:
-                    for selected in self.coverage(db, scope, (), profile, shared):
-                        selectors[canonical(selected)] = selected
-                    read_domains.add(domain)
-                for check in item.get("source_checks", ()):
-                    require(check["scope"] == scope, "invalid_input", 400)
-                    source_checks.append(check)
-                    for source in check["sources"]:
-                        selected = source_selector(source, scope)
-                        selectors[canonical(selected)] = selected
-                        exact_selectors[canonical(selected)] = selected
-        primary = requirements[0]
-        read_plan = (
-            dict(
-                selected=list(selected_plans.values()),
-                source_selectors=list(exact_selectors.values()),
-                material_ids=sorted(material_ids),
-                full_read=full_read,
-            )
-            if selected_plans
-            else None
-        )
-        return dict(
-            context=primary.get("context"),
-            profile=bool(primary.get("profile")),
-            group_read=bool(primary.get("group_read")),
-            extra_selectors=list(selectors.values()),
-            summary_scopes=[(item["scope"], bool(item.get("group_read"))) for item in requirements],
-            source_checks=source_checks,
-            dependency_keys=dependency_keys,
-            material_ids=material_ids,
-            read_plan=read_plan,
-        ), domains
-
     @contextmanager
-    def bundle_operation(self, service, requirements, *, pure_read=False):
-        """Authenticated union; only explicitly selected pure reads unlock remote I/O."""
+    def bundle_operation(self, service, requirements):
+        """One full union barrier and transaction for authenticated scope requirements.
+
+        Requirements are assembled by the authenticated application, never accepted
+        from a model or interpreted as grants. Existing component rules still run.
+        """
         require(
             bool(requirements) and getattr(self._bundled, "active", None) is None,
             "invalid_input",
             400,
         )
-        selected_read = pure_read and all(item.get("selected_only") for item in requirements)
-        with ExitStack() as entered:
-            if selected_read:
-                domains = set()  # An exact proof can never lend a full capability.
-                kwargs = dict(read_requirements=requirements)
-            else:
-                entered.enter_context(self._operation_order.turn())
-                entered.enter_context(source_read_lock(self._operation_lock))
-                begin_source_read()
-                kwargs, domains = self._bundle_plan(service, requirements)
-            db = entered.enter_context(self._operation(service, requirements[0]["scope"], **kwargs))
-            self._bundled.active = {"service": service, "domains": domains, "db": db}
-            try:
-                yield db
-            finally:
-                self._bundled.active = None
+        with self._operation_order.turn(), source_read_lock(self._operation_lock):
+            begin_source_read()
+            selectors, exact_selectors, domains, source_checks, read_domains = (
+                {},
+                {},
+                set(),
+                [],
+                set(),
+            )
+            dependency_keys, material_ids = set(), set()
+            # A legacy/full component keeps the entire bundle on the original
+            # full path, including its durable per-window negative handling.
+            full_read = any(not item.get("selected_only") for item in requirements)
+            selected_plans = {}
+            with service.store.transaction() as db:
+                for item in requirements:
+                    scope = item["scope"]
+                    dependency_keys.update(item.get("dependency_keys", ()))
+                    material_ids.update(item.get("material_ids", ()))
+                    if full_read and item.get("selected") is not None:
+                        dependency_keys.update(item["selected"]["source_keys"])
+                    if item.get("context") is not None:
+                        service._authorize(db, item["context"], scope=scope)
+                    profile, shared = bool(item.get("profile")), bool(item.get("group_read"))
+                    if item.get("selected") is not None:
+                        selected_plans[canonical(item["selected"])] = item["selected"]
+                    if full_read:
+                        domains.add((canonical(scope), profile, shared))
+                    domain = self._read_domain(scope, profile=profile, group_read=shared)
+                    if full_read and domain not in read_domains:
+                        for selected in self.coverage(db, scope, (), profile, shared):
+                            selectors[canonical(selected)] = selected
+                        read_domains.add(domain)
+                    for check in item.get("source_checks", ()):
+                        require(check["scope"] == scope, "invalid_input", 400)
+                        source_checks.append(check)
+                        for source in check["sources"]:
+                            selected = source_selector(source, scope)
+                            selectors[canonical(selected)] = selected
+                            exact_selectors[canonical(selected)] = selected
+            primary = requirements[0]
+            read_plan = (
+                dict(
+                    selected=list(selected_plans.values()),
+                    source_selectors=list(exact_selectors.values()),
+                    material_ids=sorted(material_ids),
+                    full_read=full_read,
+                )
+                if selected_plans
+                else None
+            )
+            with self._operation(
+                service,
+                primary["scope"],
+                context=primary.get("context"),
+                profile=bool(primary.get("profile")),
+                group_read=bool(primary.get("group_read")),
+                extra_selectors=list(selectors.values()),
+                summary_scopes=[
+                    (item["scope"], bool(item.get("group_read"))) for item in requirements
+                ],
+                source_checks=source_checks,
+                dependency_keys=dependency_keys,
+                material_ids=material_ids,
+                read_plan=read_plan,
+            ) as db:
+                self._bundled.active = {"service": service, "domains": domains, "db": db}
+                try:
+                    yield db
+                finally:
+                    self._bundled.active = None
 
     @contextmanager
-    def _operation(self, service, scope, *, read_requirements=None, **kwargs):
+    def _operation(self, service, scope, **kwargs):
         for _ in range(3):
-            boundary = (
-                self._read_barrier(service, read_requirements)
-                if read_requirements is not None
-                else nullcontext(self.barrier(service, scope, **kwargs))
-            )
-            with boundary as (result, viewer):
-                with service.store.transaction() as db:
-                    if self.revision(db) != result["local_revision"]:
-                        continue
-                    if viewer is not None:
-                        service._authorize(db, viewer, scope=scope)
-                    yield db
-                    return
+            result, viewer = self.barrier(service, scope, **kwargs)
+            with service.store.transaction() as db:
+                if self.revision(db) != result["local_revision"]:
+                    continue
+                if viewer is not None:
+                    service._authorize(db, viewer, scope=scope)
+                yield db
+                return
         raise Fault("dependency_unavailable", 503)
 
     def _apply(self, service, db, snapshot, access):

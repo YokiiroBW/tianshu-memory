@@ -318,7 +318,7 @@ def requirements(
 @contextmanager
 def operation(service, items):
     if service.synchronized:
-        with service.source_authority.bundle_operation(service, items, pure_read=True) as db:
+        with service.source_authority.bundle_operation(service, items) as db:
             yield db
     else:
         with service.store.transaction() as db:
