@@ -300,6 +300,18 @@ def correlation_of(request):
     return read_correlation(request.headers.get(CORRELATION_HEADER))
 
 
+def correlate_outbound(request):
+    """Carry this execution's ID on a request, never on the reusable client.
+
+    HTTPX runs this hook in the calling worker, whose ContextVars already
+    follow the admitted request and copied source-read workers. An unrelated
+    background call gets its own ID; no account, path or credential enters it.
+    """
+    scope = _scope.get()
+    current = read_correlation(scope.correlation_id) if scope is not None else None
+    request.headers[CORRELATION_HEADER] = current or new_correlation_id()
+
+
 def map_fault(code):
     """The registered error code for a product verdict, or the fixed internal one."""
     if not isinstance(code, str):

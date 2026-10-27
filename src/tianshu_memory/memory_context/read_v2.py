@@ -230,22 +230,30 @@ def prepare_query(service, db, frame, subquery, selection, *, context_mode=False
         candidates = [entry for entry in candidates if applies(entry)]
         contextual = [entry for entry in contextual if applies(entry)]
     candidates.extend(contextual)
-    lexical = service._rank_groups(
-        db,
-        candidates,
-        query_terms(subquery["text"]),
-        subquery["text"],
-        fact_snapshot=frame["snapshot"],
-        authorized_group_ids=frozenset(frame["group_map"]),
+    lexical = (
+        service._rank_groups(
+            db,
+            candidates,
+            query_terms(subquery["text"]),
+            subquery["text"],
+            fact_snapshot=frame["snapshot"],
+            authorized_group_ids=frozenset(frame["group_map"]),
+        )
+        if "facts" in subquery["kinds"]
+        else []
     )
     episode_ids = {
         row["id"]
         for row in memory_documents.eligible_episodes(service, db, domain["episodes"], subquery)
     }
-    lexical_episodes = list(
-        memory_documents.episode_metadata(
-            service, db, [entry[0] for entry in domain["scopes"]], query_text=subquery["text"]
+    lexical_episodes = (
+        list(
+            memory_documents.episode_metadata(
+                service, db, [entry[0] for entry in domain["scopes"]], query_text=subquery["text"]
+            )
         )
+        if "episodes" in subquery["kinds"]
+        else []
     )
     documents = (
         [
@@ -720,13 +728,19 @@ def execute(application, request, context):
     # A bounded query embedding depends only on the caller's text and captured
     # retrieval revision. Do it before acquiring a source boundary, so current
     # authorized document vectors can later be ranked without any external work.
-    query_vectors = {}
+    query_vectors, vectors_by_text = {}, {}
     if settings is not None:
         deadline = time.monotonic() + 8
         for query in request["queries"]:
-            query_vectors[query["query_id"]] = prepare_query_vector(
-                service.retrieval, query["text"], settings, deadline=deadline
-            )
+            # Kinds, intent and time filters change document selection, not the
+            # embedding of the exact text under this one captured revision.
+            # Reuse only here; authorization and every query's proof stay live.
+            text = query["text"]
+            if text not in vectors_by_text:
+                vectors_by_text[text] = prepare_query_vector(
+                    service.retrieval, text, settings, deadline=deadline
+                )
+            query_vectors[query["query_id"]] = vectors_by_text[text]
     local_selection = (
         service.synchronized
         and contextual(request)

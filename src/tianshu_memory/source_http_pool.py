@@ -16,6 +16,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .diagnostics import correlate_outbound
+
 
 class _RejectCookies(DefaultCookiePolicy):
     """Only sockets are shared; owner responses cannot create request state."""
@@ -53,6 +55,7 @@ class OwnerHttpPool:
             follow_redirects=False,
             trust_env=False,
             cookies=CookieJar(policy=_RejectCookies()),
+            event_hooks={"request": [correlate_outbound]},
             **options,
         )
 

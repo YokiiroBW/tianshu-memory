@@ -255,6 +255,86 @@ def test_multiple_queries_share_external_budget_without_refilling_in_source(sync
     assert source_calls(sync) == ["snapshot", "current", "head"]
 
 
+@pytest.mark.parametrize("failure", [False, True])
+def test_identical_query_text_embeds_once_per_request_without_reusing_authority(
+    sync, monkeypatch, failure
+):
+    backend = indexed(sync)
+    outside_boundaries(sync, monkeypatch, backend)
+    backend.fail_query = failure
+    payload = request(sync, "乌龙茶")
+    payload["queries"] = [
+        dict(payload["queries"][0], query_id="facts", kinds=["facts"]),
+        dict(payload["queries"][0], query_id="current", kinds=["episodes"]),
+        dict(payload["queries"][0], query_id="history", intent="history"),
+    ]
+    response = post(sync, "query", payload)
+    assert response.status_code == 200, response.text
+    assert backend.query_calls == 1
+    assert [item["query_id"] for item in response.json()["query_results"]] == [
+        "facts",
+        "current",
+        "history",
+    ]
+    assert response.json()["evidence"]
+    assert source_calls(sync) == ["snapshot", "current", "head"]
+
+    # A later request embeds afresh and rechecks the source owners. The derived
+    # vector cannot make a newly denied original eligible or complete.
+    for grant in sync.grants:
+        grant["state"] = "denied"
+    sync.platform_head["sequence"] += 1
+    sync.calls.clear()
+    again = post(sync, "query", payload)
+    assert again.status_code == 200, again.text
+    assert again.json()["evidence"] == []
+    assert backend.query_calls == 2
+    assert source_calls(sync) == ["snapshot", "current", "head"]
+
+
+@pytest.mark.parametrize("kinds", [["facts"], ["episodes"]])
+def test_query_kinds_do_not_rank_the_other_domain_but_keep_source_verification(
+    sync, monkeypatch, kinds
+):
+    from test_memory_v2 import fact
+
+    from tianshu_memory import memory_documents
+
+    setup(sync)
+    text = "我喜欢乌龙茶。"
+    job, _ = candidate(sync, text)
+    assert commit(sync, job, text, fact("乌龙茶"))["state"] == "completed"
+    calls = []
+    original_episodes = memory_documents.episode_metadata
+    original_facts = sync.service._rank_groups
+
+    def episodes(*args, **kwargs):
+        if kwargs.get("query_text") is not None:
+            calls.append("episodes")
+        yield from original_episodes(*args, **kwargs)
+
+    def facts(*args, **kwargs):
+        calls.append("facts")
+        return original_facts(*args, **kwargs)
+
+    monkeypatch.setattr(memory_documents, "episode_metadata", episodes)
+    monkeypatch.setattr(sync.service, "_rank_groups", facts)
+    payload = request(sync, "乌龙茶")
+    payload["queries"][0]["kinds"] = kinds
+    response = post(sync, "query", payload)
+    assert response.status_code == 200, response.text
+    evidence = response.json()["evidence"]
+    assert evidence and all(
+        (item["kind"] == "episode") == (kinds == ["episodes"]) for item in evidence
+    )
+    assert calls and set(calls) == set(kinds)
+    assert verify(sync, response.json()["bundle"]).status_code == 200
+    for grant in sync.grants:
+        grant["state"] = "denied"
+    sync.platform_head["sequence"] += 1
+    assert verify(sync, response.json()["bundle"]).status_code == 409
+
+
 def test_completed_derived_query_vector_survives_later_source_queue_time(sync, monkeypatch):
     from tianshu_memory import persistent_retrieval
     from tianshu_memory.memory_context import read_v2
