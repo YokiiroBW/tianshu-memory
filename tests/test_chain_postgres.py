@@ -15,9 +15,11 @@ from test_storage_backends import source_examples as source_examples
 
 @pytest.mark.parametrize("failure", [False, True])
 def test_postgres_same_text_vectors_remain_request_local(pg_sync, monkeypatch, failure):
+    assert pg_sync.store.backend == "postgresql", "isolated PG configuration fell back to SQLite"
     vector_case(pg_sync, monkeypatch, failure)
 
 
 @pytest.mark.parametrize("kinds", [["facts"], ["episodes"]])
 def test_postgres_query_kinds_keep_fresh_selected_source_proof(pg_sync, monkeypatch, kinds):
+    assert pg_sync.store.backend == "postgresql", "isolated PG configuration fell back to SQLite"
     kinds_case(pg_sync, monkeypatch, kinds)
