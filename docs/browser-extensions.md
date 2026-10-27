@@ -6,6 +6,16 @@ They do not create another memory service or storage table. Original browser end
 their source and request behavior. The extra packages are coordinator-pinned local candidates;
 the original published user memory contracts are unchanged.
 
+An existing reader can explicitly set `allow_runtime_groups: true` to delegate registration of
+new group conversation IDs to its trusted Platform origin owner. The default is false. This
+does not accept a browser's own scope claim: the current resolved `allowed_scope` must exactly
+match the request, the verified account must match the registered reader account, and the group
+scope must retain the operator person from a registered template. The actor must be the reader's
+static actor, or retain both existing runtime-role flags and an active current role grant.
+Private scopes and other accounts/people are not broadened. Platform must resolve the actual
+group and canonical conversation before issuing that origin; the original source checkpoint,
+fresh authorization after the checkpoint and deletion behavior remain unchanged.
+
 ## Group topics
 
 `POST /internal/v1/memory/browser/topics` accepts the frozen group-memory-projection request:

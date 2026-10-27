@@ -124,20 +124,32 @@ def _registration(auth, caller_name, caller, context, scope):
     require(context["verified_account"] == reader.get("account"), "forbidden", 403)
     require(context["allowed_scope"] == scope, "forbidden", 403)
     templates = reader.get("scopes", [])
-    static = scope["actor_id"] == reader.get("actor_id") and scope in templates
-    runtime = (
+    static_actor = scope["actor_id"] == reader.get("actor_id")
+    runtime_actor = (
         reader.get("allow_runtime_roles") is True
         and caller.get("allow_runtime_roles") is True
         and auth.role_grants is not None
         and auth.role_grants.decision(scope["actor_id"]) is True
+    )
+    static = static_actor and scope in templates
+    runtime = runtime_actor and any(
+        isinstance(template, dict)
+        and template.get("actor_id") == reader.get("actor_id")
+        and {**template, "actor_id": scope["actor_id"]} == scope
+        for template in templates
+    )
+    runtime_group = (
+        reader.get("allow_runtime_groups") is True
+        and scope["audience"] == "group"
+        and (static_actor or runtime_actor)
         and any(
             isinstance(template, dict)
             and template.get("actor_id") == reader.get("actor_id")
-            and {**template, "actor_id": scope["actor_id"]} == scope
+            and template.get("person_id") == scope["person_id"]
             for template in templates
         )
     )
-    require(static or runtime, "forbidden", 403)
+    require(static or runtime or runtime_group, "forbidden", 403)
 
 
 def _group(service, db, row, scope, subject=None):
