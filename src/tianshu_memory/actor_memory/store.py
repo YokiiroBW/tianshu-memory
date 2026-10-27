@@ -54,7 +54,7 @@ def checkpoint(db):
 
 
 class Store:
-    def __init__(self, config, *, initialize=False):
+    def __init__(self, config, *, initialize=False, storage_environ=None):
         section = config["actor_memory"]
         path = Path(section["database_path"])
         require(
@@ -90,7 +90,7 @@ class Store:
         )
         self.gate = threading.RLock()
         self.runtime = StorageRuntime(
-            StorageOptions.from_settings(config),
+            StorageOptions.from_settings(config, environ=storage_environ),
             service="actor-memory",
             state_directory=self.state_directory,
         )

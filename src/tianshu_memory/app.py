@@ -74,6 +74,8 @@ def create_app(
     body_timeout=5.0,
     execute_timeout=15.0,
     max_active=8,
+    internal_clients=None,
+    storage_environ=None,
 ):
     @asynccontextmanager
     async def lifespan(application):
@@ -81,22 +83,25 @@ def create_app(
             yield
         finally:
             try:
-                try:
-                    await application.state.actor_memory.aclose()
-                finally:
-                    if auth is not None and hasattr(auth, "close"):
-                        auth.close()
+                await application.state.drain()
             finally:
                 try:
-                    transport = getattr(
-                        getattr(service, "source_authority", None), "transport", None
-                    )
-                    if transport is not None and hasattr(transport, "close"):
-                        transport.close()
+                    try:
+                        await application.state.actor_memory.aclose()
+                    finally:
+                        if auth is not None and hasattr(auth, "close"):
+                            auth.close()
                 finally:
-                    verifier = getattr(getattr(service, "observations", None), "verifier", None)
-                    if verifier is not None and hasattr(verifier, "close"):
-                        verifier.close()
+                    try:
+                        transport = getattr(
+                            getattr(service, "source_authority", None), "transport", None
+                        )
+                        if transport is not None and hasattr(transport, "close"):
+                            transport.close()
+                    finally:
+                        verifier = getattr(getattr(service, "observations", None), "verifier", None)
+                        if verifier is not None and hasattr(verifier, "close"):
+                            verifier.close()
 
     app = FastAPI(
         title="Tianshu Memory",
@@ -119,8 +124,24 @@ def create_app(
     from .actor_memory.http import mount as mount_actor_memory
 
     mount_actor_memory(
-        app, auth, body_timeout=body_timeout, execute_timeout=execute_timeout, max_active=max_active
+        app,
+        auth,
+        body_timeout=body_timeout,
+        execute_timeout=execute_timeout,
+        max_active=max_active,
+        internal_clients=internal_clients,
+        storage_environ=storage_environ,
     )
+
+    async def drain():
+        # Do not stop callback admission here. The host stops external root work
+        # first and drains all domains before closing their shared exchange.
+        while True:
+            await asyncio.gather(admission.drain(), app.state.actor_memory.drain())
+            if not admission.active and not app.state.actor_memory.admission.active:
+                return
+
+    app.state.drain = drain
     from .candidate_http import mount as mount_candidates
 
     mount_candidates(
@@ -627,7 +648,16 @@ def create_app(
     return app
 
 
-def runtime_app(config_path, contract_path):
+def runtime_app(
+    config_path,
+    contract_path,
+    *,
+    internal_clients=None,
+    storage_environ=None,
+    diagnostics=None,
+    log_directory=None,
+    diagnostics_environ=None,
+):
     """The composition root the deployment CLI hands to `server_runtime`.
 
     It is the same `configured_app` factory the product already had, plus the one thing a probe
@@ -636,7 +666,15 @@ def runtime_app(config_path, contract_path):
     """
     from .runtime_probes import ProbeConfig
 
-    app = configured_app()
+    app = configured_app(
+        config_path,
+        internal_clients=internal_clients,
+        storage_environ=storage_environ,
+        diagnostics=diagnostics,
+        log_directory=log_directory,
+        diagnostics_contract=contract_path,
+        diagnostics_environ=diagnostics_environ,
+    )
 
     def handles():
         return app.state.memory is not None and getattr(app.state, "auth", None) is not None
@@ -649,14 +687,24 @@ def runtime_app(config_path, contract_path):
             contract_path=contract_path,
             runtime=assembly,
             handles=handles,
+            storage_environ=storage_environ,
         )
 
     app.state.probe_settings = probe_settings
     return app
 
 
-def configured_app():
-    config_path = os.environ.get("TIANSHU_MEMORY_CONFIG")
+def configured_app(
+    config_path=None,
+    *,
+    internal_clients=None,
+    storage_environ=None,
+    diagnostics=None,
+    log_directory=None,
+    diagnostics_contract=None,
+    diagnostics_environ=None,
+):
+    config_path = config_path or os.environ.get("TIANSHU_MEMORY_CONFIG")
     if not config_path:
         return create_app()
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
@@ -671,14 +719,16 @@ def configured_app():
         for caller in config.get("callers", {}).values()
     ) or bool(config.get("browser_readers")):
         contracts.load_profiles()
-    store = Store.from_config(config)
+    store = Store.from_config(config, storage_environ=storage_environ)
     sources = LocalFixtureSources() if config.get("mode") == "local_fixture" else None
     if config.get("mode") == "source_sync":
         from .source_authority import SourceAuthority
         from .source_transport import SourceTransport
 
         contracts.load_sources()
-        sources = SourceAuthority(SourceTransport(config_path, contracts), contracts)
+        sources = SourceAuthority(
+            SourceTransport(config_path, contracts, internal_clients=internal_clients), contracts
+        )
     if wants_context:
         contracts.load_context()
     if any(
@@ -696,7 +746,9 @@ def configured_app():
 
             retrieval = Retrieval(LocalEmbeddingBackend(config["retrieval"]))
         else:
-            retrieval = Retrieval(RetrievalTransport(config_path))
+            retrieval = Retrieval(
+                RetrievalTransport(config_path, internal_clients=internal_clients)
+            )
     service = MemoryService(
         store,
         contracts,
@@ -708,9 +760,17 @@ def configured_app():
         from .observations import ObservationLedger, PlatformVerifier
 
         service.observations = ObservationLedger(
-            store, PlatformVerifier(config_path), local_commit=service.local_commit
+            store,
+            PlatformVerifier(config_path, internal_clients=internal_clients),
+            local_commit=service.local_commit,
         )
-    auth = Authenticator(config_path, contracts, now, role_database=store.role_database)
+    auth = Authenticator(
+        config_path,
+        contracts,
+        now,
+        role_database=store.role_database,
+        internal_clients=internal_clients,
+    )
     from .relationships import Policy, Relationships
 
     policy_config = dict(config.get("relationships_policy", {}))
@@ -718,7 +778,13 @@ def configured_app():
         if name in policy_config:
             policy_config[name] = tuple(policy_config[name])
     relationships = Relationships(service, auth=auth, policy=Policy(**policy_config))
-    app = create_app(service=service, auth=auth, relationships=relationships)
+    app = create_app(
+        service=service,
+        auth=auth,
+        relationships=relationships,
+        internal_clients=internal_clients,
+        storage_environ=storage_environ,
+    )
     app.state.auth = auth
     if retrieval is not None:
         from .memory_index_lifecycle import attach as attach_index
@@ -727,4 +793,15 @@ def configured_app():
     from .storage_lifecycle import attach
 
     attach(app, store)
+    from .module_runtime import install_diagnostics
+
+    install_diagnostics(
+        app,
+        CHAT_SERVICE,
+        config_path,
+        diagnostics_contract,
+        diagnostics=diagnostics,
+        log_directory=log_directory,
+        diagnostics_environ=diagnostics_environ,
+    )
     return app

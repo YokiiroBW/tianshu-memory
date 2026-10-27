@@ -12,22 +12,38 @@ from .service import MemoryService
 from .store import Store
 
 
-def mount(app, config_path, config, *, body_timeout, execute_timeout, store=None):
+def mount(
+    app,
+    config_path,
+    config,
+    *,
+    body_timeout,
+    execute_timeout,
+    store=None,
+    internal_clients=None,
+    storage_environ=None,
+):
     from .storage_lifecycle import attach
 
-    store = store or Store.from_config(config, service="knowledge")
-    attach(app, store)
+    store = store or Store.from_config(config, service="knowledge", storage_environ=storage_environ)
     callers = config.get("callers", {})
     enabled = any(
         any(op.startswith("content_") for op in caller.get("operations", []))
         for caller in callers.values()
     )
     if not enabled and not any(caller.get("role_admin") is True for caller in callers.values()):
+        attach(app, store)
         return
     contracts = Contracts(config["contract_directory"])
     if enabled:
         contracts.load_content()
-    auth = Authenticator(config_path, contracts, now, role_database=store.role_database)
+    auth = Authenticator(
+        config_path,
+        contracts,
+        now,
+        role_database=store.role_database,
+        internal_clients=internal_clients,
+    )
     service = MemoryService(store, contracts)
 
     def authorize_scope(db, context, *, scope):
@@ -58,6 +74,7 @@ def mount(app, config_path, config, *, body_timeout, execute_timeout, store=None
     app.state.knowledge_content = content
     app.state.content_auth = auth
     app.state.content_requests = admission
+    attach(app, store, drain=admission.drain, before_close=auth.close)
     mount_roles(app, auth, admission, body_timeout=body_timeout)
     if enabled:
         with store.transaction() as db:

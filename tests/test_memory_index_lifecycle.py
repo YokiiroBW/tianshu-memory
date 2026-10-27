@@ -18,8 +18,11 @@ def lifecycle(monkeypatch):
     async def previous(app):
         yield None
 
+    async def drain():
+        pass
+
     app = SimpleNamespace(
-        router=SimpleNamespace(lifespan_context=previous), state=SimpleNamespace()
+        router=SimpleNamespace(lifespan_context=previous), state=SimpleNamespace(drain=drain)
     )
     service = SimpleNamespace(
         retrieval=SimpleNamespace(backend=SimpleNamespace(close=lambda: closed.append(True)))
@@ -35,6 +38,7 @@ def lifecycle(monkeypatch):
             Event=asyncio.Event,
             to_thread=asyncio.to_thread,
             create_task=asyncio.create_task,
+            shield=asyncio.shield,
             wait_for=wait_for,
         ),
     )

@@ -438,7 +438,18 @@ class Assembly:
         return self.probe_factory(self)
 
 
-def build_assembly(service, build_app, *, config_path, contract_path, binding, probe_settings=None):
+def build_assembly(
+    service,
+    build_app,
+    *,
+    config_path,
+    contract_path,
+    binding,
+    probe_settings=None,
+    diagnostics=None,
+    log_directory=None,
+    diagnostics_environ=None,
+):
     """Assemble one Memory process: read the private configuration, install, and return.
 
     A configuration that cannot be read, or whose diagnostics section is malformed, stops the
@@ -448,15 +459,20 @@ def build_assembly(service, build_app, *, config_path, contract_path, binding, p
     sees the real code rather than a generic startup error.
     """
     raw = read_configuration(config_path)
+    if log_directory is not None:
+        raw["log_directory"] = str(log_directory) if log_directory is not False else False
     resolved = diagnostics_contract_path(raw, config_path, contract_path)
     # `raw` goes in whole: the adapter reads its own `diagnostics` section, and a section that is
     # malformed or a log directory that is missing is refused here, before the socket exists, rather
     # than becoming a process that serves and cannot record what it did.
-    diagnostics = Diagnostics(service, raw, config_path=config_path, contract_path=resolved)
+    diagnostics = diagnostics or Diagnostics(
+        service, raw, config_path=config_path, contract_path=resolved, environ=diagnostics_environ
+    )
     diagnostics.emit("runtime.starting", level="INFO", outcome="started")
     try:
         assembly = Assembly(build_app(), diagnostics, binding, probe_factory=probe_settings)
-        diagnostics.install(assembly.app)
+        if getattr(assembly.app.state, "diagnostics", None) is not diagnostics:
+            diagnostics.install(assembly.app)
         install_networking(assembly.app, binding)
         install_probe_routes(assembly.app, assembly)
     except Fault:

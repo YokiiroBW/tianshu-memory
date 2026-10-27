@@ -25,7 +25,7 @@ from .knowledge_evidence import blocks
 from .knowledge_files import block as read_block
 from .knowledge_ports import ContinuationReader, DirectoryWriter, EvidenceLookup
 from .knowledge_sources import FileReader, content_hash, decode, fetch_url, read_file
-from .knowledge_storage import KnowledgeStorage, registration
+from .knowledge_storage import KnowledgeStorage
 from .postgres import is_postgres
 
 READ = {
@@ -494,7 +494,7 @@ class KnowledgeApplication:
         config, knowledge, principal, project, secret, scan, worktrees = self._authorize(
             client, credential, project_id, operation, evidence_projects
         )
-        storage_key = registration(config)
+        storage_key = self._store_owner.registration(config)
         storage = self._storage
         if storage["key"] is not None:
             require(storage_key == storage["key"], "registration_changed", 409)

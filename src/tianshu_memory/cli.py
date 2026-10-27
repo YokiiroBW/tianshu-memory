@@ -175,8 +175,7 @@ def run_local_operation(args, parser):
                 result = store.migrate_profiles(args.backup)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
-    os.environ["TIANSHU_MEMORY_CONFIG"] = args.config
-    app = configured_app()
+    app = configured_app(args.config)
     if args.operation == "reindex-memory":
         from .memory_reindex import MemoryReindexer
 

@@ -1,7 +1,6 @@
 """Purpose-bound Platform attestations; service credentials never constitute user consent."""
 
 import json
-import ssl
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -52,20 +51,16 @@ class PlatformProofs:
             503,
         )
         require(port is None or 0 < port <= 65535, "dependency_unavailable", 503)
-        verify = True
+        ca_file = config.get("ca_file")
         if config.get("ca_file") is not None:
             require(
                 isinstance(config["ca_file"], str) and Path(config["ca_file"]).is_absolute(),
                 "dependency_unavailable",
                 503,
             )
-            try:
-                verify = ssl.create_default_context(cafile=config["ca_file"])
-            except OSError:
-                raise Fault("dependency_unavailable", 503) from None
         try:
-            with httpx.Client(
-                verify=verify, timeout=5, follow_redirects=False, trust_env=False
+            with self.auth.owner_client(
+                "context-proofs", url, ca_file, target="platform"
             ) as client:
                 deadline = time.monotonic() + 5
                 with client.stream(

@@ -525,9 +525,11 @@ def http_app(actor, contracts, *, execute_timeout=15):
 
 def test_http_transport_is_separate_from_user_admission_and_denies_wrong_actor(actor, contracts):
     app, endpoint = http_app(actor, contracts)
-    held = [app.state.chat_requests.claim() for _ in range(app.state.chat_requests.ordinary_limit)]
-    try:
-        with TestClient(app) as client:
+    with TestClient(app) as client:
+        held = [
+            app.state.chat_requests.claim() for _ in range(app.state.chat_requests.ordinary_limit)
+        ]
+        try:
             response = client.post(
                 "/internal/v1/actor-self-memory/operate",
                 json=append(actor),
@@ -541,9 +543,9 @@ def test_http_transport_is_separate_from_user_admission_and_denies_wrong_actor(a
             )
             assert response.status_code == 403
             assert endpoint.admission.active == 0
-    finally:
-        for lease in held:
-            lease.finish()
+        finally:
+            for lease in held:
+                lease.finish()
 
 
 def test_timeout_keeps_actual_worker_and_original_receipt_recovery(actor, contracts):
@@ -640,7 +642,8 @@ def test_real_authority_rejects_unbound_owner_response(actor, monkeypatch, malfo
     from contextlib import contextmanager
 
     @contextmanager
-    def connection(*args):
+    def connection(*args, target):
+        assert target == "companion"
         yield client
 
     monkeypatch.setattr(authority.pool, "client", connection)

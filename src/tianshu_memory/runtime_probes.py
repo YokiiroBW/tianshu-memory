@@ -63,6 +63,7 @@ class ProbeConfig:
         "handles",
         "runtime",
         "service",
+        "storage_environ",
     )
 
     def __init__(
@@ -75,6 +76,7 @@ class ProbeConfig:
         runtime=None,
         client=None,
         handles=None,
+        storage_environ=None,
     ):
         self.service = service
         self.diagnostics = diagnostics
@@ -87,6 +89,7 @@ class ProbeConfig:
         # A callable the entry point supplies: whether it still holds the objects that own its
         # database handle. The probe calls it and never sets anything through it.
         self.handles = handles
+        self.storage_environ = None if storage_environ is None else dict(storage_environ)
 
 
 class Outcome:
@@ -179,10 +182,11 @@ def _connect(database):
 class SelectedDatabase:
     """Read the persisted backend binding without starting or migrating a runtime."""
 
-    def __init__(self, raw, service):
+    def __init__(self, raw, service, *, storage_environ=None):
         self.path = raw["database_path"]
         self.raw = raw
         self.service = "memory" if service == CHAT_SERVICE else "knowledge"
+        self.storage_environ = storage_environ
 
     def readonly(self):
         from tianshu_storage import StorageOptions, StorageRuntime
@@ -190,7 +194,7 @@ class SelectedDatabase:
         from .postgres import dialect
 
         return StorageRuntime.open_existing(
-            StorageOptions.from_settings(self.raw),
+            StorageOptions.from_settings(self.raw, environ=self.storage_environ),
             service=self.service,
             state_directory=str(self.path) + ".storage",
             name="main",
@@ -517,10 +521,10 @@ def assess(settings, diagnostics, runtime=None):
         # unlike Store construction it cannot initialize a missing binding.
         from tianshu_storage import StorageOptions, StorageRuntime
 
-        selected = SelectedDatabase(raw, settings.service)
+        selected = SelectedDatabase(raw, settings.service, storage_environ=settings.storage_environ)
         try:
             status = StorageRuntime.inspect(
-                StorageOptions.from_settings(raw),
+                StorageOptions.from_settings(raw, environ=settings.storage_environ),
                 service=selected.service,
                 state_directory=database + ".storage",
             )
@@ -629,7 +633,9 @@ def present_token(request, diagnostics):
     is 503, because it cannot authenticate anyone at all. The comparison is constant time, the
     token is never logged and it grants no business permission of any kind.
     """
-    token = os.environ.get(diagnostics.token_env) if diagnostics.token_env else None
+    environment = getattr(diagnostics, "environ", None)
+    environment = os.environ if environment is None else environment
+    token = environment.get(diagnostics.token_env) if diagnostics.token_env else None
     if not token:
         return "unconfigured"
     header = request.headers.get("authorization")

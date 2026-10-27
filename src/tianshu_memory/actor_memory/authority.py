@@ -13,9 +13,9 @@ from ..source_http_pool import OwnerHttpPool
 
 
 class Authority:
-    def __init__(self, config_path, contracts):
+    def __init__(self, config_path, contracts, *, internal_clients=None):
         self.path, self.contracts = Path(config_path), contracts
-        self.pool = OwnerHttpPool()
+        self.pool = OwnerHttpPool(internal_clients=internal_clients)
 
     def _call(self, owner, definition, payload):
         try:
@@ -55,7 +55,8 @@ class Authority:
         )
         self.contracts.validate(definition + "_request", payload)
         try:
-            with self.pool.client("actor-memory:" + owner, url, ca) as client:
+            target = "platform" if owner == "actor_check" else owner
+            with self.pool.client("actor-memory:" + owner, url, ca, target=target) as client:
                 deadline = time.monotonic() + 5
                 with client.stream(
                     "POST",

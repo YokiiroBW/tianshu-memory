@@ -21,14 +21,15 @@ from .store import Store
 
 
 class Endpoint:
-    def __init__(self, auth, *, max_active):
+    def __init__(self, auth, *, max_active, internal_clients=None, storage_environ=None):
         self.auth = auth
         self.admission = Requests(max_active)
         self.application = None
         self.registration = None
         self.lock = threading.RLock()
-        self.leases = set()
         self.closed = False
+        self.internal_clients = internal_clients
+        self.storage_environ = storage_environ
 
     def get(self):
         require(not self.closed and self.auth is not None, "dependency_unavailable", 503)
@@ -46,7 +47,9 @@ class Endpoint:
                         "contract_directory",
                     )
                 },
-                "storage": asdict(StorageOptions.from_settings(config)),
+                "storage": asdict(
+                    StorageOptions.from_settings(config, environ=self.storage_environ)
+                ),
                 "user_database_path": config.get("database_path"),
                 "user_guard_path": config.get("source_sync", {}).get("recovery_path"),
             }
@@ -56,9 +59,11 @@ class Endpoint:
             if self.application is None:
                 try:
                     contracts = Contracts(section["contract_directory"])
-                    authority = Authority(self.auth.path, contracts)
+                    authority = Authority(
+                        self.auth.path, contracts, internal_clients=self.internal_clients
+                    )
                     try:
-                        store = Store(config)
+                        store = Store(config, storage_environ=self.storage_environ)
                     except BaseException:
                         authority.close()
                         raise
@@ -70,16 +75,31 @@ class Endpoint:
             return self.application
 
     async def aclose(self):
+        await self.drain()
         self.closed = True
-        tasks = [lease.task for lease in self.leases if lease.task is not None]
-        if tasks:
-            await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
         if self.application is not None:
             self.application.close()
 
+    async def drain(self):
+        await self.admission.drain()
 
-def mount(app, auth, *, body_timeout, execute_timeout, max_active):
-    endpoint = Endpoint(auth, max_active=max_active)
+
+def mount(
+    app,
+    auth,
+    *,
+    body_timeout,
+    execute_timeout,
+    max_active,
+    internal_clients=None,
+    storage_environ=None,
+):
+    endpoint = Endpoint(
+        auth,
+        max_active=max_active,
+        internal_clients=internal_clients,
+        storage_environ=storage_environ,
+    )
     app.state.actor_memory = endpoint
 
     @app.post("/internal/v1/actor-self-memory/operate")
@@ -88,7 +108,6 @@ def mount(app, auth, *, body_timeout, execute_timeout, max_active):
         try:
             require(not endpoint.closed and auth is not None, "dependency_unavailable", 503)
             lease = endpoint.admission.claim()
-            endpoint.leases.add(lease)
             caller_name, caller = await lease.run(
                 auth.authenticate, request.headers.get("authorization")
             )
@@ -152,10 +171,6 @@ def mount(app, auth, *, body_timeout, execute_timeout, max_active):
         finally:
             if lease is not None:
                 lease.finish()
-                if lease.task is not None and not lease.task.done():
-                    lease.task.add_done_callback(lambda task: endpoint.leases.discard(lease))
-                else:
-                    endpoint.leases.discard(lease)
         note_fault(code)
         # Invalid body request IDs cannot be echoed as unbounded diagnostic text.
         if len(request_id) > 128:

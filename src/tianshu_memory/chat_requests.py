@@ -15,6 +15,8 @@ class Requests:
         self.limit, self.active = limit, 0
         self.ordinary_limit = max(1, limit - 1) if reserve_identity else limit
         self.ordinary_active = 0
+        self.leases = set()
+        self._changed = asyncio.Event()
 
     def claim(self, *, identity=False):
         if self.active >= self.limit or (
@@ -24,7 +26,20 @@ class Requests:
         self.active += 1
         if not identity:
             self.ordinary_active += 1
-        return Lease(self, identity=identity)
+        lease = Lease(self, identity=identity)
+        self.leases.add(lease)
+        return lease
+
+    async def drain(self):
+        """Wait for actual owners, leaving callback admission open for the host.
+
+        A response timeout is not worker completion. The host stops external
+        producers first; this boundary neither cancels writes nor closes peers.
+        """
+        while self.leases:
+            self._changed.clear()
+            if self.leases:
+                await self._changed.wait()
 
 
 class Lease:
@@ -80,3 +95,5 @@ class Lease:
             self.owner.active -= 1
             if not self.identity:
                 self.owner.ordinary_active -= 1
+            self.owner.leases.discard(self)
+            self.owner._changed.set()

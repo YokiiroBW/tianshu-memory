@@ -1,18 +1,22 @@
 """Bounded calls to the Platform-owned retrieval model configuration and executor."""
 
 import json
-import ssl
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
 
 from .domain import Fault, require, strict_json
+from .source_http_pool import OwnerHttpPool
 
 
 class RetrievalTransport:
-    def __init__(self, config_path):
+    def __init__(self, config_path, *, internal_clients=None):
         self.path = Path(config_path)
+        self.pool = OwnerHttpPool(internal_clients=internal_clients, timeout=8)
+
+    def close(self):
+        self.pool.close()
 
     def call(self, operation, payload):
         try:
@@ -35,18 +39,12 @@ class RetrievalTransport:
                 "dependency_unavailable",
                 503,
             )
-            verify = (
-                ssl.create_default_context(cafile=config["ca_file"])
-                if config.get("ca_file")
-                else True
-            )
+            ca_file = str(Path(config["ca_file"]).absolute()) if config.get("ca_file") else None
             data = json.dumps(
                 {"operation": operation, **payload}, ensure_ascii=False, allow_nan=False
             ).encode()
             require(len(data) <= 1024 * 1024, "budget_exceeded", 429)
-            with httpx.Client(
-                verify=verify, timeout=8, trust_env=False, follow_redirects=False
-            ) as client:
+            with self.pool.client("gateway", url, ca_file) as client:
                 with client.stream(
                     "POST",
                     url,

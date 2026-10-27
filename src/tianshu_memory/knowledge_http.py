@@ -480,7 +480,15 @@ def parse_body(raw):
 
 
 def create_app(
-    config_path, client, port, *, body_timeout=None, execute_timeout=None, authorities=None
+    config_path,
+    client,
+    port,
+    *,
+    body_timeout=None,
+    execute_timeout=None,
+    authorities=None,
+    internal_clients=None,
+    storage_environ=None,
 ):
     """Build the entry for one fixed knowledge client on one explicit port.
 
@@ -531,7 +539,7 @@ def create_app(
     from .knowledge_storage import KnowledgeStorage
     from .storage_lifecycle import attach
 
-    storage = KnowledgeStorage()
+    storage = KnowledgeStorage(storage_environ=storage_environ)
     attach(app, storage)
     from .knowledge_content_runtime import mount as mount_content_runtime
 
@@ -541,6 +549,8 @@ def create_app(
         config,
         body_timeout=read_deadline,
         execute_timeout=execute_deadline,
+        internal_clients=internal_clients,
+        storage_environ=storage_environ,
     )
 
     if getattr(app.state, "content_auth", None) is not None:
@@ -556,6 +566,25 @@ def create_app(
                 except Fault as error:
                     return failed(error.code, error.status)
             return await call_next(request)
+
+    active_changed = asyncio.Event()
+
+    async def drain():
+        while True:
+            while app.state.active:
+                active_changed.clear()
+                if app.state.active:
+                    await active_changed.wait()
+            content = getattr(app.state, "content_requests", None)
+            if content is not None:
+                await content.drain()
+            if not app.state.active and (content is None or not content.active):
+                return
+
+    app.state.drain = drain
+    from .storage_lifecycle import attach_drain
+
+    attach_drain(app, drain)
 
     def claim_slot():
         """Take one of the four admission slots, or report that none is free.
@@ -595,6 +624,7 @@ def create_app(
             if self.owner == "request":
                 self.owner = "nobody"
                 app.state.active -= 1
+                active_changed.set()
 
     def released(task, lease):
         """Free the slot an abandoned call was holding, and consume its outcome.
@@ -793,3 +823,55 @@ def probe_handles(app, port):
     calls this; this module installs nothing else.
     """
     return bool(app.state.knowledge_client) and isinstance(port, int)
+
+
+def runtime_app(
+    config_path,
+    contract_path=None,
+    *,
+    client,
+    port,
+    authorities=None,
+    internal_clients=None,
+    storage_environ=None,
+    diagnostics=None,
+    log_directory=None,
+    diagnostics_environ=None,
+):
+    """The standalone CLI's application factory, without starting Uvicorn."""
+    from .diagnostics import KNOWLEDGE_SERVICE
+    from .module_runtime import install_diagnostics
+    from .runtime_probes import ProbeConfig
+
+    app = create_app(
+        config_path,
+        client,
+        port,
+        authorities=authorities,
+        internal_clients=internal_clients,
+        storage_environ=storage_environ,
+    )
+
+    def probe_settings(assembly):
+        return ProbeConfig(
+            service=KNOWLEDGE_SERVICE,
+            diagnostics=assembly.diagnostics,
+            config_path=config_path,
+            contract_path=contract_path,
+            runtime=assembly,
+            client=client,
+            storage_environ=storage_environ,
+            handles=lambda: probe_handles(app, port),
+        )
+
+    app.state.probe_settings = probe_settings
+    install_diagnostics(
+        app,
+        KNOWLEDGE_SERVICE,
+        config_path,
+        contract_path,
+        diagnostics=diagnostics,
+        log_directory=log_directory,
+        diagnostics_environ=diagnostics_environ,
+    )
+    return app

@@ -19,12 +19,12 @@ STORAGE_FIELDS = (
 )
 
 
-def registration(config):
+def registration(config, *, storage_environ=None):
     """Include effective environment overrides without retaining/logging credentials."""
     return fingerprint(
         {
             "config": {key: config.get(key) for key in STORAGE_FIELDS},
-            "options": asdict(StorageOptions.from_settings(config)),
+            "options": asdict(StorageOptions.from_settings(config, environ=storage_environ)),
         }
     )
 
@@ -62,15 +62,19 @@ class KnowledgeStorage:
     supplied after each dispatch has performed its current authorization check.
     """
 
-    def __init__(self):
+    def __init__(self, *, storage_environ=None):
         self._state = _State()
         self._finalizer = weakref.finalize(self, _close, self._state)
+        self.storage_environ = None if storage_environ is None else dict(storage_environ)
+
+    def registration(self, config):
+        return registration(config, storage_environ=self.storage_environ)
 
     @contextmanager
     def lease(self, config, key):
         state = self._state
         with state.lock:
-            require(registration(config) == key, "registration_changed", 409)
+            require(self.registration(config) == key, "registration_changed", 409)
             entry = state.current
             if entry is None or entry.key != key:
                 if entry is not None:
@@ -78,9 +82,14 @@ class KnowledgeStorage:
                     state.current = None
                     if not entry.users:
                         entry.store.close()
-                store = Store.from_config(config, service="knowledge")
+                options = (
+                    {}
+                    if self.storage_environ is None
+                    else {"storage_environ": self.storage_environ}
+                )
+                store = Store.from_config(config, service="knowledge", **options)
                 try:
-                    require(registration(config) == key, "registration_changed", 409)
+                    require(self.registration(config) == key, "registration_changed", 409)
                 except BaseException:
                     store.close()
                     raise

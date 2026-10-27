@@ -16,10 +16,10 @@ MAX_BODY_BYTES = 1024 * 1024
 class SourceTransport:
     """Read full configured endpoints and credentials anew for every owner request."""
 
-    def __init__(self, config_path, contracts):
+    def __init__(self, config_path, contracts, *, internal_clients=None):
         self.config_path = Path(config_path)
         self.contracts = contracts
-        self._http_pool = OwnerHttpPool()
+        self._http_pool = OwnerHttpPool(internal_clients=internal_clients)
 
     def close(self):
         self._http_pool.close()
@@ -108,7 +108,8 @@ class SourceTransport:
                     "dependency_unavailable",
                     503,
                 )
-            with self._http_pool.client(owner, url, ca_file) as client:
+            target = "companion" if owner == "core" else "platform"
+            with self._http_pool.client(owner, url, ca_file, target=target) as client:
                 with client.stream(
                     "POST",
                     url,

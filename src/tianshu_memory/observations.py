@@ -19,9 +19,9 @@ HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 class PlatformVerifier:
-    def __init__(self, config_path):
+    def __init__(self, config_path, *, internal_clients=None):
         self.config_path = Path(config_path)
-        self.pool = OwnerHttpPool()
+        self.pool = OwnerHttpPool(internal_clients=internal_clients)
 
     def close(self):
         self.pool.close()

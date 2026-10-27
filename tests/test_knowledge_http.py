@@ -1565,6 +1565,9 @@ def test_http_module_calls_only_the_public_execute_and_holds_no_domain_state():
         "knowledge_content_runtime",
         "knowledge_storage",
         "storage_lifecycle",
+        "diagnostics",
+        "module_runtime",
+        "runtime_probes",
     }, imported
     attributes = {
         node.attr

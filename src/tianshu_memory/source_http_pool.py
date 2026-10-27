@@ -36,38 +36,44 @@ class _Generation:
 
 
 class OwnerHttpPool:
-    def __init__(self):
+    def __init__(self, *, internal_clients=None, timeout=5):
         self._lock = threading.Lock()
         self._current = {}
         self._closed = False
+        self.internal_clients = dict(internal_clients or {})
+        self.timeout = timeout
 
-    @staticmethod
-    def _client(verify):
+    def _client(self, verify, *, transport=None):
         # Pass the stdlib jar itself: httpx retains this rejection policy.
         # Passing an httpx.Cookies wrapper would copy into a default-policy jar.
+        options = {} if transport is None else {"transport": transport}
         return httpx.Client(
             verify=verify,
-            timeout=5,
+            timeout=self.timeout,
             follow_redirects=False,
             trust_env=False,
             cookies=CookieJar(policy=_RejectCookies()),
+            **options,
         )
 
-    def _acquire(self, owner, url, ca_file):
-        path = Path(ca_file)
-        if not path.is_absolute():
-            raise ValueError("Explicit owner CA must be absolute")
-        # Read once: both the generation key and its SSLContext use these exact
-        # bytes, even if the configured file is replaced while this call runs.
-        trust = path.read_bytes()
-        if not trust:
-            raise ValueError("Explicit owner CA must not be empty")
+    def _acquire(self, owner, url, ca_file, target):
         endpoint = urlsplit(url)
         port = endpoint.port
         if port is None:
             port = {"https": 443, "http": 80}.get(endpoint.scheme)
         origin = (endpoint.scheme, endpoint.hostname, port)
-        key = (origin, str(path), hashlib.sha256(trust).digest())
+        factory = self.internal_clients.get(target)
+        if factory is not None:
+            key = (origin, "local", target)
+        else:
+            path = Path(ca_file)
+            if not path.is_absolute():
+                raise ValueError("Explicit owner CA must be absolute")
+            # One trust generation uses exactly these bytes, never credentials.
+            trust = path.read_bytes()
+            if not trust:
+                raise ValueError("Explicit owner CA must not be empty")
+            key = (origin, str(path), hashlib.sha256(trust).digest())
         with self._lock:
             if self._closed:
                 raise OSError("Owner transport is closed")
@@ -76,12 +82,15 @@ class OwnerHttpPool:
                 current.users += 1
                 return current
 
-        try:
-            certificates = trust.decode("ascii")
-        except UnicodeDecodeError:
-            certificates = trust
-        verify = ssl.create_default_context(cadata=certificates)
-        candidate = _Generation(key, self._client(verify))
+        if factory is not None:
+            client = self._client(True, transport=factory())
+        else:
+            try:
+                certificates = trust.decode("ascii")
+            except UnicodeDecodeError:
+                certificates = trust
+            client = self._client(ssl.create_default_context(cadata=certificates))
+        candidate = _Generation(key, client)
         close = []
         with self._lock:
             if self._closed:
@@ -106,8 +115,11 @@ class OwnerHttpPool:
         return selected
 
     @contextmanager
-    def client(self, owner, url, ca_file=None):
-        if ca_file is None:
+    def client(self, owner, url, ca_file=None, *, target=None):
+        # A logical capability chooses an injected transport. URL, headers and
+        # credentials never select a module. Unmapped peers keep real networking.
+        target = owner if target is None else target
+        if ca_file is None and target not in self.internal_clients:
             # Preserve the original one-shot system-trust behavior; do not cache
             # a system root store whose files are outside this configuration.
             with self._lock:
@@ -122,7 +134,7 @@ class OwnerHttpPool:
             with self._client(True) as client:
                 yield client
             return
-        generation = self._acquire(owner, url, ca_file)
+        generation = self._acquire(owner, url, ca_file, target)
         try:
             yield generation.client
         finally:

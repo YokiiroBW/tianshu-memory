@@ -316,7 +316,7 @@ def _directory_setting(value):
     return resolved
 
 
-def read_config(raw):
+def read_config(raw, *, environ=None):
     """The two diagnostics settings, validated strictly; every other key is left to its owner.
 
     `log_directory` is the explicit local log directory (deployment mounts it at
@@ -341,7 +341,9 @@ def read_config(raw):
     require(isinstance(raw, dict), "invalid_configuration", 503)
     directory = _directory_setting(raw.get("log_directory"))
     if directory is None and raw.get("log_directory") is not False:
-        directory = _directory_setting(os.environ.get(LOG_DIRECTORY_ENV))
+        directory = _directory_setting(
+            (os.environ if environ is None else environ).get(LOG_DIRECTORY_ENV)
+        )
     section = raw.get("diagnostics", {})
     require(isinstance(section, dict), "invalid_configuration", 503)
     token_env = section.get("token_env")
@@ -1180,13 +1182,23 @@ class Diagnostics:
         "stopping",
         "token_env",
         "writer",
+        "environ",
     )
 
     def __init__(
-        self, service, config, *, sink=None, clock=None, config_path=None, contract_path=None
+        self,
+        service,
+        config,
+        *,
+        sink=None,
+        clock=None,
+        config_path=None,
+        contract_path=None,
+        environ=None,
     ):
         require(service in SERVICES, "invalid_configuration", 503)
-        settings = read_config(config)
+        self.environ = None if environ is None else dict(environ)
+        settings = read_config(config, environ=self.environ)
         self.service = service
         self.token_env = settings["token_env"]
         # Whether this process was configured with a durable log at all, as distinct from whether

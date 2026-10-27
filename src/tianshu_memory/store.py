@@ -89,7 +89,15 @@ CREATE TABLE profile_approvals (
 class Store:
     """One selected SQL backend and one atomic, independently checkpointed authority."""
 
-    def __init__(self, path: str | Path, *, recovery_path=None, settings=None, service="memory"):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        recovery_path=None,
+        settings=None,
+        service="memory",
+        storage_environ=None,
+    ):
         from tianshu_storage import FileStore, StorageOptions, StorageRuntime
 
         from .postgres import dialect, prepare, prepare_grants
@@ -130,7 +138,7 @@ class Store:
         check_authority()
         self.files = FileStore(settings.get("knowledge_files_directory") or (str(path) + ".files"))
         self.runtime = StorageRuntime(
-            StorageOptions.from_settings(settings),
+            StorageOptions.from_settings(settings, environ=storage_environ),
             service=service,
             state_directory=state_directory,
         )
@@ -171,12 +179,13 @@ class Store:
             raise
 
     @classmethod
-    def from_config(cls, config, *, service="memory"):
+    def from_config(cls, config, *, service="memory", storage_environ=None):
         return cls(
             config["database_path"],
             recovery_path=config.get("source_sync", {}).get("recovery_path"),
             settings=config,
             service=service,
+            storage_environ=storage_environ,
         )
 
     def _initialize(self):

@@ -79,7 +79,7 @@ def main():
             create_server(args.config, args.client, args.credential_env).run(transport="stdio")
             return
         elif args.command == "serve":
-            from .knowledge_http import create_app, probe_handles
+            from .knowledge_http import probe_handles, runtime_app
             from .runtime_probes import ProbeConfig
             from .server_runtime import resolve_binding, serve
 
@@ -104,10 +104,11 @@ def main():
                 # the entry's own loopback rule — reachable as a probe and unusable as a service.
                 # This hands over the names that were already validated before the socket existed;
                 # it does not relax the check, derive anything from a request or accept a wildcard.
-                return create_app(
+                return runtime_app(
                     args.config,
-                    args.client,
-                    args.port,
+                    args.diagnostics_contract,
+                    client=args.client,
+                    port=args.port,
                     authorities=binding.authority_names(),
                 )
 

@@ -10,10 +10,30 @@ from .memory_reindex import MemoryReindexer
 
 def attach(app, service):
     previous = app.router.lifespan_context
+    previous_drain = app.state.drain
+    stopped = asyncio.Event()
+    running = {}
+
+    async def quiesce():
+        stopped.set()
+
+    async def drain():
+        await quiesce()
+        task = running.get("task")
+        try:
+            if task is not None:
+                await asyncio.shield(task)
+        except Exception:
+            await previous_drain()
+            raise
+        await previous_drain()
+
+    app.state.quiesce = quiesce
+    app.state.drain = drain
 
     @asynccontextmanager
     async def lifespan(application):
-        stopped = asyncio.Event()
+        stopped.clear()
 
         async def maintain():
             indexer = MemoryReindexer(service)
@@ -39,13 +59,15 @@ def attach(app, service):
 
         async with previous(application) as state:
             task = asyncio.create_task(maintain())
+            running["task"] = task
             try:
                 yield state
             finally:
-                stopped.set()
-                close = getattr(service.retrieval.backend, "close", None)
-                if close is not None:
-                    await asyncio.to_thread(close)
-                await task
+                try:
+                    await drain()
+                finally:
+                    close = getattr(service.retrieval.backend, "close", None)
+                    if close is not None:
+                        await asyncio.to_thread(close)
 
     app.router.lifespan_context = lifespan

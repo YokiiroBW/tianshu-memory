@@ -36,9 +36,9 @@ def interrupted_transport(error):
 class Authenticator:
     """Per-caller credentials, fixed issuer configuration, and live origin re-resolution."""
 
-    def __init__(self, config_path, contracts, clock, *, role_database=None):
+    def __init__(self, config_path, contracts, clock, *, role_database=None, internal_clients=None):
         self.path, self.contracts, self.clock = Path(config_path), contracts, clock
-        self._http_pool = OwnerHttpPool()
+        self._http_pool = OwnerHttpPool(internal_clients=internal_clients)
         config = self.config()
         grant_path = config.get("role_grants_database_path")
         if grant_path is not None:
@@ -52,6 +52,9 @@ class Authenticator:
 
     def close(self):
         self._http_pool.close()
+
+    def owner_client(self, owner, url, ca_file=None, *, target=None):
+        return self._http_pool.client(owner, url, ca_file, target=target)
 
     def config(self):
         return json.loads(self.path.read_text(encoding="utf-8"))
@@ -121,7 +124,7 @@ class Authenticator:
                 503,
             )
         try:
-            with self._http_pool.client(service, url, ca_file) as client:
+            with self.owner_client(service, url, ca_file, target=issuer) as client:
                 deadline = time.monotonic() + 5
                 with client.stream(
                     "POST",
