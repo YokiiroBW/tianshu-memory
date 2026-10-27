@@ -80,6 +80,7 @@ WRITE_QUEUE_LIMIT = 64
 # a stop request. It is not a caller's wait: no producer ever blocks on the queue, and the longest a
 # caller waits for its own line is `WRITER_DEADLINE_SECONDS`.
 WRITER_QUEUE_TIMEOUT_SECONDS = 0.25
+RECOVERY_INTERVAL_SECONDS = 1.0
 WRITER_DEADLINE_SECONDS = 2.0
 # The longest shutdown waits for already-queued lines. Past it the process stops anyway and every
 # line it could not persist is latched as a failure by the writer that owns it.
@@ -381,6 +382,8 @@ class Sink:
         self.sequence = 0
         self._last_reserved = 0
         self.failure = None
+        self._failure_generation = 0
+        self._capacity_recoverable = False
         self.warned = False
         self._handle = None
         self._segment_size = 0
@@ -453,15 +456,75 @@ class Sink:
                 pass
 
     def fail(self, code):
-        """Latch a persistence failure and emit the one fixed warning. Never recovers by itself.
+        """Latch a persistence failure until the owner proves recovery; warn once.
 
         The open handle is deliberately left alone: it is owned by the single writer thread, which
         is the only caller of `write` and therefore the only place that may close it. Latching is
         safe from any thread.
         """
-        if self.failure is None:
-            self.failure = code
+        with self.lock:
+            self._failure_generation += 1
+            if self.failure is None:
+                self.failure = code
+                self._capacity_recoverable = code == "log_capacity"
+            elif code != "log_capacity":
+                # Keep the original closed verdict, but a later unknown IO outcome
+                # cannot be cleared by proving only directory capacity.
+                self._capacity_recoverable = False
         self._warn_once()
+
+    def recover(self):
+        """Prove freed capacity on the existing file owner, without a log-sequence write.
+
+        Unknown I/O outcomes keep their latch. Capacity is restored only after a fresh
+        measurement and an actual create/write/fsync/unlink in this same directory.
+        """
+        with self.lock:
+            if self.failure != "log_capacity":
+                return self.failure is None
+            if not self._capacity_recoverable:
+                return False
+            generation = self._failure_generation
+        if self.directory is None or (self._handle is not None and self._handle.closed):
+            return False
+        target = self.directory / (".tianshu-log-probe-" + uuid.uuid4().hex + ".tmp")
+        created = False
+        try:
+            used = self._directory_usage()
+            reserved = self.segment_bytes
+            if self._handle is not None:
+                reserved = max(0, self.segment_bytes - self._segment_size)
+            proof = b"tianshu-log-capacity-probe\n"
+            if used + max(reserved, len(proof)) > self.directory_bytes:
+                return False
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(proof)
+                stream.flush()
+                os.fsync(stream.fileno())
+            target.unlink()
+            created = False
+        except (OSError, ValueError):
+            return False
+        finally:
+            if created:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+        with self.lock:
+            # A newer queue/IO refusal while the proof was in flight remains a failure.
+            if (
+                self._failure_generation != generation
+                or self.failure != "log_capacity"
+                or not self._capacity_recoverable
+            ):
+                return False
+            self.failure = None
+            self._capacity_recoverable = False
+            self.warned = False
+            return True
 
     def _close(self):
         handle, self._handle = self._handle, None
@@ -573,14 +636,15 @@ class _Pending:
     still spent. `taken` is set only by the code that really spends the slot, never by a caller.
     """
 
-    __slots__ = ("done", "failed", "persisted", "record", "taken")
+    __slots__ = ("done", "failed", "persisted", "record", "taken", "maintenance")
 
-    def __init__(self, record):
+    def __init__(self, record, *, maintenance=False):
         self.record = record
         self.done = threading.Event()
         self.persisted = False
         self.failed = False
         self.taken = False
+        self.maintenance = maintenance
 
 
 class Writer:
@@ -1096,6 +1160,7 @@ class Writer:
         need the allocation and the write to happen under one lock, and holding that lock across an
         `fsync` is exactly the design this class exists to remove.
         """
+        recovery_due = None
         try:
             while True:
                 try:
@@ -1103,9 +1168,26 @@ class Writer:
                 except queue.Empty:
                     if self.stopping.is_set():
                         return
+                    if self.sink.failure == "log_capacity":
+                        now = time.monotonic()
+                        if recovery_due is None:
+                            recovery_due = now + RECOVERY_INTERVAL_SECONDS
+                        elif now >= recovery_due:
+                            # This owner is idle: no accepted record or active fsync is
+                            # bypassed, and no new thread or readiness-path write is needed.
+                            with self.lock:
+                                idle = self.admitted == 0
+                            if idle:
+                                self.sink.recover()
+                            recovery_due = now + RECOVERY_INTERVAL_SECONDS
+                    else:
+                        recovery_due = None
                     continue
-                self.attempted += 1
                 try:
+                    if getattr(pending, "maintenance", False):
+                        pending.persisted = self.sink.recover()
+                        continue
+                    self.attempted += 1
                     record = pending.record
                     sequence = self.sink.reserve()
                     record["sequence"] = sequence
@@ -1274,6 +1356,21 @@ class Diagnostics:
 
     def available(self):
         return self.sink.failure is None
+
+    def _recovery(self):
+        if self.stopping.is_set() or not self.sink.durable:
+            return None
+        return self.writer.admit(_Pending(None, maintenance=True))
+
+    def recover(self):
+        """Local maintenance through the existing bounded writer; health stays read-only."""
+        pending = self._recovery()
+        return pending is not None and self.writer.wait(pending)
+
+    async def arecover(self):
+        """The same owned proof without waiting for disk on the serving loop."""
+        pending = self._recovery()
+        return pending is not None and await self.writer.await_verdict(pending)
 
     def _build(self, name, *, level, outcome, error_code, duration_ms):
         """Build one contract-shaped record, with every field except its number.

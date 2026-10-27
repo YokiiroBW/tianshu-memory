@@ -477,7 +477,7 @@ def test_a_capacity_refusal_latches_fail_closed_and_warns_exactly_once(tmp_path,
     assert adapter.log_state() == "log_capacity"
     # One fixed warning, carrying no path, no value and no exception text.
     assert capsys.readouterr().err == SINK_WARNING
-    # It never recovers by itself, and it never removes history to make room.
+    # A later business event cannot clear the latch or remove history; storage is still full.
     assert adapter.emit("runtime.started", level="INFO", outcome="succeeded") is False
     assert capsys.readouterr().err == ""
     assert isinstance(SinkFull("x"), RuntimeError)
