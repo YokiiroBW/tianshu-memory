@@ -92,7 +92,7 @@ CONTEXT_TERMS = frozenset(
 )
 
 
-def query_terms(value: str) -> list[str]:
+def query_terms(value: str, *, legacy_hints=True) -> list[str]:
     from .recall_language import (
         clean_query,
         lexical_question_text,
@@ -101,7 +101,9 @@ def query_terms(value: str) -> list[str]:
         topic_tokens,
     )
 
-    value = normalize_objects(clean_query(value))
+    value = clean_query(value)
+    if legacy_hints:
+        value = normalize_objects(value)
 
     scaffolding = {
         "我的",
@@ -149,7 +151,7 @@ def query_terms(value: str) -> list[str]:
         "normally",
         "currently",
     }
-    topics = topic_tokens(value)
+    topics = topic_tokens(value) if legacy_hints else []
     if "topic10" in topics and not {"topic11", "topic12"}.intersection(topics):
         topics += ["topic11", "topic12"]
     if "topic4" in topics and not {"topic5", "topic6"}.intersection(topics):
@@ -157,8 +159,8 @@ def query_terms(value: str) -> list[str]:
     if "topic19" in topics:
         # Query-side aliases also reach existing indexes without rewriting memory.
         topics += ["topic7", "topic8", "beverage", "drink", "饮料", "饮品"]
-    aliases = query_aliases(value)
-    if "topic2" in topics or "工作室" in value or "工作坊" in value:
+    aliases = query_aliases(value) if legacy_hints else []
+    if legacy_hints and ("topic2" in topics or "工作室" in value or "工作坊" in value):
         # Occupation already has a topic token; its raw bigram also occurs in studios.
         scaffolding.update({"工作", "work", "job"})
     if (topics or aliases) and not re.search(

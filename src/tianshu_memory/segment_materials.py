@@ -6,7 +6,7 @@ import json
 from jsonschema import ValidationError
 
 from . import consolidation_sources, segment_sources
-from .domain import Fault, canonical, fingerprint, parse_time, require, utc
+from .domain import Fault, canonical, fingerprint, new_id, parse_time, require, source_selector, utc
 from .memory_documents import capture, capture_sources
 from .segment_migration import installed
 
@@ -60,7 +60,48 @@ def human_member(
 class SegmentMaterials:
     def __init__(self, service, *, read_content=None):
         self.service = service
-        self.read_content = read_content
+        self.read_content = read_content or self.read_originals
+
+    def read_originals(self, event, *, with_metadata=False):
+        """Read authenticated bodies; the caller retains its final source boundary."""
+        service = self.service
+        scope, sources = event["scope"], event["sources"]
+        authority = service.source_authority
+        request = dict(
+            schema_version=1,
+            request_id=new_id("extract-source"),
+            mode="snapshot",
+            selectors=[source_selector(source, scope) for source in sources],
+            turn_ids=[event["aggregate_id"]],
+            include_content=True,
+        )
+        snapshot = authority.transport.facts(request)
+        authority._relations("source_snapshot", request, snapshot)
+        access_request, access = authority._read_access(snapshot, None)
+        authority._relations(
+            "current_access", access_request, access, snapshot, utc(service.clock())
+        )
+        authority._relations("actor_event", event, snapshot["turns"][0], snapshot)
+        authority._relations("current_actor_sources", scope, sources, snapshot)
+        physicals = {canonical(p["key"]): p for p in snapshot["physicals"]}
+        result = []
+        for index, source in enumerate(sources):
+            data = physicals[canonical(source_selector(source, scope)["key"])]["content"]
+            text = "\n".join(p["text"] for p in data["parts"] if p["kind"] == "text")
+            item = dict(index=index, text=text, sent_at=data["sent_at"])
+            if with_metadata:
+                item.update(
+                    author=data["author"],
+                    reply_refs=data["reply_refs"],
+                    mentioned_accounts=data["mentioned_accounts"],
+                )
+            result.append(item)
+        require(
+            len(canonical(result).encode()) <= (262144 if with_metadata else 65536),
+            "budget_exceeded",
+            413,
+        )
+        return result
 
     def execute(self, request, publisher):
         service = self.service
@@ -70,8 +111,6 @@ class SegmentMaterials:
             require(installed(db), "dependency_unavailable", 503)
         if "event" in request:
             receipt = service.consume(request["event"], publisher)
-            if receipt["candidate_job_ref"] is not None:
-                return receipt
             require(
                 receipt["state"] in {"accepted", "duplicate"},
                 "scope_changed" if receipt["state"] == "scope_changed" else "version_conflict",

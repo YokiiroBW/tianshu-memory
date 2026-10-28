@@ -24,164 +24,6 @@ class _WorkflowBase:
     def __init__(self, service):
         self.service = service
 
-    def _commit_candidate(self, job_id, drafts, *, exact_scope=False, source_extraction=False):
-        """Commit complete reviewed groups, or [] to skip. No LLM call or auto-confirmation.
-
-        A job is atomic and single-consumption. Source-version ledger deduplicates overlapping
-        events/turns, including relationship effects. Any stale dependency rejects the entire job.
-        """
-        require(isinstance(drafts, list) and len(drafts) <= 32, "invalid_input", 400)
-        require(
-            all(
-                isinstance(draft, dict) and isinstance(draft.get("units"), list) for draft in drafts
-            ),
-            "invalid_input",
-            400,
-        )
-        # The result contract cannot represent a partial commit or more than 256 records.
-        require(sum(len(draft["units"]) for draft in drafts) <= 256, "invalid_input", 400)
-        digest = fingerprint(drafts)
-        with self.service.store.transaction() as db:
-            initial = db.execute("SELECT event FROM jobs WHERE id=?", (job_id,)).fetchone()
-            require(initial is not None, "not_found", 404)
-            event = json.loads(initial["event"])
-        with self.service.operation(
-            scope=event["scope"], sources=event["sources"], event=event
-        ) as db:
-            job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-            require(job is not None, "not_found", 404)
-            require(job["event"] == initial["event"], "version_conflict", 409)
-            if exact_scope:
-                # Reviewed source extraction does not itself approve broader disclosure.
-                require(all(draft["scope"] == event["scope"] for draft in drafts))
-            old = db.execute("SELECT * FROM write_ledger WHERE job_id=?", (job_id,)).fetchone()
-            if old:
-                require(old["digest"] == digest, "idempotency_conflict", 409)
-                return json.loads(old["result"])
-            event, snapshot = json.loads(job["event"]), json.loads(job["source_snapshot"])
-            if source_extraction:
-                require(job["state"] == "pending", "scope_changed", 409)
-            current_version = self.service._scope_version(db, event["scope"])
-            if event["scope_version"] != current_version:
-                from .memory_context.history import source_version_retained
-
-                # Independent sourced extraction survives automatic fact updates
-                # while it was queued. Explicit revisions/withdrawals still reject
-                # a nonempty proposal; an empty proposal cannot restore a fact. All
-                # paths still recheck the current job, authority and exact sources.
-                require(
-                    source_extraction
-                    and event["scope_version"] < current_version
-                    and (
-                        not drafts
-                        or source_version_retained(
-                            self.service, db, event["scope"], event["scope_version"]
-                        )
-                    ),
-                    "scope_changed",
-                    409,
-                )
-            rows = self.service._source_rows(
-                db, event["sources"], event["scope"], reality=event["reality"]
-            )
-            require(
-                snapshot == {r["key"]: [r["revision"], r["epoch"]] for r in rows},
-                "version_conflict",
-                409,
-            )
-            source_map = {r["key"]: r for r in rows}
-            from .memory_context.migration import installed, target_key
-
-            contextual = installed(db)
-            # After migration a source may support distinct targets. Legacy whole-job
-            # consumption is retained only for databases not yet explicitly upgraded.
-            pending = (
-                [
-                    draft
-                    for draft in drafts
-                    if not db.execute(
-                        "SELECT 1 FROM context_applications WHERE scope=? AND target_key=? AND digest=? LIMIT 1",
-                        (canonical(event["scope"]), target_key(draft), fingerprint(draft)),
-                    ).fetchone()
-                ]
-                if contextual
-                else drafts
-            )
-            duplicate = (
-                bool(drafts) and not pending
-                if contextual
-                else any(
-                    db.execute(
-                        "SELECT job_id FROM source_writes WHERE source_key=? AND revision=? AND scope=?",
-                        (r["key"], r["revision"], canonical(event["scope"])),
-                    ).fetchone()
-                    for r in rows
-                )
-            )
-            if duplicate:
-                result = {"state": "duplicate_source", "record_ids": [], "group_ids": []}
-            else:
-                record_ids, group_ids = [], []
-                for draft in pending:
-                    result_group = self._write_group(db, draft, event, source_map)
-                    group_ids.append(result_group[0])
-                    record_ids.extend(result_group[1])
-                    if contextual:
-                        used_sources = {
-                            row[0]
-                            for row in db.execute(
-                                "SELECT source_key FROM lineage WHERE group_id=?",
-                                (result_group[0],),
-                            )
-                        }
-                        for row in rows:
-                            if row["key"] not in used_sources:
-                                continue
-                            db.execute(
-                                "INSERT INTO context_applications VALUES (?,?,?,?,?,?,?)",
-                                (
-                                    row["key"],
-                                    row["revision"],
-                                    canonical(event["scope"]),
-                                    target_key(draft),
-                                    job_id + ":" + str(len(group_ids)),
-                                    fingerprint(draft),
-                                    result_group[0],
-                                ),
-                            )
-                for row in rows:
-                    db.execute(
-                        "INSERT OR IGNORE INTO source_writes VALUES (?,?,?,?)",
-                        (
-                            row["key"],
-                            row["revision"],
-                            canonical(event["scope"]),
-                            job_id,
-                        ),
-                    )
-                if contextual and pending:
-                    self.service._bump(db, event["scope"], history_changed=False)
-                result = {
-                    "state": "committed" if drafts else "skipped",
-                    "record_ids": record_ids,
-                    "group_ids": group_ids,
-                }
-            db.execute(
-                "INSERT INTO write_ledger VALUES (?,?,?)", (job_id, digest, canonical(result))
-            )
-            db.execute("UPDATE jobs SET state=? WHERE id=?", (result["state"], job_id))
-            self.service._emit(
-                db, "memory.candidate_completed", {"candidate_job_ref": job_id, **result}
-            )
-            return result
-
-    def _write_group(self, db, draft, event, source_map):
-        if "fact" in draft:
-            from .automatic_facts import commit
-
-            return commit(self, db, draft, event, source_map)
-        return self._write_raw_group(db, draft, event, source_map)
-
     def _write_raw_group(self, db, draft, event, source_map):
         require(
             set(draft)
@@ -302,7 +144,6 @@ class _WorkflowBase:
     def _index(self, db, unit, scope, field, item):
         from .automatic_facts import index_text
         from .fact_migration import version
-        from .recall_language import topic_tokens
 
         text = " ".join(
             [
@@ -324,7 +165,7 @@ class _WorkflowBase:
                 unit["record_id"],
                 unit["record_version"],
                 canonical(scope),
-                " ".join(terms(text) + topic_tokens(text)),
+                " ".join(terms(text)),
             ),
         )
         from .memory_documents import index_group
@@ -522,9 +363,6 @@ class LocalWorkflow(_WorkflowBase):
                 return json.loads(proof["result"])
             return self._publish_profile(db, draft, approval_ref, sources)
 
-    def commit_candidate(self, job_id, drafts):
-        return self._commit_candidate(job_id, drafts)
-
     def rebuild_index(self):
         with self.service.store.transaction() as db:
             db.execute("DELETE FROM search_index")
@@ -576,29 +414,6 @@ class TrustedWorkflow(_WorkflowBase):
         super().__init__(service)
         self.confirmation_adapter = confirmation_adapter
         self.profile_approval_adapter = profile_approval_adapter
-
-    def commit_candidate(self, input):
-        self.service.contracts.validate("sync-workflow#candidate_commit", input)
-        result = self._commit_candidate(input["job_id"], input["drafts"], exact_scope=True)
-        self.service.contracts.validate("sync-workflow#candidate_result", result)
-        return result
-
-    def commit_extracted(self, input):
-        # The published write envelope is unchanged. The paired extractor supplies only
-        # internal derived metadata alongside the validated sourced semantic units.
-        portable = dict(
-            job_id=input["job_id"],
-            drafts=[
-                {k: v for k, v in draft.items() if k not in {"fact", "observed_at", "quotes"}}
-                for draft in input["drafts"]
-            ],
-        )
-        self.service.contracts.validate("sync-workflow#candidate_commit", portable)
-        result = self._commit_candidate(
-            input["job_id"], input["drafts"], exact_scope=True, source_extraction=True
-        )
-        self.service.contracts.validate("sync-workflow#candidate_result", result)
-        return result
 
     def confirm_revision(self, input):
         self.service.contracts.validate("sync-workflow#confirmation_input", input)

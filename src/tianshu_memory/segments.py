@@ -45,34 +45,13 @@ def _leaf_rows(service, db, event):
 
 def _invalid_material_snapshot(db, materials):
     """Original versions plus a durable negative, never a positive source proof."""
-    keys = sorted({row["source_key"] for row in materials})
-    marks = ",".join("?" for _ in keys)
-    current = {
-        row["key"]: row
-        for row in db.execute("SELECT * FROM sources WHERE key IN (" + marks + ")", keys)
+    if not segment_sources.invalidated_many(db, materials):
+        return None
+    return {
+        material["source_key"]: [payload["source_revision"], payload["source_epoch"]]
+        for material in materials
+        for payload in [json.loads(material["payload"])]
     }
-    suppressed = {
-        row[0]
-        for row in db.execute(
-            "SELECT source_key FROM suppression WHERE source_key IN (" + marks + ")", keys
-        )
-    }
-    snapshot, invalid = {}, False
-    for material in materials:
-        payload = json.loads(material["payload"])
-        expected = [payload["source_revision"], payload["source_epoch"]]
-        key = material["source_key"]
-        snapshot.setdefault(key, expected)
-        source = current.get(key)
-        invalid |= key in suppressed or (
-            source is not None
-            and source["scope"] == material["scope"]
-            and (
-                source["state"] == "withdrawn"
-                or (source["revision"], source["epoch"]) > tuple(expected)
-            )
-        )
-    return snapshot if invalid else None
 
 
 def _current(service, db, event, snapshot):

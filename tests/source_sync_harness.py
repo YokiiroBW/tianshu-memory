@@ -17,7 +17,6 @@ from tianshu_memory.app import configured_app
 from tianshu_memory.domain import canonical, fingerprint
 from tianshu_memory.store import Store
 from tianshu_memory.user_actions import LocalUserApplication, credential_digest
-from tianshu_memory.workflow import TrustedWorkflow
 
 
 class SyncHarness:
@@ -130,17 +129,38 @@ class SyncHarness:
         return response.json()
 
     def seed(self, actor=0):
+        """Create explicit reviewed data through the current manual proposal port."""
+        from tianshu_memory.memory_context import MemoryContext
+
+        self.store.migrate_context(self.directory / "seed-before-context.sqlite")
+        self.contracts.load_context()
         event = self.event(actor)
-        response = self.post("memory/turn-commits", event)
-        assert response.status_code == 200, response.text
-        assert response.json()["state"] == "accepted", response.text
-        job = response.json()["candidate_job_ref"]
         draft = copy.deepcopy(self.examples["memory/candidate-commit"]["drafts"][0])
         draft["scope"] = self.scope(actor)
         draft["units"][0]["sources"] = event["sources"]
-        result = TrustedWorkflow(self.service).commit_candidate({"job_id": job, "drafts": [draft]})
-        assert result["state"] == "committed"
-        return result, job, event
+        request = dict(
+            command=self.command(actor),
+            scope=self.scope(actor),
+            batch_ref=None,
+            item_id="fixture:reviewed-seed",
+            kind="upsert",
+            target=dict(
+                category=draft["category"],
+                field_key=draft.get("field_key"),
+                item_key=draft.get("item_key"),
+                record_id=None,
+                expected_version=None,
+            ),
+            units=draft["units"],
+            evidence_refs=event["sources"],
+            proof_ref=None,
+        )
+        self.contracts.validate("memory-context#proposal_request", request)
+        result = MemoryContext(self.service).propose(
+            request, self.contexts[f"synthetic-viewer:{actor}"]
+        )
+        assert result["state"] == "committed", result
+        return result, result["operation_id"], event
 
     def revision(self, record_id, actor=0, kind="forget"):
         request = dict(

@@ -272,60 +272,6 @@ def test_freeze_restart_watermark_backwards_clock_and_no_catchup(relationship):
     assert app.read(h.private, context(h))["score"] == 98
 
 
-@pytest.mark.parametrize("delta", [37, -37])
-def test_old_workflow_delayed_frozen_event_does_not_score_after_unfreeze(relationship, delta):
-    h, app, clock = relationship
-    command(h, app, "set_freeze", frozen=True)
-    clock[0] += timedelta(hours=1)
-    _, _, _, event = candidate(h, clock, 1)
-    with h.store.transaction() as db:
-        job = db.execute(
-            "SELECT id FROM jobs WHERE json_extract(event,'$.event_id')=?", (event["event_id"],)
-        ).fetchone()[0]
-    clock[0] += timedelta(hours=1)
-    command(h, app, "set_freeze", frozen=False)
-    draft = h.draft(
-        units=[h.unit(event["sources"][0])], category="relationship", relationship_delta=delta
-    )
-    result = h.workflow.commit_candidate(job, [draft])
-    assert result["state"] == "committed"
-    assert app.read(h.private, context(h))["score"] == 0
-    assert h.workflow.commit_candidate(job, [draft]) == result
-    with h.store.transaction() as db:
-        assert db.execute("SELECT amount FROM relationship_entries").fetchone()[0] == delta
-        assert db.execute(
-            "SELECT outcome,delta FROM relationship_events WHERE kind='automatic'"
-        ).fetchone()[:] == ("rejected_frozen", 0)
-
-
-def test_old_and_new_paths_share_one_source_budget_and_forget_invalidates(relationship):
-    h, app, clock = relationship
-    proof, scope, ctx, event = candidate(h, clock, 1)
-    assert app.settle(proof, scope, ctx)["applied_delta"] == 1
-    with h.store.transaction() as db:
-        job = db.execute(
-            "SELECT id FROM jobs WHERE json_extract(event,'$.event_id')=?", (event["event_id"],)
-        ).fetchone()[0]
-    seeded = h.workflow.commit_candidate(
-        job,
-        [
-            h.draft(
-                units=[h.unit(event["sources"][0])], category="relationship", relationship_delta=37
-            )
-        ],
-    )
-    assert app.read(scope, ctx)["score"] == h.workflow.relationship_value(scope) == 1
-    command(h, app, "set_freeze", frozen=True)
-    request = h.revision(seeded["record_ids"][0], kind="forget")
-    request["evidence_refs"] = event["sources"]
-    request["confirmation_ref"] = "confirmation-affinity-forget"
-    h.workflow.confirm_revision(request, h.account, scope, "2027-01-01T00:00:00Z")
-    h.service.revise(request, ctx)
-    assert app.read(scope, ctx)["score"] == 0
-    with pytest.raises(Fault):
-        app.settle(proof, scope, ctx)
-
-
 def test_invalidated_decayed_positive_does_not_turn_negative(relationship):
     h, app, clock = relationship
     proof, scope, ctx, _ = candidate(h, clock, 1)

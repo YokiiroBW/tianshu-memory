@@ -6,7 +6,7 @@ import hmac
 from datetime import timedelta
 
 import pytest
-from test_consolidation import pending, prepare, submit, window, withdraw_source
+from summary_fixtures import pending, prepare, submit, window, withdraw_source
 from test_group_context import owner
 from test_memory_context import ProofIssuer
 from test_memory_preparation import checks, payload
@@ -108,9 +108,9 @@ def test_append_changes_factual_domain_but_not_the_selected_context(sync, mode, 
         submit(sync, pending(sync, [new], window(sync, [new])), "今天去图书馆阅读。")
     else:
         # Capturing another author's episode does not grant their private scope.
-        from test_candidate_extraction import PATH
+        from manual_memory_fixtures import capture_original
 
-        response = sync.post(PATH, dict(job_id=new, output=None, supported_extraction_schemas=[4]))
+        response = capture_original(sync, new)
         assert response.status_code == 200, response.text
     verified = verify(sync, selected["bundle"])
     if mode is None and author == "other":
@@ -150,10 +150,10 @@ def test_explicit_room_append_changes_factual_but_not_selected_context(sync, mod
         constraint = selected["bundle"]["selection_constraints"][0]
         assert constraint["owner_resolution"]["mode"] == "room"
         assert constraint["candidate_domain_complete"] is True
-    from test_candidate_extraction import PATH
+    from manual_memory_fixtures import capture_original
 
     new = candidate(sync, "我也喜欢咖啡。", 2, owner(sync), capture=False)[0]
-    response = sync.post(PATH, dict(job_id=new, output=None, supported_extraction_schemas=[4]))
+    response = capture_original(sync, new)
     assert response.status_code == 200, response.text
     verified = verify(sync, selected["bundle"])
     assert verified.status_code == (200 if mode == "context" else 409), verified.text
@@ -321,6 +321,9 @@ def test_external_ranking_rechecks_expiry_through_the_same_eligibility(sync, mod
     experience(sync, "河边散步时聊起咖啡。", importance="low")
     with sync.store.transaction() as db:
         expiry = parse_time(db.execute("SELECT expires_at FROM memory_summaries").fetchone()[0])
+    # Current retention starts at the original speech, not fixture submission.
+    # Begin before its real expiry so the backend hook crosses that boundary.
+    sync.service.clock = lambda: expiry - timedelta(seconds=1)
     backend = attach(sync, "hybrid" if kind == "embedding" else "keyword", kind == "rerank")
     if kind == "embedding":
         assert MemoryReindexer(sync.service).index_step()["indexed"] == 2
@@ -363,9 +366,10 @@ def test_context_prepare_keeps_selected_checks_and_optional_required_classificat
 def test_context_history_restores_natural_expiry_but_never_forgotten_sources(sync):
     prepare(sync)
     saved = experience(sync, importance="low")
-    old = contextual_query(sync, "河边散步")["bundle"]
     with sync.store.transaction() as db:
         expiry = db.execute("SELECT expires_at FROM memory_summaries").fetchone()[0]
+    sync.service.clock = lambda: parse_time(expiry) - timedelta(seconds=1)
+    old = contextual_query(sync, "河边散步")["bundle"]
     sync.service.clock = lambda: parse_time(expiry) + timedelta(seconds=1)
     assert verify(sync, old).status_code == 409
     assert contextual_query(sync, "河边散步")["evidence"] == []

@@ -385,24 +385,6 @@ def test_group_does_not_expand_private_associations(continuity):
     assert len(result["scope_checks"]) == 1 and result["scope_checks"][0]["scope"] == h.group
 
 
-def test_legacy_jobs_can_reuse_source_for_another_target_after_migration(continuity):
-    h = continuity
-    _, event = h.candidate()
-    first_job = h.workflow.jobs()[0]["id"]
-    assert h.workflow.commit_candidate(first_job, [h.draft()])["state"] == "committed"
-    event.update(event_id="second-event", aggregate_id="second-turn", scope_version=2)
-    second = h.post("memory/turn-commits", event).json()
-    assert (
-        h.workflow.commit_candidate(
-            second["candidate_job_ref"], [h.draft(), h.draft(field_key="sleep")]
-        )["state"]
-        == "committed"
-    )
-    with h.store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM groups WHERE field_key='coffee'").fetchone()[0] == 1
-        assert db.execute("SELECT COUNT(*) FROM groups WHERE field_key='sleep'").fetchone()[0] == 1
-
-
 def test_real_nonempty_upgrade_preserves_old_sources_accounts_records_and_checkpoint(h):
     h.store.migrate_profiles(h.directory / "schema1.sqlite")
     first, _, _ = h.seed()

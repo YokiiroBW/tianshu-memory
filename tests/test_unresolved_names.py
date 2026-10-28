@@ -3,7 +3,7 @@
 from collections import Counter
 
 import pytest
-from test_automatic_facts import add
+from manual_memory_fixtures import add
 from test_group_context import cat, named_cats, owner, query, recalled
 from test_group_context import room as room
 from test_source_sync import certificates as certificates

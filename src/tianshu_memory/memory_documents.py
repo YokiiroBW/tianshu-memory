@@ -92,12 +92,10 @@ def capture(db, source, text, observed_at):
                 span_end=span_end,
             ),
         )
-        from .recall_language import topic_tokens
-
         db.execute("DELETE FROM memory_episode_index WHERE document_id=?", (identity,))
         db.execute(
             "INSERT INTO memory_episode_index VALUES (?,?,?)",
-            (identity, encoded_scope, " ".join(terms(part) + topic_tokens(part))),
+            (identity, encoded_scope, " ".join(terms(part))),
         )
         if end == len(text):
             break
@@ -203,7 +201,17 @@ def discard(db, identity):
     db.execute("DELETE FROM memory_documents WHERE id=?", (identity,))
 
 
-def episodes(service, db, scopes, *, query_text=None, metadata_only=False, after=None, limit=4097):
+def episodes(
+    service,
+    db,
+    scopes,
+    *,
+    query_text=None,
+    metadata_only=False,
+    after=None,
+    limit=4097,
+    legacy_hints=True,
+):
     if not installed(db) or not scopes:
         return []
     keys = [canonical(scope) for scope in scopes]
@@ -211,8 +219,8 @@ def episodes(service, db, scopes, *, query_text=None, metadata_only=False, after
     if query_text is not None:
         from .recall_language import candidate_aliases
 
-        tokens = set(query_terms(query_text))
-        for alias in candidate_aliases(query_text):
+        tokens = set(query_terms(query_text, legacy_hints=legacy_hints))
+        for alias in candidate_aliases(query_text) if legacy_hints else ():
             tokens.update(terms(alias))
         if not tokens:
             return []
@@ -296,12 +304,19 @@ def eligible_episodes(service, db, rows, subquery):
     ]
 
 
-def episode_metadata(service, db, scopes, *, query_text=None):
+def episode_metadata(service, db, scopes, *, query_text=None, legacy_hints=True):
     """Walk the complete authorized index in bounded pages, without loading source bodies."""
     after = ""
     while True:
         page = episodes(
-            service, db, scopes, query_text=query_text, metadata_only=True, after=after, limit=512
+            service,
+            db,
+            scopes,
+            query_text=query_text,
+            metadata_only=True,
+            after=after,
+            limit=512,
+            legacy_hints=legacy_hints,
         )
         yield from page
         if len(page) < 512:

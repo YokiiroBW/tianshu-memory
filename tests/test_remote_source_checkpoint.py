@@ -7,8 +7,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 
 import pytest
+from summary_fixtures import pending, prepare, submit, window, withdraw_source
 from test_audit_runtime import until
-from test_consolidation import pending, prepare, submit, window, withdraw_source
 from test_contextual_recall import contextual_query
 from test_group_context import owner
 from test_memory_preparation import payload

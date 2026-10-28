@@ -360,37 +360,3 @@ def test_inherited_summary_dependency_is_checked_without_a_material_id(sync, mon
         assert db.execute("SELECT COUNT(*) FROM write_ledger").fetchone()[0] == 1
     assert len(calls) == 2
     assert calls[0][1] == {second["job_id"]} and calls[1][1] == set()
-
-
-@pytest.mark.parametrize("schema", [3, 4, 5])
-def test_legacy_pending_branch_keeps_its_actual_job_while_schema6_is_batched(
-    sync, monkeypatch, schema
-):
-    from test_candidate_extraction import PATH
-    from test_consolidation import pending as legacy_pending
-    from test_consolidation import prepare, window
-    from test_memory_v2 import candidate
-
-    prepare(sync)
-    old, _ = candidate(sync, "旧协议尚未提交的原话。", 1, capture=False)
-    if schema == 5:
-        legacy_pending(sync, [old], window(sync, [old]))
-    else:
-        response = sync.post(
-            PATH, dict(job_id=old, output=None, supported_extraction_schemas=[schema])
-        )
-        assert response.status_code == 200 and response.json()["extraction_schema"] == schema, (
-            response.text
-        )
-    ready(sync)
-    fresh, _ = front(sync, "新段独立的原话。", "legacy-neighbor")
-    new = seal(sync, [fresh], "segment:legacy-neighbor")[0]["job_id"]
-    calls = observe_invalidation(monkeypatch)
-    with sync.service.local_commit() as db:
-        row = db.execute("SELECT * FROM jobs WHERE id=?", (old,)).fetchone()
-        assert row["extraction_schema"] == schema
-        old_keys = set(json.loads(row["source_snapshot"]))
-        sync.service._invalidate_jobs(db, source_keys=old_keys)
-        assert states(db) == {old: "stale_source", new: "pending"}
-        assert db.execute("SELECT COUNT(*) FROM write_ledger").fetchone()[0] == 0
-    assert len(calls) == 1 and set(calls[0][0]) == {new}

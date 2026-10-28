@@ -4,7 +4,7 @@ import copy
 import json
 
 import pytest
-from test_consolidation import assistant_member, pending, prepare, submit, window, withdraw_source
+from summary_fixtures import assistant_member, pending, prepare, submit, window, withdraw_source
 from test_contextual_recall import contextual_query, experience
 from test_group_context import owner
 from test_memory_context import ProofIssuer

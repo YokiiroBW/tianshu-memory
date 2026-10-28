@@ -1,4 +1,4 @@
-"""Source-grounded author names, shared by extraction and transaction-local fact views.
+"""Source-grounded author names in transaction-local fact views.
 
 Names are relevance evidence inside an already authorized owner scope. Neither a
 predicate nor a name grants a scope. Legacy rows retain their original keys.
@@ -9,11 +9,11 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 
-from .domain import fingerprint, parse_time, require
+from .domain import fingerprint, parse_time
 from .fact_migration import source_text_installed
-from .fact_provenance import DERIVED_UPDATES
 from .fact_source_text import ATTRIBUTION, CONDITION, PAIRS, quoted_positions
 
+DERIVED_UPDATES = frozenset({"confirm", "retract"})
 KEY = "identity.name"
 KEYS = (KEY, "person.name", "author.name", "name")
 FIELDS = tuple("automatic." + key for key in KEYS)
@@ -52,11 +52,6 @@ ROLE_DESCRIPTION = re.compile(
 
 def candidate(fact):
     return fact["key"] in KEYS and fact.get("entity") is None
-
-
-def canonical_key(key):
-    """The existing author-name aliases share one stored predicate."""
-    return KEY if key in KEYS else key
 
 
 def field_values(kind, value):
@@ -163,7 +158,7 @@ def _supported(fact, unit, quotes, *, historical_only=False):
 
 
 def grounded(fact, unit, proofs, *, historical_only=False):
-    """One source-bound rule for new drafts and retained original name evidence."""
+    """Validate retained original name evidence inside the authorized read scope."""
     # A current original assertion may remain evidence in a derived historical
     # group. Only a new retirement's current proof must itself declare a past name.
     if not _supported(
@@ -206,36 +201,6 @@ def assertion_proofs(fact, proofs):
     if any(ref not in available for ref in refs):
         return []
     return [available[ref] for ref in refs]
-
-
-def inherit(fact, unit, selected, names):
-    """Exact same-value/modality targets were validated before this call."""
-    proofs = {}
-    for row, _ in selected:
-        entry = names.entries.get(row["group_id"])
-        require(entry is not None, "invalid_input", 400)
-        proofs.update((proof_ref(proof), proof) for proof in entry.proofs)
-    require(grounded(fact, unit, list(proofs.values())), "invalid_input", 400)
-    return dict(fact, name_assertion_refs=sorted(proofs))
-
-
-def prepare(fact, unit, evidence, content):
-    """Normalize only after exact evidence validation, before any target identity."""
-    if fact["key"] not in KEYS:
-        return fact
-    if fact.get("entity") is not None:
-        require(fact["key"] != KEY, "invalid_input", 400)
-        return fact
-    require(
-        grounded(
-            fact,
-            unit,
-            [dict(proof, source_text=content[proof["source_index"]]["text"]) for proof in evidence],
-        ),
-        "invalid_input",
-        400,
-    )
-    return dict(fact, key=canonical_key(fact["key"]))
 
 
 @dataclass(frozen=True)

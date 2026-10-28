@@ -705,7 +705,15 @@ class MemoryService:
             )
 
     def _rank_groups(
-        self, db, eligible, search_terms, query, *, fact_snapshot=None, authorized_group_ids=None
+        self,
+        db,
+        eligible,
+        search_terms,
+        query,
+        *,
+        fact_snapshot=None,
+        authorized_group_ids=None,
+        context_mode=False,
     ):
         from .recall_index import rank_groups
 
@@ -717,6 +725,7 @@ class MemoryService:
             query,
             fact_snapshot=fact_snapshot,
             authorized_group_ids=authorized_group_ids,
+            context_mode=context_mode,
         )
 
     def _fit_groups(self, eligible, budget, *, requester_scope=None):
@@ -809,6 +818,7 @@ class MemoryService:
         self.authorize_source_publisher(event["scope"], publisher)
         require(event["conversation_id"] == event["scope"]["conversation_id"], "invalid_input", 400)
         with self.operation(scope=event["scope"], sources=event["sources"], event=event) as db:
+            require(segment_installed(db), "dependency_unavailable", 503)
             require(
                 db.execute(
                     "SELECT id FROM people WHERE id=?", (event["scope"]["person_id"],)
@@ -879,7 +889,6 @@ class MemoryService:
                         if previous["state"] in {"accepted", "duplicate"}
                         else previous["state"]
                     ),
-                    candidate_job_ref=previous["candidate_job_ref"],
                 )
             else:
                 latest_input = db.execute(
@@ -894,42 +903,19 @@ class MemoryService:
                     result["state"] = "scope_changed"
                 else:
                     try:
-                        rows = self._source_rows(
+                        self._source_rows(
                             db, event["sources"], event["scope"], reality=event["reality"]
                         )
                     except Fault as error:
                         if error.code != "version_conflict":
                             raise
                         result["state"] = "stale_source"
-                    else:
-                        if not segment_installed(db):
-                            pending = db.execute(
-                                "SELECT COUNT(*) FROM jobs WHERE state='pending'"
-                            ).fetchone()[0]
-                            require(pending < self.max_pending_jobs, "queue_full", 429)
-                            result["candidate_job_ref"] = new_id("candidate")
-                            snapshot = {r["key"]: [r["revision"], r["epoch"]] for r in rows}
-                            db.execute(
-                                "INSERT INTO jobs(id,state,event,source_snapshot) VALUES (?,'pending',?,?)",
-                                (
-                                    result["candidate_job_ref"],
-                                    canonical(event),
-                                    canonical(snapshot),
-                                ),
-                            )
-                            self._emit(
-                                db,
-                                "memory.candidate_accepted",
-                                {"candidate_job_ref": result["candidate_job_ref"]},
-                            )
                 db.execute(
                     "INSERT INTO turn_inputs(turn_id,revision,digest,result) VALUES (?,?,?,?)",
                     (*turn_key, input_digest, canonical(result)),
                 )
-            if (
-                segment_installed(db)
-                and result["state"] in {"accepted", "duplicate"}
-                and (latest is None or event["aggregate_version"] >= latest)
+            if result["state"] in {"accepted", "duplicate"} and (
+                latest is None or event["aggregate_version"] >= latest
             ):
                 db.execute(
                     "UPDATE turn_inputs SET event=? WHERE turn_id=? AND revision=? "
@@ -947,15 +933,13 @@ class MemoryService:
 
     @staticmethod
     def read_committed(db, turn_id):
-        """The real received event, with exact frozen-job fallback before schema 6."""
+        """Return the latest authenticated event from the current material journal."""
         from .segment_migration import installed as segment_installed
 
-        event = "COALESCE(t.event,j.event)" if segment_installed(db) else "j.event"
+        require(segment_installed(db), "dependency_unavailable", 503)
         row = db.execute(
-            "SELECT " + event + " FROM turn_inputs t LEFT JOIN jobs j ON "
-            "j.id=json_extract(t.result,'$.candidate_job_ref') WHERE t.turn_id=? "
-            "AND " + event + " IS NOT NULL "
-            "ORDER BY t.revision DESC LIMIT 1",
+            "SELECT event FROM turn_inputs WHERE turn_id=? AND event IS NOT NULL "
+            "ORDER BY revision DESC LIMIT 1",
             (turn_id,),
         ).fetchone()
         return row[0] if row is not None else None

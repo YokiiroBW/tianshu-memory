@@ -3,7 +3,7 @@
 import copy
 
 import pytest
-from test_consolidation import pending, prepare, submit, window, withdraw_source
+from summary_fixtures import pending, prepare, submit, window, withdraw_source
 from test_group_context import owner
 from test_memory_raw_sources import check_request, original_turn, raw_check
 from test_memory_v2 import candidate, post, request

@@ -230,7 +230,7 @@ def test_saved_alias_with_null_resolve_still_requires_fresh_observation_permissi
 ):
     if sync.scope()["audience"] != "group":
         pytest.skip("A real physical alias whose resolver later has no new mapping")
-    from tianshu_memory.candidate_extraction import CandidateExtraction
+    from tianshu_memory.segment_materials import SegmentMaterials
 
     ready(sync)
     _, original = archive(sync, native="saved-alias", accept_material=False)
@@ -239,14 +239,14 @@ def test_saved_alias_with_null_resolve_still_requires_fresh_observation_permissi
     assert first.status_code == 200, first.text
     material = first.json()["materials"][0]
     sync.passive_owner.resolve.clear()
-    read_originals = CandidateExtraction.read_originals
+    read_originals = SegmentMaterials.read_originals
 
     def revoked(reader, event, **kwargs):
         result = read_originals(reader, event, **kwargs)
         sync.passive_owner.read_allowed = False
         return result
 
-    monkeypatch.setattr(CandidateExtraction, "read_originals", revoked)
+    monkeypatch.setattr(SegmentMaterials, "read_originals", revoked)
     rejected = sync.post(MATERIALS, body)
     assert rejected.status_code == 403, rejected.text
     with sync.store.transaction() as db:

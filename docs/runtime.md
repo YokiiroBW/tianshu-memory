@@ -71,13 +71,12 @@ uv run pytest tests/test_auth_https.py -q --basetemp .runtime/tests-ts032-https
 | operation | arguments |
 | --- | --- |
 | observe_source | source（common.source）、scope、reality（real/fictional）、state（active/withdrawn） |
-| commit_candidate | job_id、drafts（完整语义组数组，或 []） |
 | confirm_revision | request（整个 revise_request）、account、scope、expires_at |
 | acknowledge | event_id（内部 outbox 投递得到实际确认后） |
 | approve_profile | draft（完整目标/范围/字段/语义/来源）、context（合成 issuer）、expires_at |
 | publish_profile | draft、approval_ref（上一步返回）、context（当前合成 issuer） |
 
-draft 每组包含 scope、category（identity/style/relationship/current_items/evidence）、可选 field_key/item_key、units。每个 unit 必須包含 statement、conditions、negations、valid_time、uncertainty、reality、sources。sources 必须是该 job 已核验原文引用子集，不接受客户端 projection_ref；群投影由服务自行签发。relationship 类组可附整数 relationship_delta（-100..100），按来源版本账本累计。
+旧单人候选 `commit_candidate` 已退役。当前手工记忆写入使用现有 `context/propose`，自动整理使用 schema 6 的 materials → segments → process，不通过 fixture-action 写生产记忆。
 
 `jobs` 查看持久工作状态，`rebuild-index` 重建当前合法条目，`outbox` 读取最多 100 个未确认事件。读取不会删除事件，实际确认后才能 acknowledge，重启继续投递。无生产 worker 自动运行，不会背景调用模型或发消息。
 

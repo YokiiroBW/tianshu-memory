@@ -1,7 +1,7 @@
 """A correction can omit the old locator without making the old value current."""
 
 import pytest
-from test_automatic_facts import add, initialize, recall
+from manual_memory_fixtures import add, initialize, recall
 from test_source_sync import certificates as certificates
 from test_source_sync import source_contracts as source_contracts
 from test_source_sync import source_examples as source_examples

@@ -403,6 +403,7 @@ CREATE TABLE IF NOT EXISTS memory_segment_claims (
  job_id TEXT NOT NULL REFERENCES jobs(id) DEFERRABLE INITIALLY IMMEDIATE, PRIMARY KEY(material_id,job_id));
 CREATE TABLE IF NOT EXISTS memory_segment_items (
  group_id TEXT PRIMARY KEY REFERENCES groups(id) DEFERRABLE INITIALLY IMMEDIATE,
- kind TEXT NOT NULL, state TEXT NOT NULL, retention TEXT NOT NULL, valid_until TEXT, effective_at TEXT NOT NULL);
+ kind TEXT NOT NULL, state TEXT NOT NULL, retention TEXT NOT NULL, valid_until TEXT, effective_at TEXT NOT NULL,
+ replaces TEXT NOT NULL DEFAULT '[]', observed_epoch DOUBLE PRECISION NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS memory_observation_heads (
  owner_id TEXT PRIMARY KEY, epoch BIGINT NOT NULL, revision BIGINT NOT NULL);

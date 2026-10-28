@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 from contextlib import contextmanager
 
 from .domain import Fault, canonical, fingerprint, require, utc
@@ -152,7 +153,7 @@ def _registration(auth, caller_name, caller, context, scope):
     require(static or runtime or runtime_group, "forbidden", 403)
 
 
-def _group(service, db, row, scope, subject=None):
+def _group(service, db, row, scope, subject=None, *, include_details=False):
     if not service._group_current(db, row["id"]):
         return None
     records = db.execute(
@@ -203,13 +204,20 @@ def _group(service, db, row, scope, subject=None):
             service.contracts.validate("profiles#unit", unit)
     if not service._projections_current(db, units):
         return None
-    return {
+    result = {
         "semantic_group_id": row["id"],
         "category": row["category"],
         "field_key": row["field_key"],
         "item_key": row["item_key"],
         "units": [{key: unit.get(key) for key in UNIT_FIELDS} for unit in units],
     }
+    if subject is None and include_details:
+        from .browser_details import provenance
+
+        details = provenance(service, db, row["id"], scope)
+        if details is not None:
+            result["provenance"] = details
+    return result
 
 
 def _profile_rows(db, scope, subject, last, limit):
@@ -230,27 +238,29 @@ def _profile_rows(db, scope, subject, last, limit):
     ).fetchall()
 
 
-def _records(service, db, scope, subject, last, limit):
+def _records(service, db, scope, subject, last, limit, *, timeline=False):
+    from .browser_details import personal_rows
+
+    if not timeline:
+        last = last or ""
     items = []
+    positions = []
     scanned = 0
     while scanned < MAX_SCAN and len(items) < limit + 1:
         batch = min(64, MAX_SCAN - scanned)
         if subject is None:
-            rows = db.execute(
-                "SELECT * FROM groups WHERE scope=? AND state='active' AND id>? "
-                "ORDER BY id LIMIT ?",
-                (canonical(scope), last, batch),
-            ).fetchall()
+            rows = personal_rows(db, scope, last, batch, timeline=timeline)
         else:
             rows = _profile_rows(db, scope, subject, last, batch)
         if not rows:
             break
         for row in rows:
             scanned += 1
-            item = _group(service, db, row, scope, subject)
+            item = _group(service, db, row, scope, subject, include_details=True)
+            last = [row["browser_epoch"], row["id"]] if timeline else row["id"]
             if item is not None:
                 items.append(item)
-            last = row["id"]
+                positions.append(last)
             if len(items) >= limit + 1:
                 break
         if len(rows) < batch:
@@ -259,10 +269,9 @@ def _records(service, db, scope, subject, last, limit):
     # resume just before it, rather than skipping it.
     more = len(items) > limit
     if more:
-        next_first = items.pop()
-        # Last returned group ID is a strict keyset cursor, so the next page includes next_first.
-        last = items[-1]["semantic_group_id"]
-        assert next_first["semantic_group_id"] > last
+        items.pop()
+        positions.pop()
+        last = positions[-1]
     elif scanned >= MAX_SCAN:
         more = True
     return items, last if more else None
@@ -413,17 +422,30 @@ def read(service, auth, caller_name, caller, body, context, operation):
             "verified_at": utc(service.clock()),
         }
         if operation == "overview":
-            rows = db.execute(
-                "SELECT * FROM groups WHERE scope=? AND state='active' ORDER BY id LIMIT ?",
-                (canonical(scope), MAX_OVERVIEW_SCAN + 1),
-            ).fetchall()
-            valid = sum(
-                _group(service, db, row, scope) is not None for row in rows[:MAX_OVERVIEW_SCAN]
-            )
+            from .browser_details import personal_rows, review, timeline_ready
+
+            timeline = timeline_ready(db)
+            rows = personal_rows(db, scope, None, MAX_OVERVIEW_SCAN + 1, timeline=timeline)
+
+            def visible():
+                for row in rows[:MAX_OVERVIEW_SCAN]:
+                    item = _group(service, db, row, scope)
+                    if item is not None:
+                        yield row, item
+
+            truncated = len(rows) > MAX_OVERVIEW_SCAN
+            if timeline:
+                valid_count, reading = review(service, visible(), truncated=truncated)
+            else:
+                valid_count, reading = sum(1 for _ in visible()), None
             stamp.update(
-                memory_group_count=valid,
-                counts_truncated=len(rows) > MAX_OVERVIEW_SCAN,
+                memory_group_count=valid_count,
+                counts_truncated=truncated,
+                review=reading,
             )
+            from .browser_details import learning_progress
+
+            stamp["learning"] = learning_progress(db, scope)
             return stamp
         expected = {
             "operation": operation,
@@ -432,11 +454,30 @@ def read(service, auth, caller_name, caller, body, context, operation):
             "revision": revision,
             "version": version,
         }
+        from .browser_details import record_position, timeline_ready
+
+        timeline = operation == "records" and subject is None and timeline_ready(db)
+        if timeline:
+            expected["order"] = "observed_desc"
         last = decode_cursor(body.get("cursor"), current_caller["token"], expected)
         limit = body.get("limit", 20)
         if operation == "records":
-            require(last is None or isinstance(last, str), "invalid_input", 400)
-            items, next_last = _records(service, db, scope, subject, last or "", limit)
+            if timeline:
+                require(
+                    last is None
+                    or (
+                        isinstance(last, list)
+                        and len(last) == 2
+                        and type(last[0]) in (int, float)
+                        and math.isfinite(last[0])
+                        and isinstance(last[1], str)
+                    ),
+                    "invalid_input",
+                    400,
+                )
+            else:
+                require(last is None or isinstance(last, str), "invalid_input", 400)
+            items, next_last = _records(service, db, scope, subject, last, limit, timeline=timeline)
         else:
             require(
                 last is None
@@ -460,7 +501,9 @@ def read(service, auth, caller_name, caller, body, context, operation):
             stamp["items"].pop()
             retained = stamp["items"][-1]
             if operation == "records":
-                last_retained = retained["semantic_group_id"]
+                last_retained = (
+                    record_position(retained) if timeline else retained["semantic_group_id"]
+                )
             else:
                 target = retained["subject"]
                 last_retained = [

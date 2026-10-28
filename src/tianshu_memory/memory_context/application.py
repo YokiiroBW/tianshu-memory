@@ -253,7 +253,7 @@ class MemoryContext:
             item_key=target["item_key"],
             units=request["units"],
         )
-        group_id, records = self.writer._write_group(
+        group_id, records = self.writer._write_raw_group(
             db,
             draft,
             {"scope": scope, "sources": request["evidence_refs"], "reality": next(iter(reality))},

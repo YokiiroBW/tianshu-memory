@@ -8,7 +8,6 @@ from fastapi.responses import JSONResponse
 from jsonschema import ValidationError
 from starlette.requests import ClientDisconnect
 
-from .candidate_extraction import CandidateExtraction
 from .diagnostics import anote_authenticated, record_execution
 from .domain import Fault, require, strict_json
 
@@ -42,14 +41,6 @@ def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
                     body.extend(chunk)
             payload = strict_json(body)
             require(isinstance(payload, dict), "invalid_input", 400)
-            require(
-                "job_ids" in payload
-                or payload.get("extraction_schema") == 6
-                or request.url.path.endswith(("/materials", "/segments"))
-                or len(body) <= 65536,
-                "invalid_input",
-                413,
-            )
             lease.request = request
 
             def execute():
@@ -73,14 +64,15 @@ def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
                     if request.url.path.endswith("/materials"):
                         from .segment_materials import SegmentMaterials
 
-                        return SegmentMaterials(
-                            service, read_content=CandidateExtraction(service).read_originals
-                        ).execute(payload, publisher)
+                        return SegmentMaterials(service).execute(payload, publisher)
                     if request.url.path.endswith("/segments"):
                         from .segments import Segments
 
                         return Segments(service).seal(payload, publisher)
-                    return CandidateExtraction(service).execute(payload, publisher)
+                    from .segments import Segments
+
+                    require(payload.get("extraction_schema") == 6, "invalid_input", 400)
+                    return Segments(service).execute(payload, publisher)
 
             async with asyncio.timeout(execute_timeout):
                 result = await lease.run(execute, business=True)

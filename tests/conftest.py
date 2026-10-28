@@ -158,9 +158,7 @@ class Harness:
         for source in sources:
             self.workflow.observe_source(source, scope, reality=reality)
         event = self.event(sources, scope, turn, event_id, reality)
-        response = self.post("memory/turn-commits", event)
-        assert response.status_code == 200, response.text
-        return response.json()["candidate_job_ref"], event
+        return turn, event
 
     def unit(self, source=None, statement="晚上不喝咖啡，白天偶尔可以", **overrides):
         return dict(
@@ -188,8 +186,44 @@ class Harness:
         )
 
     def seed(self, drafts=None):
-        job, event = self.candidate()
-        return self.workflow.commit_candidate(job, drafts or [self.draft()]), job, event
+        """Seed explicit reviewed units through the current manual application."""
+        from tianshu_memory.memory_context import MemoryContext
+
+        self.store.migrate_profiles(self.directory / "seed-profile.sqlite")
+        self.store.migrate_sources(self.directory / "seed-source.sqlite", self.contracts)
+        self.store.migrate_context(self.directory / "seed-context.sqlite")
+        self.contracts.load_context()
+        _, event = self.candidate()
+        records, groups = [], []
+        for index, draft in enumerate(drafts or [self.draft()]):
+            origin = "origin-group" if draft["scope"]["audience"] == "group" else "origin-private"
+            request = dict(
+                command=self.command(origin),
+                scope=draft["scope"],
+                batch_ref=None,
+                item_id=f"fixture:reviewed:{index}",
+                kind="upsert",
+                target=dict(
+                    category=draft["category"],
+                    field_key=draft.get("field_key"),
+                    item_key=draft.get("item_key"),
+                    record_id=None,
+                    expected_version=None,
+                ),
+                units=draft["units"],
+                evidence_refs=[source for unit in draft["units"] for source in unit["sources"]],
+                proof_ref=None,
+            )
+            self.contracts.validate("memory-context#proposal_request", request)
+            result = MemoryContext(self.service).propose(request, self.config["origins"][origin])
+            assert result["state"] == "committed", result
+            records.extend(result["record_ids"])
+            groups.extend(result["group_ids"])
+        return (
+            dict(state="committed", record_ids=records, group_ids=groups),
+            result["operation_id"],
+            event,
+        )
 
     def selection(self, query="咖啡", scope=None, budget=100000, known=None, selection=None):
         scope = scope or self.private

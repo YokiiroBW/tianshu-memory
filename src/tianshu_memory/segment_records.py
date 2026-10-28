@@ -3,12 +3,20 @@
 import json
 from datetime import timedelta
 
-from .consolidation import record_refs
 from .domain import canonical, new_id, parse_time, require, utc
 from .memory_documents import index_group, remove_groups
 from .workflow import _WorkflowBase
 
 RETENTION = {"short": "low", "medium": "normal", "long": "high"}
+
+
+def record_refs(db, group_id):
+    return [
+        dict(record_id=row["id"], record_version=row["version"])
+        for row in db.execute(
+            "SELECT id,version FROM records WHERE group_id=? ORDER BY id", (group_id,)
+        )
+    ]
 
 
 def expires(service, effective_at, memory):
@@ -103,7 +111,7 @@ def write(
         ),
     )
     db.execute(
-        "INSERT INTO memory_segment_items VALUES (?,?,?,?,?,?)",
+        "INSERT INTO memory_segment_items VALUES (?,?,?,?,?,?,?,?)",
         (
             group_id,
             memory["kind"],
@@ -111,6 +119,8 @@ def write(
             memory["retention"],
             memory["valid_until"],
             effective_at,
+            canonical(memory.get("prior_refs", []) if memory.get("operation") == "replace" else []),
+            parse_time(effective_at).timestamp(),
         ),
     )
     all_dependencies = {row["key"]: row for row in dependencies}

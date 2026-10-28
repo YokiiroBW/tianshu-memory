@@ -1,22 +1,12 @@
-# 规范事实与长期来源检索
+# 长期来源检索
 
 本版复用既有 records/groups/automatic_facts/source ledger、候选队列、来源权限与 context_operations。新的 `fact_subjects` 只维护来源约束下的稳定实体/事件标识；`memory_documents`、`memory_episode_index`、`memory_vectors` 是可重建派生索引，不是第二套事实账本。
 
-## 写入与兼容
+## 当前写入与来源
 
-现有 `/internal/v1/memory/candidates/process` 明确协商抽取版本。新读请求发送 `supported_extraction_schemas:[3,4]`；已锁定的旧 job 返回 3，未绑定的新 job 选择 4。提交携同一 `extraction_schema`，持久 job 与既有 write_ledger 控制重放；不能根据输出是否含 fact 猜协议或在 400 后降级。旧 `{job_id,output}` 保持 schema 3，旧空 valid_time 和原日期 offset 仍可读写。
+普通自动学习只走 schema 6 多人分段整理，见 [会话经历整理与人物归纳](context-consolidation.md)。原 schema 3/4 的模型事实解析、语义修补与 schema 5 单人摘要已退役；候选端口不再协商旧协议或恢复旧任务。当前手工 `context/propose`、修订/遗忘与关系账本保留原归属。
 
-schema 4 不收自由 statement。模型提供 subject/predicate/value、single/set、assert/add/replace/retract/confirm、精确 target_refs、qualifiers 和原句引用；Memory 渲染 statement。modality 为 asserted/observed/planned/conditional/uncertain，独立于 current/historical。计划不会被渲染成已经执行，来源报告已发生也不等于客观核实。实体 mention 必须在该项原句中，person/scope 来自受信事件；事实的 reality 同样由事件确定。真实与虚构槽相互隔离，可信本人姓名仍沿旧完整来源规则。
-
-默认当前槽包含 modality，未指定目标的计划与已发生报告并行保留。explicit replace 验证同 owner、主体、predicate、reality、cardinality 的准确版本，可以由新来源报告改变 modality，且只退休明确 targets。confirm/retract 仍要求同 modality、同值；集合 add 保留其他成员。历史补充不会被当前单值互斥拒绝，也不能以历史 replace 退休当前值。单值未来生效由读取时的有效时间裁定。
-
-作者姓名沿现有 `identity.name/person.name/author.name/name` 规则统一为 `identity.name`，兼容 key、field、渲染和更新目标保持一致；其他作者属性及实体名字不进入本人姓名槽。独立姓名断言必须由本次完整原文正向证明，转述、条件、否定或其他人的名字仍不能成为本人姓名。confirm/retract 从已核精确目标继承原正向姓名证据；服务器在既有事实 payload 中保存证据引用摘要，读取重新核对完整原文。控制意图仍是必须有效的来源依赖，不冒充新的姓名断言，也不能让 assert/add/replace 借用旧证明。
-
-派生确认的有效期必须等于目标，撤回中非空日期只能继承目标相同日期；控制原话无需重报这些旧日期。新断言和 replace 的日期仍须本次来源支持。事实原有效期与控制发生时间分开：确认/撤回退休目标的时刻使用新控制来源的 observed_at。全部继承来源沿既有 lineage/evidence 保留，原来源遗忘、撤权、迟到任务和重建仍统一失效。
-
-retract/confirm 的旧值来自精确目标，结果组继承目标的完整来源 revision/epoch 和引用证据，包括前序更新已继承的依赖。retract 必须匹配目标值，confirm 还必须保持状态、有效期、条件和否定项。确认组保留同一值及证据，旧目标成为可审计前驱，避免随后撤回确认时原副本重新成为当前值。独立 assert/add/replace 的新内容不继承被操作目标的来源；schema 4 仅在相同来源基础内合并独立同值事实，不能把一个新来源声明并入带旧来源依赖的组。旧 schema 3 的既有语义去重不变。
-
-旧记录保持 `legacy_unstructured`。新明确来源可以建立规范当前值，旧值不会阻塞 assert；同值也不把旧 mixed statement 合并升格为 canonical。当前投影在同槽和时间可证时优先规范事实，原记录与原文继续可查。模型仍可能误解自然语言；引用存在和结构正确本身不证明语义蕴含。
+经历和画像作为解释性材料，原话 episode 供精确检索与来源复验。它们共享现有数据库、来源账本和持久索引，不另建聊天库。模型结果只引用自己被分配的新材料；身份、范围、版本和权限继续由程序核验。
 
 ## 显式迁移和旧来源重建
 
@@ -27,7 +17,7 @@ uv run tianshu-memory --config C:/runtime/memory/config.json migrate-memory --ba
 uv run tianshu-memory --config C:/runtime/memory/config.json reindex-memory --batch-size 32 --max-batches 100
 ```
 
-前置是 source schema 3、context schema 1、automatic_fact_schema 2；升级后 automatic_fact_schema 为 3。备份路径不得已存在，备份与 `.source-guard.json` 成对保留。SQLite 使用完整数据库备份；PostgreSQL 使用既有逻辑快照格式，记录实际已存在表的全部列/行和 guard。旧事实不重抽、不猜旧模态，旧 jobs 锁定 schema 3。启动不自动升级。
+前置是 source schema 3、context schema 1、automatic_fact_schema 2；升级后 automatic_fact_schema 为 3。备份路径不得已存在，备份与 `.source-guard.json` 成对保留。SQLite 使用完整数据库备份；PostgreSQL 使用既有逻辑快照格式，记录实际已存在表的全部列/行和 guard。迁移不恢复已退役的旧自动整理入口。启动不自动升级。
 
 `reindex-memory` 从当前仍有效且有权限的旧来源回读精确文本，验证读前/读后的来源 revision/epoch 后建立 episode 和事实索引。`memory_reindex_cursor` 在现 metadata 中保存进度；`completed` 表示扫描结束，`unavailable` 非空表示这些来源尚未成功，可重试相同命令；`--restart` 从头重新核验。重建不会生成新的事实。迁移后新的输入会直接建立来源片段，旧来源需此显式重建才能进入长期原话检索。
 

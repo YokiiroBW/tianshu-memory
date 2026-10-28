@@ -460,6 +460,24 @@ def current_many(service, db, materials):
     return _current_materials(materials, _material_inputs(db, materials))
 
 
+def invalidated_many(db, materials):
+    """Only durable negatives, not missing data or an unproved binding mismatch."""
+    local = _material_inputs(db, materials)
+    result = set()
+    for material in materials:
+        key = material["source_key"]
+        payload = local["payloads"][material["id"]]
+        row = local["sources"].get(key)
+        expected = (payload["source_revision"], payload["source_epoch"])
+        if key in local["suppressed"] or (
+            row is not None
+            and row["scope"] == material["scope"]
+            and (row["state"] == "withdrawn" or (row["revision"], row["epoch"]) > expected)
+        ):
+            result.add(material["id"])
+    return result
+
+
 def _current_materials(materials, local):
     bindings, sources, suppressed = (local[key] for key in ("bindings", "sources", "suppressed"))
     payloads = local["payloads"]

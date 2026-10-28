@@ -9,7 +9,7 @@ import json
 from datetime import timedelta
 
 import pytest
-from test_consolidation import prepare as prepare_summary
+from summary_fixtures import prepare as prepare_summary
 from test_group_context import owner
 from test_memory_raw_sources import original_turn
 from test_memory_v2 import post, request
@@ -783,9 +783,10 @@ def test_schema6_needs_explicit_migration_and_consume_stops_creating_new_singlet
 
 
 def test_forgotten_optional_core_context_does_not_poison_new_or_reselect_after_seal(sync):
-    from test_consolidation import assistant_member, candidate, window
-    from test_consolidation import pending as legacy_pending
-    from test_consolidation import submit as legacy_submit
+    from summary_fixtures import assistant_member, window
+    from summary_fixtures import pending as legacy_pending
+    from summary_fixtures import submit as legacy_submit
+    from test_memory_v2 import candidate
 
     prepare_summary(sync)
     old = candidate(sync, "旧的散步安排。", 1, capture=False)[0]
@@ -1009,41 +1010,6 @@ def test_late_core_alias_after_natural_expiry_never_revives_canonical_episode(sy
             db.execute("SELECT COUNT(*) FROM memory_documents WHERE kind='episode'").fetchone()[0]
             == 2
         )
-
-
-def test_materials_recovers_exact_legacy_job_receipt_after_segment_migration(sync):
-    from test_consolidation import pending as legacy_pending
-    from test_consolidation import submit as legacy_submit
-    from test_consolidation import window
-
-    prepare_summary(sync)
-    event = front(sync, "旧任务已经受理，回执丢失。", "legacy-ack", accept=False)
-    accepted = sync.post("memory/turn-commits", event)
-    assert accepted.status_code == 200, accepted.text
-    receipt = accepted.json()
-    job = receipt["candidate_job_ref"]
-    assert job is not None
-    prepared = legacy_pending(sync, [job], window(sync, [job]))
-    with sync.store.transaction() as db:
-        frozen = dict(db.execute("SELECT * FROM jobs WHERE id=?", (job,)).fetchone())
-    ready(sync)
-    response = sync.post(MATERIALS, dict(schema_version=1, event=event, context_windows=[]))
-    assert response.status_code == 200, response.text
-    assert response.json() == dict(receipt, state="duplicate")
-    with sync.store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM memory_materials").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM memory_segments").fetchone()[0] == 0
-        assert dict(db.execute("SELECT * FROM jobs WHERE id=?", (job,)).fetchone()) == frozen
-        assert sync.service.read_committed(db, event["aggregate_id"]) == canonical(event)
-        assert (
-            db.execute(
-                "SELECT event FROM turn_inputs WHERE turn_id=?", (event["aggregate_id"],)
-            ).fetchone()[0]
-            is None
-        )
-    done, body = legacy_submit(sync, prepared, "旧任务原窗口正常恢复。")
-    assert done["state"] == "completed"
-    assert sync.post(PROCESS, body).json() == done
 
 
 def test_new_material_journals_delivery_updates_and_settles_without_singleton(sync):

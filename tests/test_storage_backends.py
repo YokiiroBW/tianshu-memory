@@ -76,12 +76,9 @@ from test_research_notes import notes as notes
 from test_research_notes import (
     test_two_sources_to_note_revision_query_and_withdrawal as note_case,
 )
-from test_revisions_events import (
-    test_revision_invalidates_whole_group_projection_old_index_cache_and_job as revision_case,
-)
 from test_source_sync import sync as sync
 from test_source_sync import (
-    test_configured_https_consume_candidate_select_probe_and_background_check as source_case,
+    test_configured_https_manual_records_select_probe_and_background_check as source_case,
 )
 from test_source_sync import (
     test_suppression_is_actor_local_and_correction_never_publishes_new_value as suppression_case,
@@ -95,33 +92,6 @@ from tianshu_memory.knowledge_catalog_migration import inspect
 from tianshu_memory.knowledge_files import FORMAT, read, reference
 from tianshu_memory.role_grants import RoleGrants
 from tianshu_memory.store import Store
-
-
-@pytest.mark.parametrize("null_id", [False, True])
-def test_native_postgres_named_alias_updates_existing_location(pg_sync, null_id):
-    from test_fact_entities import named_alias_location_case
-
-    named_alias_location_case(pg_sync, null_id=null_id)
-
-
-@pytest.mark.parametrize(
-    "reason",
-    [
-        "ambiguous",
-        "wrong_id",
-        "foreign_scope",
-        "superseded",
-        "expired",
-        "withdrawn",
-        "conditions",
-        "missing_quote",
-        "incomplete_group",
-    ],
-)
-def test_native_postgres_named_alias_obeys_current_source_identity(pg_sync, reason):
-    from test_fact_entities import named_alias_rejection_case
-
-    named_alias_rejection_case(pg_sync, reason)
 
 
 def pg_options():
@@ -152,19 +122,6 @@ def postgres_store(path, *, settings=None, service="memory"):
         with psycopg.connect(settings["storage_backends"]["postgresql_url"], autocommit=True) as db:
             for name in schemas:
                 db.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(name)))
-
-
-@pytest.mark.parametrize("kind", ["correct", "forget"])
-def test_postgres_recall_consume_suppression_and_replay(h, kind):
-    h.store.migrate_profiles(h.directory / "profiles.bak")
-    h.contracts.load_sources()
-    h.store.migrate_sources(h.directory / "sources.bak", h.contracts)
-    h.store.close()
-    with postgres_store(h.store.path) as (store, _):
-        h.store = h.service.store = store
-        revision_case(h, kind)
-        with store.transaction() as db:
-            assert db.execute("SELECT COUNT(*) FROM write_ledger").fetchone()[0] == 1
 
 
 @pytest.fixture(params=["self_private", "group"])
@@ -612,9 +569,13 @@ def test_postgres_import_preserves_existing_records_outbox_and_receipts(h):
         h.store = h.service.store = store
         assert store.recovery_path.read_bytes() == guard
         assert h.select()["selected_units"] == before["selected_units"]
-        result = h.post("memory/turn-commits", event).json()
-        assert result["state"] == "duplicate" and result["candidate_job_ref"] == job
-        assert h.workflow.commit_candidate(job, [h.draft()])["record_ids"] == seeded["record_ids"]
+        from tianshu_memory.memory_context import MemoryContext
+
+        receipt = MemoryContext(h.service).receipt(
+            dict(schema_version=1, query=h.query(), scope=h.private, operation_id=job),
+            h.config["origins"]["origin-private"],
+        )
+        assert receipt["found"] and receipt["receipt"]["record_ids"] == seeded["record_ids"]
         with store.transaction() as db:
             assert counts == {
                 t: db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in counts
@@ -737,7 +698,7 @@ def test_postgres_segment_missing_journal_refuses_business_and_repairs_only_with
         assert repaired.recovery_path.read_bytes() == guard
         backup_digest = hashlib.sha256(backup.read_bytes()).hexdigest()
         assert repaired.migrate_segments(backup) == dict(
-            memory_segment_schema=1, already_installed=True
+            memory_segment_schema=2, already_installed=True
         )
         assert hashlib.sha256(backup.read_bytes()).hexdigest() == backup_digest
     app = configured_app(pg_sync.config_path)

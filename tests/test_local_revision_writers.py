@@ -15,7 +15,7 @@ import pytest
 from test_audit_runtime import until
 from test_memory_context import ProofIssuer
 from test_memory_read_cancellation import ObservedLock, client_for, read_request
-from test_memory_v2 import candidate, setup
+from test_memory_v2 import setup
 from test_memory_v2_domains import private_conversation
 from test_observations import Verifier, event, source
 from test_source_sync import certificates as certificates
@@ -24,7 +24,6 @@ from test_source_sync import source_examples as source_examples
 from test_source_sync import sync as sync
 
 from tianshu_memory.app import create_app
-from tianshu_memory.candidate_extraction import CandidateExtraction
 from tianshu_memory.domain import Fault, utc
 from tianshu_memory.observations import ObservationLedger
 from tianshu_memory.qq_identity import observe_alias
@@ -93,21 +92,35 @@ def local_writer(h, kind, monkeypatch):
         return lambda: ledger.ingest("companion", request), check
 
     if kind == "candidate_schema":
-        job, _ = candidate(h, "我喜欢大麦茶。", capture=False)
-        request = dict(job_id=job, output=None, supported_extraction_schemas=[3, 4])
+        from test_segments import front, ready
+
+        from tianshu_memory.segment_sources import frame
+        from tianshu_memory.segments import Segments
+
+        ready(h)
+        material, _ = front(h, "我喜欢大麦茶。", "local-writer")
+        request = dict(
+            schema_version=1,
+            segment_id="segment:local-writer",
+            frame=frame(h.scope()),
+            material_refs=[material["material_ref"]],
+            context_refs=[],
+            context_windows=[],
+            omitted_context=False,
+        )
         publisher = dict(authenticated_service="companion", allowed_scopes=[h.scope()])
 
         def check(value):
-            assert value["state"] == "pending" and value["extraction_schema"] == 4
+            assert value["state"] == "pending"
             with h.store.transaction() as db:
                 assert (
-                    db.execute("SELECT extraction_schema FROM jobs WHERE id=?", (job,)).fetchone()[
-                        0
-                    ]
-                    == 4
+                    db.execute(
+                        "SELECT extraction_schema FROM jobs WHERE id=?", (value["job_id"],)
+                    ).fetchone()[0]
+                    == 6
                 )
 
-        return lambda: CandidateExtraction(h.service).execute(request, publisher), check
+        return lambda: Segments(h.service).seal(request, publisher), check
 
     if kind == "qq_alias":
         request, context = registration(h, new=True)
@@ -538,8 +551,7 @@ def test_queued_http_query_can_cancel_while_a_local_writer_still_owns_its_transa
 
 
 def test_fixture_workflow_acknowledge_keeps_its_existing_local_store_transaction(h):
-    job, _ = h.candidate()
-    h.workflow.commit_candidate(job, [h.draft()])
+    h.seed()
     workflow = LocalWorkflow(h.service)
     identity = workflow.outbox()[0]["event_id"]
     assert not h.service.synchronized

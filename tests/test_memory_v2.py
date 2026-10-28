@@ -5,8 +5,7 @@ import json
 from contextlib import closing
 
 import pytest
-from test_automatic_facts import initialize
-from test_candidate_extraction import PATH
+from manual_memory_fixtures import initialize
 from test_source_sync import certificates as certificates
 from test_source_sync import source_contracts as source_contracts
 from test_source_sync import source_examples as source_examples
@@ -24,6 +23,19 @@ def setup(h):
         "context_propose",
         "context_receipt",
     ]
+    h.fixture_events = getattr(h, "fixture_events", {})
+    h.fixture_prepared = getattr(h, "fixture_prepared", {})
+
+    if not hasattr(h, "window_checker"):
+        from tianshu_memory.segment_sources import frame
+
+        h.window_checker = lambda body: dict(
+            schema_version=1,
+            valid=True,
+            channel=body["channel"],
+            delivery_channel=body["delivery_channel"],
+            frame=dict(frame(h.scope()), actor_id=body["actor_id"]),
+        )
     h.save()
 
 
@@ -68,16 +80,26 @@ def candidate(h, text, serial=1, actor=0, *, reality="real", capture=True):
     h.turns.append(turn)
     h.core_head["sequence"] += 1
     h.platform_head["sequence"] += 1
-    response = h.post("memory/turn-commits", event)
-    assert response.status_code == 200, response.text
-    job = response.json()["candidate_job_ref"]
+    from summary_fixtures import current_segments
+    from test_segments import pending, seal
+
+    current_segments(h)
     if not capture:
-        return job, None
-    pending = h.post(PATH, dict(job_id=job, output=None, supported_extraction_schemas=[3, 4]))
-    assert pending.status_code == 200, pending.text
-    assert pending.json()["extraction_schema"] == 4
-    h.contracts.validate("memory-extraction#process_response", pending.json())
-    return job, pending.json()
+        response = h.post("memory/turn-commits", event)
+        assert response.status_code == 200, response.text
+        h.fixture_events[event["aggregate_id"]] = event
+        return event["aggregate_id"], None
+    response = h.post(
+        "memory/candidates/materials", dict(schema_version=1, event=event, context_windows=[])
+    )
+    assert response.status_code == 200, response.text
+    material = response.json()["materials"][0]
+    h.fixture_events[material["material_ref"]] = event
+    sealed, _ = seal(h, [material], "fixture:candidate:" + fingerprint(material))
+    prepared = pending(h, sealed)
+    h.fixture_events[sealed["job_id"]] = event
+    h.fixture_prepared[sealed["job_id"]] = prepared
+    return sealed["job_id"], prepared
 
 
 def fact(
@@ -106,22 +128,42 @@ def fact(
 
 
 def commit(h, job, text, *facts):
-    output = dict(
-        memories=[
+    """Write current contextual experiences; the old fact parser is not emulated."""
+    from summary_fixtures import inspect_receipt
+    from test_segments import submit
+
+    prepared = h.fixture_prepared[job]
+    results = []
+    for target in prepared["segment_window"]["targets"]:
+        memories = (
+            []
+            if not facts
+            else [
+                dict(
+                    text=text,
+                    kind="experience",
+                    state="described",
+                    valid_until=None,
+                    source_member_ids=target["new_member_ids"],
+                    prior_refs=[],
+                    operation="append",
+                    importance="normal",
+                    retention="medium",
+                )
+            ]
+        )
+        results.append(
             dict(
-                conditions=[],
-                negations=[],
-                valid_time="当前",
-                evidence=[dict(source_index=0, quote=text)],
-                fact=value,
+                subject_person_id=target["scope"]["person_id"],
+                covered_member_ids=target["new_member_ids"],
+                memories=memories,
+                portrait=None,
             )
-            for value in facts
-        ]
-    )
-    result = h.post(PATH, dict(job_id=job, extraction_schema=4, output=output))
-    assert result.status_code == 200, result.text
-    h.contracts.validate("memory-extraction#process_response", result.json())
-    return result.json()
+        )
+    response, _ = submit(h, prepared, dict(extraction_schema=6, topics=[], results=results))
+    assert response.status_code == 200, response.text
+    h.contracts.validate("memory-extraction#segment_receipt", response.json())
+    return inspect_receipt(h, response.json())
 
 
 def request(h, text, *, actor=0):
@@ -371,7 +413,7 @@ def test_explicit_episode_forget_reuses_receipt_and_cannot_reindex(sync):
 def test_old_migration_backup_and_explicit_source_reindex(sync):
     import shutil
 
-    from test_automatic_facts import add
+    from manual_memory_fixtures import add
 
     from tianshu_memory.memory_reindex import MemoryReindexer
     from tianshu_memory.store import Store
@@ -645,7 +687,7 @@ def test_fictional_and_real_properties_are_separate_and_episodes_keep_reality(sy
 
 @pytest.mark.parametrize("new_value", ["乌龙茶", "红茶"])
 def test_legacy_current_can_be_asserted_as_typed_without_promoting_old_statement(sync, new_value):
-    from test_automatic_facts import add
+    from manual_memory_fixtures import add
 
     from tianshu_memory.memory_reindex import MemoryReindexer
 

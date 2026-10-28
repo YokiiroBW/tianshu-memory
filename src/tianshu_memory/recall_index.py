@@ -238,8 +238,32 @@ def _units(group, rows, scope, scope_key):
 
 
 def rank_groups(
-    service, db, eligible, search_terms, query, *, fact_snapshot=None, authorized_group_ids=None
+    service,
+    db,
+    eligible,
+    search_terms,
+    query,
+    *,
+    fact_snapshot=None,
+    authorized_group_ids=None,
+    context_mode=False,
 ):
+    if context_mode:
+        # Conversation recall supplies positive, already-authorized evidence.
+        # The factual interpreter's object/topic rules are not an eligibility gate.
+        if not eligible or not search_terms:
+            return []
+        expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in search_terms)
+        corpus = [
+            (
+                entry[0]["id"],
+                " ".join(token for unit in entry[2] for token in terms(unit["statement"])),
+            )
+            for entry in eligible
+        ]
+        by_id = {entry[0]["id"]: entry for entry in eligible}
+        return [by_id[row["group_id"]] for row in rank_corpus(db, corpus, expression)]
+
     from .consolidation_sources import metadata
 
     summaries = metadata(db, [entry[0]["id"] for entry in eligible])

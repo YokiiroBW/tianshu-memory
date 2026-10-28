@@ -234,7 +234,6 @@ def run_local_operation(args, parser):
         allowed = {
             "observe_source",
             "confirm_revision",
-            "commit_candidate",
             "acknowledge",
             "approve_profile",
             "publish_profile",

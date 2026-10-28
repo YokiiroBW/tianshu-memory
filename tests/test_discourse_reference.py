@@ -3,7 +3,7 @@
 import json
 
 import pytest
-from test_automatic_facts import add
+from manual_memory_fixtures import add
 from test_group_context import (
     cat,
     owner,

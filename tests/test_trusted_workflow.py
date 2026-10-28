@@ -15,76 +15,6 @@ from tianshu_memory.domain import Fault, canonical, fingerprint, semantic_reques
 from tianshu_memory.workflow import LocalWorkflow, TrustedWorkflow
 
 
-def test_candidate_limit_rejects_before_any_operation_or_write(h, monkeypatch):
-    job, _ = h.candidate()
-    drafts = [h.draft(units=[h.unit() for _ in range(32)]) for _ in range(8)]
-    drafts.append(h.draft())
-
-    def forbidden_operation(**kwargs):
-        pytest.fail("Oversized candidate must fail before the source barrier or business writes")
-
-    monkeypatch.setattr(h.service, "operation", forbidden_operation)
-    with pytest.raises(Fault) as error:
-        h.workflow.commit_candidate(job, drafts)
-    assert (error.value.code, error.value.status) == ("invalid_input", 400)
-    with h.store.transaction() as db:
-        for table in ("records", "groups", "write_ledger", "source_writes"):
-            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
-        assert db.execute("SELECT state FROM jobs WHERE id=?", (job,)).fetchone()[0] == "pending"
-
-
-def test_candidate_limit_accepts_complete_256_records(h):
-    job, _ = h.candidate()
-    drafts = [h.draft(units=[h.unit() for _ in range(32)]) for _ in range(8)]
-    result = h.workflow.commit_candidate(job, drafts)
-    assert result["state"] == "committed"
-    assert len(result["record_ids"]) == 256
-    assert len(result["group_ids"]) == 8
-    assert h.workflow.commit_candidate(job, drafts) == result
-
-
-def test_candidate_reloads_snapshot_after_barrier(h, monkeypatch):
-    job, event = h.candidate()
-
-    @contextmanager
-    def changed_snapshot(**kwargs):
-        assert kwargs == {"scope": h.private, "sources": event["sources"], "event": event}
-        # An independently committed source synchronization can change the job's dependency.
-        with h.store.transaction() as db:
-            db.execute("UPDATE jobs SET source_snapshot='{}' WHERE id=?", (job,))
-        with h.store.transaction() as db:
-            yield db
-
-    monkeypatch.setattr(h.service, "operation", changed_snapshot)
-    with pytest.raises(Fault) as error:
-        h.workflow.commit_candidate(job, [h.draft()])
-    assert error.value.code == "version_conflict"
-    with h.store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0
-        assert (
-            db.execute("SELECT source_snapshot FROM jobs WHERE id=?", (job,)).fetchone()[0] == "{}"
-        )
-
-
-def test_candidate_rejects_changed_job_event_after_barrier(h, monkeypatch):
-    job, event = h.candidate()
-
-    @contextmanager
-    def changed_event(**kwargs):
-        with h.store.transaction() as db:
-            changed = dict(event, scope=dict(h.private, actor_id="unapproved-actor"))
-            db.execute("UPDATE jobs SET event=? WHERE id=?", (canonical(changed), job))
-        with h.store.transaction() as db:
-            yield db
-
-    monkeypatch.setattr(h.service, "operation", changed_event)
-    with pytest.raises(Fault) as error:
-        h.workflow.commit_candidate(job, [h.draft()])
-    assert error.value.code == "version_conflict"
-    with h.store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0
-
-
 def test_trusted_workflow_rejects_fixture_backend(h):
     with pytest.raises(ValueError, match="production SourceAuthority"):
         TrustedWorkflow(h.service)
@@ -128,34 +58,6 @@ def trusted(h, monkeypatch):
         "expires_at": "2027-01-01T00:00:00Z",
     }
     return SimpleNamespace(h=h, input=input, calls=calls, job=job, event=event)
-
-
-@pytest.mark.parametrize("scope_change", ["audience", "conversation", "actor", "person"])
-def test_trusted_candidate_does_not_expand_source_scope(trusted, scope_change):
-    scope = copy.deepcopy(trusted.h.private)
-    if scope_change == "audience":
-        scope = trusted.h.group
-    elif scope_change == "conversation":
-        scope["conversation_id"] = "unapproved-conversation"
-    elif scope_change == "actor":
-        scope["actor_id"] = "unapproved-actor"
-    else:
-        scope["person_id"] = "unapproved-person"
-    draft = trusted.h.draft(scope=scope, item_key=None, relationship_delta=None)
-    with pytest.raises(Fault) as error:
-        TrustedWorkflow(trusted.h.service).commit_candidate(
-            {"job_id": trusted.job, "drafts": [draft]}
-        )
-    assert error.value.status == 403
-    assert trusted.calls == [
-        {
-            "scope": trusted.h.private,
-            "sources": trusted.event["sources"],
-            "event": trusted.event,
-        }
-    ]
-    with trusted.h.store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM groups").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("adapter", [None, object(), SimpleNamespace(verify_approval=True)])

@@ -614,7 +614,22 @@ class SourceAuthority:
                 # and committed above. A raw turn may be in any 32-turn page,
                 # and its original sources may be in any 256-selector page.
                 complete = self._merge_snapshot(observations)
-                for source_check in (*source_checks, *material_checks):
+                # Discovery may include a material whose source was withdrawn
+                # by this checkpoint. Its durable negative must filter the read,
+                # rather than turn a normal retraction into a dependency outage.
+                # Explicit input checks retain their independent strict boundary.
+                with service.store.transaction() as db:
+                    if self.revision(db) != result["local_revision"]:
+                        continue
+                    invalidated_ids = segment_sources.invalidated_many(db, materials)
+                invalidated_checks, _ = segment_sources.requirements(
+                    [material for material in materials if material["id"] in invalidated_ids]
+                )
+                invalidated_checks = {canonical(item) for item in invalidated_checks}
+                retained_checks = [
+                    item for item in material_checks if canonical(item) not in invalidated_checks
+                ]
+                for source_check in (*source_checks, *retained_checks):
                     self._check_input_sources(source_check, complete)
             return result, final_access.get("viewer_context")
         raise Fault("dependency_unavailable", 503)

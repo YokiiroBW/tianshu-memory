@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 
 import pytest
-from test_consolidation import assistant_member, pending, prepare, submit, window, withdraw_source
+from summary_fixtures import assistant_member, pending, prepare, submit, window, withdraw_source
 from test_context_query_selection import guard_window
 from test_contextual_recall import contextual_query, experience
 from test_group_context import owner

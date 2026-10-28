@@ -211,7 +211,12 @@ def prepare_query(service, db, frame, subquery, selection, *, context_mode=False
         ]
     if not history:
         candidates = automatic_facts.filter_current(
-            db, candidates, subquery["text"], service.clock, fact_snapshot=frame["snapshot"]
+            db,
+            candidates,
+            subquery["text"],
+            service.clock,
+            fact_snapshot=frame["snapshot"],
+            include_history=False if context_mode else None,
         )
     period = subquery["time_filter"]
     if period is not None:
@@ -234,10 +239,11 @@ def prepare_query(service, db, frame, subquery, selection, *, context_mode=False
         service._rank_groups(
             db,
             candidates,
-            query_terms(subquery["text"]),
+            query_terms(subquery["text"], legacy_hints=not context_mode),
             subquery["text"],
             fact_snapshot=frame["snapshot"],
             authorized_group_ids=frozenset(frame["group_map"]),
+            context_mode=context_mode,
         )
         if "facts" in subquery["kinds"]
         else []
@@ -249,7 +255,11 @@ def prepare_query(service, db, frame, subquery, selection, *, context_mode=False
     lexical_episodes = (
         list(
             memory_documents.episode_metadata(
-                service, db, [entry[0] for entry in domain["scopes"]], query_text=subquery["text"]
+                service,
+                db,
+                [entry[0] for entry in domain["scopes"]],
+                query_text=subquery["text"],
+                legacy_hints=not context_mode,
             )
         )
         if "episodes" in subquery["kinds"]

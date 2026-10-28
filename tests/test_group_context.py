@@ -6,8 +6,8 @@ from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from manual_memory_fixtures import add, initialize
 from source_sync_harness import SyncHarness
-from test_automatic_facts import add, initialize
 from test_source_sync import certificates as certificates
 from test_source_sync import source_contracts as source_contracts
 from test_source_sync import source_examples as source_examples

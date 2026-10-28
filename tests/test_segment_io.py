@@ -14,8 +14,8 @@ from test_source_sync import source_examples as source_examples
 from test_source_sync import sync as sync
 
 from tianshu_memory import segment_sources
-from tianshu_memory.candidate_extraction import CandidateExtraction
 from tianshu_memory.domain import Fault, canonical, fingerprint
+from tianshu_memory.segment_materials import SegmentMaterials
 
 
 def test_missing_segment_journal_is_not_ready_or_repaired_by_business_startup(sync):
@@ -79,7 +79,7 @@ def test_front_reuses_two_complete_boundaries_and_preserves_raw_metadata(sync):
 def test_front_rechecks_after_body_read_and_keeps_independent_journal(sync, monkeypatch, change):
     ready(sync)
     event = front(sync, "原文读取后发生来源变化。", "after-read", accept=False)
-    original = CandidateExtraction.read_originals
+    original = SegmentMaterials.read_originals
     read = []
 
     def changed(reader, received, **kwargs):
@@ -101,7 +101,7 @@ def test_front_rechecks_after_body_read_and_keeps_independent_journal(sync, monk
             sync.status["current"] = 503
         return body
 
-    monkeypatch.setattr(CandidateExtraction, "read_originals", changed)
+    monkeypatch.setattr(SegmentMaterials, "read_originals", changed)
     response = sync.post(MATERIALS, dict(schema_version=1, event=event, context_windows=[]))
     assert read and read[0][0]["text"] == "原文读取后发生来源变化。"
     assert response.status_code in {403, 409, 503}, response.text

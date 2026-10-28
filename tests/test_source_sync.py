@@ -37,11 +37,11 @@ def barrier_kinds(sync):
     return [kind for kind, _, _ in sync.calls if kind != "origin"]
 
 
-def test_configured_https_consume_candidate_select_probe_and_background_check(sync):
+def test_configured_https_manual_records_select_probe_and_background_check(sync):
     assert sync.client.get("/health").json()["source_backend"] == "source_sync_https"
     assert barrier_kinds(sync) == []  # identity registration has no source authority dependency
-    seeded, job, event = sync.seed()
-    assert barrier_kinds(sync) == ["snapshot", "current", "head"] * 2
+    seeded, _, _ = sync.seed()
+    assert barrier_kinds(sync) == ["snapshot", "current", "head"]
     selected = sync.select()
     assert len(selected["selected_units"]) == 1
     assert selected["selected_units"][0]["record_id"] == seeded["record_ids"][0]
@@ -51,17 +51,15 @@ def test_configured_https_consume_candidate_select_probe_and_background_check(sy
     checked = sync.post("memory/source-sync/check", sync.check())
     assert checked.status_code == 200, checked.text
     assert checked.json()["scope_version"] == selected["scope_version"]
-    assert barrier_kinds(sync) == ["snapshot", "current", "head"] * 5
-    replay = sync.post("memory/turn-commits", event)
-    assert replay.status_code == 200 and replay.json()["state"] == "duplicate"
-    assert replay.json()["candidate_job_ref"] == job
+    assert barrier_kinds(sync) == ["snapshot", "current", "head"] * 4
     with sync.store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM physical_sources").fetchone()[0] == 1
         assert (
             db.execute("SELECT COUNT(*) FROM source_admissions WHERE verified=1").fetchone()[0] == 1
         )
         assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 1
-        assert db.execute("SELECT COUNT(*) FROM source_writes").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM context_operations").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
     for kind, request, token in sync.calls:
         if kind in {"snapshot", "head"}:
             assert token == "Bearer synthetic-core-token"
@@ -519,37 +517,6 @@ def test_memory_coverage_limit_is_complete_or_explicitly_unavailable(sync, count
         assert (
             len(next(body for kind, body, _ in sync.calls if kind == "snapshot")["selectors"])
             == 256
-        )
-
-
-def test_discarded_committed_responses_replay_without_duplicate_source_or_relationship(sync):
-    event = sync.event()
-    with server(sync.config_path) as client:
-        # The caller closes the real HTTP response before reading the JSON acknowledgement.
-        # The request may already have committed; retry must use the identical event.
-        with client.stream("POST", "/internal/v1/memory/turn-commits", json=event):
-            pass
-        replay = client.post("/internal/v1/memory/turn-commits", json=event)
-        assert replay.status_code == 200, replay.text
-        assert replay.json()["state"] == "duplicate"
-        job_id = replay.json()["candidate_job_ref"]
-    draft = copy.deepcopy(sync.examples["memory/candidate-commit"]["drafts"][0])
-    draft.update(scope=sync.scope(), category="relationship", relationship_delta=4)
-    draft["units"][0]["sources"] = event["sources"]
-    request = {"job_id": job_id, "drafts": [draft]}
-    workflow = TrustedWorkflow(sync.service)
-    workflow.commit_candidate(request)  # The internal caller also discards its first result.
-    replay = workflow.commit_candidate(request)
-    assert replay["state"] == "committed"
-    assert len(replay["record_ids"]) == len(replay["group_ids"]) == 1
-    # Reopen verifies the independently persisted checkpoint as well as the SQLite state.
-    with Store(sync.store.path).transaction() as db:
-        for table in ("inbox", "jobs", "write_ledger", "source_writes", "relationship_entries"):
-            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
-        assert db.execute("SELECT amount FROM relationship_entries").fetchone()[0] == 4
-        guard = json.loads(sync.store.recovery_path.read_text(encoding="utf-8"))
-        assert guard["revision"] == int(
-            db.execute("SELECT value FROM metadata WHERE key='source_revision'").fetchone()[0]
         )
 
 

@@ -6,7 +6,8 @@ from contextlib import contextmanager
 from datetime import timedelta
 
 import pytest
-from test_consolidation import pending, prepare, submit, window, withdraw_source
+from manual_memory_fixtures import reviewed
+from summary_fixtures import pending, prepare, submit, window, withdraw_source
 from test_contextual_recall import contextual_query, experience
 from test_group_context import owner
 from test_memory_v2 import candidate, post, request, setup
@@ -28,7 +29,6 @@ from tianshu_memory import consolidation_sources, memory_documents
 from tianshu_memory.domain import Fault, canonical, fingerprint, parse_time, source_selector
 from tianshu_memory.memory_context import read_v2
 from tianshu_memory.memory_reindex import materialize
-from tianshu_memory.workflow import TrustedWorkflow
 
 
 def before_final(monkeypatch, callback):
@@ -107,6 +107,11 @@ def test_final_query_boundary_never_adds_or_refills_candidates(sync, monkeypatch
     prepare(sync)
     experience(sync, "去河边散步。", 1, importance="low")
     experience(sync, "去河边散步并喝茶。", 2, importance="low")
+    with sync.store.transaction() as db:
+        expiry = parse_time(
+            db.execute("SELECT MIN(expires_at) FROM memory_summaries").fetchone()[0]
+        )
+    sync.service.clock = lambda: expiry - timedelta(seconds=1)
     selected = []
 
     def change_after_discovery(items):
@@ -259,13 +264,12 @@ def test_query_episode_keeps_the_real_core_observation_alias_and_forget_closure(
 def test_query_keeps_whole_groups_and_binds_every_record_version(sync, monkeypatch, limit, change):
     setup(sync)
     job, _ = candidate(sync, "河边散步时上午喝咖啡，晚上不喝咖啡。")
-    with sync.store.transaction() as db:
-        event = json.loads(db.execute("SELECT event FROM jobs WHERE id=?", (job,)).fetchone()[0])
+    event = sync.fixture_events[job]
     draft = copy.deepcopy(sync.examples["memory/candidate-commit"]["drafts"][0])
     draft["scope"] = sync.scope()
     unit = dict(draft["units"][0], sources=event["sources"])
     draft["units"] = [dict(unit, statement=text) for text in ("上午喝咖啡。", "晚上不喝咖啡。")]
-    committed = TrustedWorkflow(sync.service).commit_candidate(dict(job_id=job, drafts=[draft]))
+    committed = reviewed(sync, draft)
     assert len(committed["record_ids"]) == 2
     # The reviewed legacy writer indexes before its lineage is complete. Use
     # the existing verified rebuild to attach the actual source's timestamp.

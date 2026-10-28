@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from test_candidate_extraction import PATH
+from manual_memory_fixtures import capture_original
 from test_group_context import owner
 from test_memory_v2 import candidate, commit, fact, post, query, request, setup
 from test_memory_v2_boundaries import attach, source_calls, verify
@@ -656,7 +656,7 @@ def test_room_empty_source_registration_does_not_change_queryable_domain_until_c
     assert job is not None
     assert verify(sync, before["bundle"]).status_code == 200
     assert verify(sync, bundle).status_code == 200
-    pending = sync.post(PATH, dict(job_id=job, output=None, supported_extraction_schemas=[3, 4]))
+    pending = capture_original(sync, job)
     assert pending.status_code == 200, pending.text
     assert verify(sync, before["bundle"]).status_code == 409
     assert verify(sync, bundle).status_code == 200  # self owner domain remains independent
