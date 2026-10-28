@@ -19,6 +19,7 @@ DEFINITIONS = {
     "uploads": ("upload_request", "upload_response"),
     "upload_status": ("upload_status_request", "upload_response"),
     "access": ("access_request", "access_response"),
+    "disclosure": ("disclosure_request", "disclosure_response"),
 }
 
 
@@ -46,7 +47,7 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                     503,
                 )
                 lease = admission.claim()
-                permission = "content_" + operation
+                permission = "content_" + ("read" if operation == "disclosure" else operation)
                 caller_name, caller = await lease.run(
                     auth.authenticate, request.headers.get("authorization")
                 )
@@ -145,7 +146,7 @@ def mount(app, application, auth, admission, *, body_timeout, execute_timeout):
                         authority = refresh()
                         if binary:
                             result = application.put_upload(upload_id, bytes(raw), authority)
-                        elif operation in {"acquire", "read"}:
+                        elif operation in {"acquire", "read", "disclosure"}:
                             result = getattr(application, operation)(payload, authority, refresh)
                         else:
                             result = getattr(application, operation)(payload, authority)

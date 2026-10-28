@@ -4,6 +4,7 @@ import hashlib
 import http.client
 import ipaddress
 import os
+import re
 import socket
 import ssl
 import time
@@ -11,7 +12,7 @@ from datetime import UTC
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 from .domain import Fault, require
 
@@ -254,7 +255,14 @@ def decode(raw, media_type):
 
 
 def fetch_url(
-    url, allowed_urls, *, submitted=False, media_types=None, max_bytes=MAX_BYTES, include_time=False
+    url,
+    allowed_urls,
+    *,
+    submitted=False,
+    media_types=None,
+    max_bytes=MAX_BYTES,
+    include_time=False,
+    disclosure_evidence=None,
 ):
     """Project exact allowlist or submitted public URLs; every hop pins the address.
 
@@ -263,6 +271,9 @@ def fetch_url(
     a configured URL never authorizes its links or another redirect. TLS verifies hosts.
     """
     deadline = time.monotonic() + 15
+    chain = []
+    if disclosure_evidence is not None:
+        disclosure_evidence.clear()
     for _ in range(4):
         trusted = submitted and url in allowed_urls
         require(submitted or url in allowed_urls)
@@ -307,15 +318,35 @@ def fetch_url(
                 tls_socket.settimeout(remaining)
 
             timeout()
+            headers = {
+                "Accept": ", ".join(
+                    sorted(media_types or {"text/plain", "text/markdown", "text/html"})
+                ),
+                "Accept-Encoding": "identity",
+            }
+            anonymous = not {"cookie", "authorization", "proxy-authorization"} & {
+                key.lower() for key in headers
+            }
+            chain.append(
+                dict(
+                    url_hash=content_hash(url.encode()),
+                    method="GET",
+                    anonymous=anonymous,
+                    public_anonymous=anonymous
+                    and not trusted
+                    and not parsed.query
+                    and not re.search(
+                        r"(?:^|[/;=._-])(?:token|secret|password|credential|signature|session|api[-_]?key)(?:$|[/;=._-])",
+                        unquote(parsed.path),
+                        re.IGNORECASE,
+                    )
+                    and all(ipaddress.ip_address(a[4][0]).is_global for a in addresses),
+                )
+            )
             connection.request(
                 "GET",
                 parsed.path + ("?" + parsed.query if parsed.query else "") or "/",
-                headers={
-                    "Accept": ", ".join(
-                        sorted(media_types or {"text/plain", "text/markdown", "text/html"})
-                    ),
-                    "Accept-Encoding": "identity",
-                },
+                headers=headers,
             )
             timeout()
             response = connection.getresponse()
@@ -352,6 +383,12 @@ def fetch_url(
                 require(size <= max_bytes, "source_too_large", 413)
                 chunks.append(chunk)
             require(length is None or size == int(length), "incomplete_source", 503)
+            if disclosure_evidence is not None:
+                disclosure_evidence.update(
+                    format="anonymous-public-fetch/v1",
+                    chain=chain,
+                    public_anonymous=all(hop["public_anonymous"] for hop in chain),
+                )
             result = (b"".join(chunks), media, url)
             if include_time:
                 modified = response.getheader("Last-Modified")

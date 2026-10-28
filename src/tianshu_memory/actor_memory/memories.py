@@ -323,6 +323,10 @@ class Memories:
 
     def execute(self, request, *, actor, caller, recheck):
         operation = request["operation"]
+        if operation == "query" and request.get("mode") == "timeline":
+            from .timeline import execute
+
+            return execute(self, request, actor=actor, caller=caller, recheck=recheck)
         if operation == "withdraw_memory":
             return self._withdraw(request, actor, caller, recheck)
         if operation == "append_derived":

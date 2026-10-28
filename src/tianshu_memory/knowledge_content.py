@@ -252,6 +252,7 @@ class KnowledgeContent:
     def acquire(self, request, authority, refresh):
         source = request["source"]
         source_time = None
+        disclosure_evidence = {}
         with self.service.store.transaction() as db:
             self._check(db, authority)
             prior = self._prior(db, "acquire", request, authority)
@@ -285,6 +286,7 @@ class KnowledgeContent:
                 media_types=media.MEDIA_TYPES,
                 max_bytes=media.MAX_BYTES,
                 include_time=True,
+                disclosure_evidence=disclosure_evidence,
             )
         prepared = media.prepare(
             raw,
@@ -292,6 +294,7 @@ class KnowledgeContent:
             resolved,
             filename=descriptor["filename"] if source["kind"] == "upload" else None,
         )
+        prepared.setdefault("provenance", {})["disclosure"] = disclosure_evidence
         authority = refresh()
         locator = source.get("url", source.get("upload_id"))
         source_id = "source:" + fingerprint([authority["owner"], source["kind"], locator])
@@ -335,6 +338,20 @@ class KnowledgeContent:
                     "INSERT INTO knowledge_content_documents VALUES (?,?,?,1) ON CONFLICT(document_id) DO UPDATE SET metadata=excluded.metadata,access_version=access_version+1",
                     (document_id, canonical(authority["owner"]), canonical(metadata)),
                 )
+            else:
+                # Acquisition evidence may change while bytes remain identical. Keep
+                # the historical read access version stable; disclosure has its own hash.
+                provenance = json.loads(
+                    db.execute(
+                        "SELECT provenance FROM knowledge_versions WHERE document_id=? AND version=?",
+                        (document_id, old["version"]),
+                    ).fetchone()[0]
+                )
+                provenance["disclosure"] = disclosure_evidence
+                db.execute(
+                    "UPDATE knowledge_versions SET provenance=? WHERE document_id=? AND version=?",
+                    (canonical(provenance), document_id, old["version"]),
+                )
             if source["kind"] == "upload":
                 current_upload = self._upload(db, source["upload_id"], authority)
                 require(
@@ -363,6 +380,25 @@ class KnowledgeContent:
             current = self._document(db, request["content_ref"], authority)
             require(current["access_version"] == row["access_version"], "scope_changed", 409)
             return self._response(current, authority) | decoded
+
+    def disclosure(self, request, authority, refresh):
+        from .knowledge_disclosure import prove
+
+        with self.service.store.transaction() as db:
+            self._check(db, authority)
+            before = prove(self, db, request, authority)
+        authority = refresh()
+        with self.service.store.transaction() as db:
+            self._check(db, authority)
+            after = prove(self, db, request, authority)
+            require(before == after, "scope_changed", 409)
+            return dict(
+                schema_version=1,
+                request_id=authority["request_id"],
+                content_ref=request["content_ref"],
+                checked_at=utc(self.service.clock()),
+                **after,
+            )
 
     def original(self, request, authority):
         with self.service.store.transaction() as db:
