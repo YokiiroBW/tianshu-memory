@@ -33,6 +33,12 @@ OPERATIONS = [
     "query",
     "check_memory",
     "withdraw_memory",
+    "interests",
+    "manage_list",
+    "memory_impact",
+    "revise_memory",
+    "forget_memory",
+    "maintain",
 ]
 
 

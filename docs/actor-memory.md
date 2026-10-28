@@ -4,7 +4,8 @@ The actor domain is part of Memory, with independent storage identity `actor-mem
 database `main`, metadata, restore guard, SQL lock, source watermarks, receipts and admission.
 It does not create a bot person or use the user Store, records, jobs or source revision.
 The domain implements the six episode operations and the four query/derived operations from
-actor-self-memory candidate.2. Each granted operation must appear explicitly in the caller's
+actor-self-memory candidate.4, plus the AL13 timeline and TS394 lifecycle operations.
+Each granted operation must appear explicitly in the caller's
 `actor_memory_operations`.
 
 An actor endpoint is installed at `POST /internal/v1/actor-self-memory/operate`. Existing
@@ -38,11 +39,20 @@ Initialize a new isolated domain explicitly while its writers are stopped:
 tianshu-memory --config <private-config.json> migrate-actor-memory --backup <new-local-file>
 ```
 
-This records that the actor domain was absent and initializes only the new logical source.
-An already installed domain is verified without recreating it. A missing or mismatching guard,
+For a new domain this records absence and initializes only the new logical source. For an
+existing schema2 domain the same explicit command writes an exclusive, complete actor-only
+logical JSON backup (seven authoritative tables, column names, rows, backend and old guard),
+then installs schema3 and rebuilds its separate `actor_search_terms` index. Schema2 withdrawal
+bodies are erased from current actor copies after the backup; body-free identity tombstones
+and receipts remain. An installed schema3 domain is verified without recreating it.
+A missing or mismatching guard,
 lost tables or a partially initialized binding fails closed; this command is not approval to
-restore an old backup. The initial domain schema is 2. The unpublished AL02 schema-1 component
-databases are rejected; there is no deployed actor data to migrate from that local draft.
+restore an old backup. Startup does not silently upgrade schema2; stop actor writers and run
+the command before starting schema3 application code. Backup files are never overwritten.
+DDL/checkpoint failure rolls back SQL or fails closed on checkpoint mismatch. Restoring a
+backup requires a separately coordinated actor recovery; never replace the live guard with
+the backup guard to bypass newer suppression. User-domain files/tables are not backed up,
+migrated or restored by this operation. The unpublished schema1 draft remains unsupported.
 SQLite and PG use the same actor state and receipt rules. Referenced
 content and source owners are checked over the real configured ports; SQLite component peers
 do not constitute actual PG or cross-product acceptance.
@@ -79,9 +89,12 @@ rewrites or retires an episode. Forgetting an episode or learning a stable sourc
 invalidates its derived records in the same local transaction. Explicitly forgetting a derived
 record leaves the underlying episode available.
 
-Query uses the existing NFKC/CJK lexical tokenizer over at most the latest 256 active episodes
-and 256 active derived records of this actor. It is a bounded positive projection, not a claim
-that no older matching memory exists. It ranks locally, admits whole items within the requested
+Query uses the existing NFKC/CJK lexical tokenizer and an independent rebuildable inverted
+index. Actor, current basis, local audience, requested kind and expiry filters precede the
+bounded candidate selection. Term-match ordering selects at most 257 episodes and 257 derived
+records before local retention-age fading; unrelated recent records cannot hide an older match.
+Candidate/output limits set `omitted`; this is not exhaustive semantic or vector search.
+It ranks locally, admits whole items within the requested
 limit and byte budget, and proves only the selected exact episode/source closure. After that
 checkpoint it may remove an invalid selected item, and never adds unproved replacement text.
 The response exposes actual episode/source refs. External disclosure requires every basis to
@@ -90,3 +103,43 @@ permit the current audience; a public basis cannot broaden another private basis
 Importance is stored separately from retention. Short/medium/long derived retention uses the
 existing product defaults of 7/30/180 days; reads do not renew it. Expiry omits a derived record
 and makes its explicit check unavailable, without suppressing the original episode or content.
+
+## Lifecycle and owner management
+
+`append_derived(kind=preference)` may include `interest={topic,stance}`, where stance is
+like/dislike/mixed/curious. A tag requires original digital-action or observation evidence;
+fictional/reported material cannot gain one. `interests` rebuilds a versioned projection and
+bounded change history from the existing authoritative records, proves the requested audience,
+and counts distinct original content/observation identities. Repeated reading of the same
+original, repeated self-expression and receipt replay do not increase support. Untagged legacy
+preferences remain visible with `topic=null, stance=unspecified`. At most 256 representative
+and history records are proved; representatives precede histories, with incompleteness explicit.
+This count is evidence availability, not confidence, affection or a permission grant.
+
+The existing Companion background cycle calls `maintain` with a unique idempotency key and
+limit up to 128. It selects expired active/historical derived records before LIMIT, and visits
+at most 256 unexpired records using an actor-local rotating metadata cursor for exact redundant
+payload compaction. It never invents a summary. Semantic autobiography replacement uses the
+existing sourced `append_derived` operation. Idle scans/receipts do not advance the content
+domain version or invalidate management/timeline cursors. Actual expiry/compaction does.
+
+Owner pages use the existing Platform service caller, its allowed actor/operation configuration,
+and current actor authority. `manage_list`, `memory_impact`, `revise_memory` and `forget_memory`
+accept only actor_only management context. List cursors bind role, filters and domain version.
+The existing `get_episode` provides full source fact and coverage detail. Revisions edit only
+derived interpretations, retaining their exact source basis and creating an explicit replacement;
+episode facts remain owned by the producer. Writes require both the exact ref revision and
+the preview's domain version. Impact lists replacement history and dependent derived references.
+An oversized preview reports `omitted`; forgetting still processes the full dependency closure.
+
+Forgetting overwrites current actor fact/payload bodies and removes search terms, including
+replacement history and episode-dependent interpretations. It retains body-free IDs, original
+request digests/receipts and suppression evidence. Reworded or split-basis late proposals of the
+same derived kind cannot restore the forgotten interpretation; new independent real evidence is
+required. Source withdrawal likewise clears current dependent bodies. Tombstone responses carry
+no text, interest, source or basis payload. Existing check ports report withdrawn/false, and
+historic accepted receipts never prove current availability.
+
+This erases the current logical actor copies, not original Knowledge/Companion content, user
+chat records, old backups, database WAL or storage media remnants. Original owner retention and
+backup lifecycle remain with their owners; no cross-product deletion is claimed.

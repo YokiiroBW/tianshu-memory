@@ -9,8 +9,8 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 from ..domain import Fault
 
-SCHEMA_SHA256 = "e7b5bccdddb160b3db241c7546c9721cfdde2c7e9e7fb545b3eceb675202195c"
-MANIFEST_SHA256 = "9ce5c9ba6ae4545c843d1eac584da2ba10ca85e8c7fb1127d5adcf1b761e5c25"
+SCHEMA_SHA256 = "c3ecae8963cfaeddd375901e6a09f2ad28f907637155dc28766c25372e3defa4"
+MANIFEST_SHA256 = "34fec40dbf16ab0109026dd721873e238e5a6fecd86ad3d58495e99103d9b3e5"
 
 
 class Contracts:
@@ -22,7 +22,7 @@ class Contracts:
         manifest = json.loads(raw_manifest)
         if (
             manifest.get("name") != "actor-self-memory"
-            or manifest.get("version") != "1.0.0-candidate.3"
+            or manifest.get("version") != "1.0.0-candidate.4"
         ):
             raise ValueError("Actor contract identity mismatch")
         for name, expected in manifest["sha256"].items():

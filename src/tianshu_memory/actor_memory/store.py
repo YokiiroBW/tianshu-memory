@@ -11,6 +11,7 @@ from tianshu_storage import StorageOptions, StorageRuntime
 
 from .. import source_recovery
 from ..domain import canonical, require
+from . import search
 
 TABLES = (
     "actor_metadata",
@@ -38,11 +39,11 @@ DDL = (
 
 def checkpoint(db):
     metadata = dict(db.execute("SELECT key,value FROM actor_metadata"))
-    require(metadata.get("schema") == "2", "dependency_unavailable", 503)
+    require(metadata.get("schema") in {"2", "3"}, "dependency_unavailable", 503)
     try:
         return {
             "domain": "actor-memory",
-            "schema": 2,
+            "schema": int(metadata["schema"]),
             "instance": metadata["instance"],
             "revision": int(metadata["revision"]),
             "recovery": metadata["recovery"],
@@ -54,7 +55,8 @@ def checkpoint(db):
 
 
 class Store:
-    def __init__(self, config, *, initialize=False, storage_environ=None):
+    def __init__(self, config, *, initialize=False, storage_environ=None, allow_legacy=False):
+        self.allow_legacy = allow_legacy
         section = config["actor_memory"]
         path = Path(section["database_path"])
         require(
@@ -138,14 +140,19 @@ class Store:
             for table in TABLES:
                 db.execute("SELECT * FROM " + table + " LIMIT 0")
             source_recovery.verify(self.guard, checkpoint(db))
+            require(
+                self.allow_legacy or checkpoint(db)["schema"] == 3, "dependency_unavailable", 503
+            )
+            if checkpoint(db)["schema"] == 3:
+                db.execute("SELECT * FROM actor_search_terms LIMIT 0")
             return
         require(
             initialize and not self.guard.exists() and source is None, "dependency_unavailable", 503
         )
-        for statement in DDL:
+        for statement in (*DDL, *search.DDL):
             db.execute(statement)
         for key, value in {
-            "schema": "2",
+            "schema": "3",
             "instance": uuid4().hex,
             "revision": "1",
             "recovery": uuid4().hex,
@@ -186,6 +193,11 @@ class Store:
             db.execute("SELECT value FROM actor_metadata WHERE key='revision'").fetchone()[0]
         )
 
+    def record_change(self, db):
+        """Mark an actual maintenance mutation inside its existing transaction."""
+        db.execute("UPDATE actor_metadata SET value=CAST(value AS BIGINT)+1 WHERE key='revision'")
+        source_recovery.persist(self.guard, checkpoint(db))
+
     @classmethod
     def initialize(cls, config, backup):
         section = config["actor_memory"]
@@ -197,12 +209,8 @@ class Store:
             or (state / ".tianshu-storage-actor-memory.json").exists()
             or guard.exists()
         ):
-            with closing(cls(config)) as store, store.transaction() as db:
-                return {
-                    "actor_memory_schema": 2,
-                    "already_installed": True,
-                    "domain_version": store.version(db),
-                }
+            with closing(cls(config, allow_legacy=True)) as store:
+                return store.migrate(backup)
         backup = Path(backup).resolve()
         require(backup not in {path, guard}, "invalid_input", 400)
         backup.parent.mkdir(parents=True, exist_ok=True)
@@ -216,10 +224,67 @@ class Store:
             os.fsync(stream.fileno())
         with closing(cls(config, initialize=True)) as store:
             return {
-                "actor_memory_schema": 2,
+                "actor_memory_schema": 3,
                 "backup": str(backup),
                 "backend": store.database.backend,
             }
+
+    def migrate(self, backup):
+        """Explicit actor-only logical backup and atomic schema2 index installation."""
+        backup = Path(backup).resolve()
+        require(backup not in {self.path, self.guard.resolve()}, "invalid_input", 400)
+        with self.transaction() as db:
+            if checkpoint(db)["schema"] == 3:
+                return {"actor_memory_schema": 3, "already_installed": True}
+            snapshot = {
+                "format": "actor-memory-backup/v1",
+                "backend": self.database.backend,
+                "guard": checkpoint(db),
+                "tables": {},
+            }
+            for table in TABLES:
+                cursor = db.execute("SELECT * FROM " + table)
+                snapshot["tables"][table] = {
+                    "columns": [part[0] for part in cursor.description],
+                    "rows": [list(row) for row in cursor],
+                }
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            with backup.open("xb") as stream:
+                stream.write(canonical(snapshot).encode())
+                stream.flush()
+                os.fsync(stream.fileno())
+            for statement in search.DDL:
+                db.execute(statement)
+            from . import lifecycle
+
+            # Schema2 withdrawal retained its body. Upgrade the current actor
+            # copies after the complete backup, preserving identity tombstones.
+            for row in list(
+                db.execute(
+                    "SELECT * FROM actor_episodes WHERE state IN ('withdrawn','unavailable') AND fact!='{}'"
+                )
+            ):
+                lifecycle.forget(
+                    db,
+                    row["actor_id"],
+                    dict(kind="episode", id=row["id"], revision=row["revision"]),
+                )
+                db.execute(
+                    "UPDATE actor_episodes SET state=? WHERE id=?", (row["state"], row["id"])
+                )
+            for row in list(
+                db.execute(
+                    "SELECT * FROM actor_derived WHERE state IN ('withdrawn','unavailable') AND payload!='{}'"
+                )
+            ):
+                lifecycle.erase_derived(db, row, state=row["state"])
+            search.rebuild(db)
+            db.execute("UPDATE actor_metadata SET value='3' WHERE key='schema'")
+            db.execute(
+                "UPDATE actor_metadata SET value=CAST(value AS BIGINT)+1 WHERE key='revision'"
+            )
+            source_recovery.persist(self.guard, checkpoint(db))
+        return {"actor_memory_schema": 3, "backup": str(backup), "backend": self.database.backend}
 
     def close(self):
         self.runtime.close()

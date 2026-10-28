@@ -1,13 +1,27 @@
 """Actor query and one-level, episode-backed derived memories."""
 
+import heapq
 import json
 from datetime import timedelta
+from itertools import islice
 from uuid import uuid4
 
 from ..domain import canonical, fingerprint, parse_time, require, terms, utc
+from . import lifecycle, search
 from .facts import INTERNAL, permitted, source_refs
 
-OPERATIONS = {"append_derived", "query", "check_memory", "withdraw_memory"}
+OPERATIONS = {
+    "append_derived",
+    "query",
+    "check_memory",
+    "withdraw_memory",
+    "interests",
+    "manage_list",
+    "memory_impact",
+    "revise_memory",
+    "forget_memory",
+    "maintain",
+}
 RETENTION_DAYS = {"short": 7, "medium": 30, "long": 180}
 MAX_CANDIDATES = 256
 
@@ -16,13 +30,17 @@ def invalidate_derived(db, episode_ids):
     ids = sorted(set(episode_ids))
     for offset in range(0, len(ids), 256):
         page = ids[offset : offset + 256]
-        db.execute(
-            "UPDATE actor_derived SET state='unavailable',revision=revision+1 WHERE state='active' AND id IN "
-            "(SELECT derived_id FROM actor_derived_basis WHERE episode_id IN ("
-            + ",".join("?" for _ in page)
-            + "))",
-            page,
+        rows = list(
+            db.execute(
+                "SELECT * FROM actor_derived WHERE payload!='{}' AND id IN "
+                "(SELECT derived_id FROM actor_derived_basis WHERE episode_id IN ("
+                + ",".join("?" for _ in page)
+                + "))",
+                page,
+            )
         )
+        for row in rows:
+            lifecycle.erase_derived(db, row, state="unavailable", suppression=False)
 
 
 class Memories:
@@ -157,24 +175,21 @@ class Memories:
             ref, row = self._rows(db, request["actor_id"], [request["ref"]])[0]
             require(row is not None, "not_found", 404)
             require(row["revision"] == ref["revision"], "version_conflict", 409)
-            table = "actor_episodes" if ref["kind"] == "episode" else "actor_derived"
-            db.execute(
-                "UPDATE " + table + " SET state='withdrawn',revision=revision+1 WHERE id=?",
-                (row["id"],),
-            )
-            if ref["kind"] == "episode":
-                invalidate_derived(db, [row["id"]])
+            lifecycle.forget(db, request["actor_id"], ref)
             return self._receipt(
                 db, request, caller, {**ref, "revision": row["revision"] + 1}, "withdrawn"
             )
 
-    def _append(self, request, actor, caller, recheck):
+    def _append(self, request, actor, caller, recheck, *, receipt_request=None):
+        receipt_request = receipt_request or request
         refs = [
             dict(kind="episode", id=part["episode_id"], revision=part["expected_revision"])
             for part in request["episode_refs"]
         ]
         with self.app.store.transaction() as db:
             version = self.app.store.version(db)
+            if "expected_domain_version" in request:
+                require(version == request["expected_domain_version"], "version_conflict", 409)
             rows = self._rows(db, request["actor_id"], refs)
             bases = self._basis(db, request["actor_id"], rows)
         sources = self._refs(bases)
@@ -194,6 +209,9 @@ class Memories:
             key: request[key]
             for key in ("kind", "text", "episode_refs", "replaces", "importance", "retention")
         }
+        if "interest" in request:
+            require(request["kind"] == "preference", "invalid_input", 400)
+            payload["interest"] = request["interest"]
         identity = fingerprint(dict(actor=request["actor_id"], payload=payload))
         with self.app.store.transaction(write=True) as db:
             require(self.app.store.version(db) == version + 1, "source_changed", 409)
@@ -210,6 +228,13 @@ class Memories:
                 "source_withdrawn",
                 409,
             )
+            lifecycle.ensure_unsuppressed(db, request["actor_id"], payload)
+            if "interest" in payload:
+                require(
+                    bool(lifecycle.evidence(db, request["actor_id"], payload["episode_refs"])),
+                    "invalid_input",
+                    400,
+                )
             old = db.execute("SELECT * FROM actor_derived WHERE identity=?", (identity,)).fetchone()
             if old is not None:
                 require(
@@ -219,7 +244,7 @@ class Memories:
                 )
                 return self._receipt(
                     db,
-                    request,
+                    receipt_request,
                     caller,
                     dict(kind="derived", id=old["id"], revision=old["revision"]),
                     "duplicate",
@@ -249,6 +274,7 @@ class Memories:
                     utc(recorded + timedelta(days=RETENTION_DAYS[request["retention"]])),
                 ),
             )
+            search.index(db, request["actor_id"], "derived", identity, payload["text"])
             for part in request["episode_refs"]:
                 db.execute(
                     "INSERT INTO actor_derived_basis VALUES (?,?,?,?)",
@@ -265,36 +291,60 @@ class Memories:
                     (ref["id"],),
                 )
             return self._receipt(
-                db, request, caller, dict(kind="derived", id=identity, revision=1), "accepted"
+                db,
+                receipt_request,
+                caller,
+                dict(kind="derived", id=identity, revision=1),
+                "accepted",
             )
 
     def _candidates(self, db, request, context):
-        rows, truncated = [], False
-        for kind, table in (("episode", "actor_episodes"), ("derived", "actor_derived")):
+        ranked, truncated = [], False
+        words = set(terms(request["text"]))
+        for kind in ("episode", "derived"):
             if kind == "episode" and "episode" not in request["kinds"]:
                 continue
             if kind == "derived" and set(request["kinds"]) == {"episode"}:
                 continue
-            found = list(
-                db.execute(
-                    "SELECT * FROM "
-                    + table
-                    + " WHERE actor_id=? AND state='active' ORDER BY recorded_at DESC,id DESC LIMIT ?",
-                    (request["actor_id"], MAX_CANDIDATES + 1),
-                )
+            candidates = search.candidates(
+                db,
+                request["actor_id"],
+                kind,
+                sorted(words),
+                context,
+                utc(self.app.clock()),
+                request["kinds"],
             )
-            truncated |= len(found) > MAX_CANDIDATES
-            for row in found[:MAX_CANDIDATES]:
-                if kind == "derived":
-                    payload = json.loads(row["payload"])
-                    if (
-                        payload["kind"] not in request["kinds"]
-                        or parse_time(row["expires_at"]) <= self.app.clock()
-                    ):
-                        continue
-                rows.append((dict(kind=kind, id=row["id"], revision=row["revision"]), dict(row)))
+            count = 0
+            while page := list(islice(candidates, 128)):
+                count += len(page)
+                truncated |= count > MAX_CANDIDATES
+                rows = []
+                for row in page:
+                    if kind == "derived":
+                        payload = json.loads(row["payload"])
+                        if (
+                            payload["kind"] not in request["kinds"]
+                            or parse_time(row["expires_at"]) <= self.app.clock()
+                        ):
+                            continue
+                    rows.append(
+                        (dict(kind=kind, id=row["id"], revision=row["revision"]), dict(row))
+                    )
+                truncated |= self._rank_page(db, request, context, words, rows, ranked)
+        chosen, used = [], 0
+        for _, _, _, ref, item in sorted(ranked, key=lambda part: part[:3], reverse=True):
+            size = len(canonical(item).encode("utf-8"))
+            if len(chosen) == request["limit"] or used + size > request["budget_bytes"]:
+                truncated = True
+                continue
+            chosen.append(ref)
+            used += size
+        return chosen, truncated
+
+    def _rank_page(self, db, request, context, words, rows, ranked):
         bases = self._basis(db, request["actor_id"], rows)
-        words, ranked = set(terms(request["text"])), []
+        truncated = False
         for ref, row in rows:
             basis = bases.get((ref["kind"], ref["id"]), [])
             if not basis or any(
@@ -309,20 +359,33 @@ class Memories:
             if len(item["source_refs"]) > 64:
                 continue
             score = len(words & set(terms(item["text"])))
+            if ref["kind"] == "derived":
+                lifetime = (
+                    parse_time(row["expires_at"]) - parse_time(row["recorded_at"])
+                ).total_seconds()
+                remaining = (parse_time(row["expires_at"]) - self.app.clock()).total_seconds()
+                score *= 0.5 + 0.5 * max(0.0, min(1.0, remaining / max(1, lifetime)))
             if score:
-                ranked.append((score, row["recorded_at"], ref["id"], ref, item))
-        chosen, used = [], 0
-        for _, _, _, ref, item in sorted(ranked, key=lambda part: part[:3], reverse=True):
-            size = len(canonical(item).encode("utf-8"))
-            if len(chosen) == request["limit"] or used + size > request["budget_bytes"]:
-                truncated = True
-                continue
-            chosen.append(ref)
-            used += size
-        return chosen, truncated
+                heapq.heappush(ranked, (score, row["recorded_at"], ref["id"], ref, item))
+                if len(ranked) > MAX_CANDIDATES:
+                    heapq.heappop(ranked)
+                    truncated = True
+        return truncated
 
     def execute(self, request, *, actor, caller, recheck):
         operation = request["operation"]
+        if operation in {
+            "interests",
+            "manage_list",
+            "memory_impact",
+            "revise_memory",
+            "forget_memory",
+        }:
+            from .management import execute
+
+            return execute(self, request, actor=actor, caller=caller, recheck=recheck)
+        if operation == "maintain":
+            return lifecycle.maintain(self.app, request, actor, caller, recheck)
         if operation == "query" and request.get("mode") == "timeline":
             from .timeline import execute
 

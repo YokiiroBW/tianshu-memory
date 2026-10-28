@@ -4,6 +4,7 @@ import json
 from uuid import uuid4
 
 from ..domain import canonical, fingerprint, now, require, utc
+from . import lifecycle, search
 from .facts import INTERNAL, identity, permitted, source_refs, version_tuple
 from .memories import OPERATIONS as MEMORY_OPERATIONS
 from .memories import Memories, invalidate_derived
@@ -14,6 +15,9 @@ COMMANDS = {
     "apply_source_revision",
     "append_derived",
     "withdraw_memory",
+    "revise_memory",
+    "forget_memory",
+    "maintain",
 }
 
 
@@ -178,9 +182,10 @@ class Application:
         updates, invalidated = changes
         for episode_id in sorted(invalidated):
             db.execute(
-                "UPDATE actor_episodes SET state='unavailable',revision=revision+1 WHERE id=? AND state='active'",
+                "UPDATE actor_episodes SET state='unavailable',revision=revision+1,fact='{}' WHERE id=? AND state='active'",
                 (episode_id,),
             )
+            search.remove(db, "episode", episode_id)
         invalidate_derived(db, invalidated)
         for row in updates:
             db.execute(
@@ -218,11 +223,11 @@ class Application:
                     require(
                         row["revision"] == request["expected_revision"], "version_conflict", 409
                     )
-                    db.execute(
-                        "UPDATE actor_episodes SET state='withdrawn',revision=revision+1 WHERE id=?",
-                        (row["id"],),
+                    lifecycle.forget(
+                        db,
+                        request["actor_id"],
+                        dict(kind="episode", id=row["id"], revision=row["revision"]),
                     )
-                    invalidate_derived(db, [row["id"]])
                     return self._save_receipt(
                         db,
                         caller,
@@ -309,6 +314,7 @@ class Application:
                         "INSERT INTO actor_episodes VALUES (?,?,1,'active',?,?,?)",
                         (episode_id, request["actor_id"], key, canonical(fact), utc(self.clock())),
                     )
+                    search.index(db, request["actor_id"], "episode", episode_id, fact["summary"])
                     for item in observed.values():
                         source = item["source"]
                         db.execute(
