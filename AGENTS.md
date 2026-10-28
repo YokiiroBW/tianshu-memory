@@ -1,3 +1,9 @@
+## 2026-10-28 最新用户要求：只做必须的验证
+
+所有窗口和任务 worktree 只执行当前改动必须的最小有效验证，复用输入未变的成功结果；不得因小功能更新默认跑完整组件、双后端、全浏览器、性能或全链路套件。文档和低影响修改直接检查即可。只有改动确实影响对应范围且定向检查不足，或用户明确要求，才扩大验证。下文历史卡“共享变动必跑全量”等要求由本条覆盖；原命令保留作按需工具，不构成每次都执行的清单。普通发布保留版本/启动健康/受影响入口检查，迁移只处理受影响数据域，保留既有容量、权限和数据保护。不得重复子代理已经完成的同输入验证，不新增测试门禁。
+
+完整跨窗口规则以天枢协调仓库 `AGENTS.md` 的同名条款为准；任务上下文中的主工作区路径可用于查阅。
+
 # 天枢记忆开发约定
 
 TS-080 项目知识域通过独立 `KnowledgeApplication` + Store 事务处理，不伪造聊天 SourceAuthority。知识表迁移只能在 schema 3 显式备份后执行，所有权威表继续受 source-guard 跟踪。配置与命令见 `docs/project-knowledge.md`；专项 `uv run --extra mcp pytest tests/test_knowledge.py tests/test_knowledge_transport.py tests/test_knowledge_concurrency.py -q --basetemp .runtime/tests-ts080-targeted`，跨迁移完整验证 `uv run --extra mcp pytest -q --basetemp .runtime/tests-ts080`。MCP 是官方可选 extra，不默认启用、不自动登记客户端。
