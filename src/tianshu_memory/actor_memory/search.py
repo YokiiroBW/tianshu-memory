@@ -2,7 +2,7 @@
 
 import json
 
-from ..domain import terms
+from ..domain import fingerprint, terms
 
 DDL = (
     "CREATE TABLE actor_search_terms (actor_id TEXT NOT NULL,kind TEXT NOT NULL,memory_id TEXT NOT NULL,term TEXT NOT NULL,PRIMARY KEY(actor_id,kind,memory_id,term))",
@@ -19,7 +19,7 @@ def index(db, actor_id, kind, memory_id, text):
     for term in terms(text):
         db.execute(
             "INSERT INTO actor_search_terms VALUES (?,?,?,?)",
-            (actor_id, kind, memory_id, term),
+            (actor_id, kind, memory_id, fingerprint(term)),
         )
 
 
@@ -61,21 +61,31 @@ def _audience(db, column, context):
     return "(" + field("kind") + "='public' OR (" + predicate + "))", parameters
 
 
+def basis_predicate(db, context):
+    """Local scope guard shared by derived recall and interest candidate selection."""
+    allowed, parameters = _audience(db, "e.fact", context)
+    predicate = (
+        "EXISTS (SELECT 1 FROM actor_derived_basis b WHERE b.derived_id=m.id) AND NOT EXISTS (SELECT 1 FROM actor_derived_basis b LEFT JOIN actor_episodes e ON e.id=b.episode_id AND e.actor_id=m.actor_id WHERE b.derived_id=m.id AND (e.id IS NULL OR e.state!='active' OR e.revision!=b.episode_revision OR NOT ("
+        + allowed
+        + ")))"
+    )
+    return predicate, parameters
+
+
 def candidates(db, actor_id, kind, words, context, now, kinds):
     if not words:
         return
+    # Fixed-size token fingerprints fit PG B-tree entries even for a valid
+    # 4000-character unbroken source word, while preserving lexical matching.
+    words = [fingerprint(word) for word in words]
     table = "actor_episodes" if kind == "episode" else "actor_derived"
     # Match before chronological ordering: an old relevant memory cannot disappear
     # merely because unrelated recent records filled a candidate window.
-    allowed, constraints = _audience(db, "m.fact" if kind == "episode" else "e.fact", context)
     if kind == "episode":
-        predicate = allowed
+        predicate, constraints = _audience(db, "m.fact", context)
     else:
-        predicate = (
-            "m.expires_at>? AND EXISTS (SELECT 1 FROM actor_derived_basis b WHERE b.derived_id=m.id) AND NOT EXISTS (SELECT 1 FROM actor_derived_basis b LEFT JOIN actor_episodes e ON e.id=b.episode_id AND e.actor_id=m.actor_id WHERE b.derived_id=m.id AND (e.id IS NULL OR e.state!='active' OR e.revision!=b.episode_revision OR NOT ("
-            + allowed
-            + ")))"
-        )
+        predicate, constraints = basis_predicate(db, context)
+        predicate = "m.expires_at>? AND " + predicate
         constraints = [now, *constraints]
         field = (
             "(m.payload::jsonb->>'kind')"

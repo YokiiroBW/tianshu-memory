@@ -493,3 +493,76 @@ def test_management_http_uses_existing_caller_and_actor_boundary(actor, contract
         assert (
             client.post("/internal/v1/actor-self-memory/operate", json=payload).status_code == 401
         )
+
+
+def test_long_lexical_token_has_bounded_index_key(actor):
+    actor["owner"].fact["summary"] = "a" * 4000
+    first = execute(actor, append(actor))
+    with actor["store"].transaction() as db:
+        tokens = [
+            row[0]
+            for row in db.execute(
+                "SELECT term FROM actor_search_terms WHERE memory_id=?", (first["episode_id"],)
+            )
+        ]
+    assert tokens and all(len(token) == 64 for token in tokens)
+
+
+def test_interest_scope_precedes_topic_window(actor):
+    actor["owner"].fact["source_constraints"] = {"kind": "public"}
+    public = execute(actor, append(actor))
+    visible = execute(
+        actor,
+        derive(
+            public,
+            kind="preference",
+            retention="long",
+            interest=dict(topic="visible old interest", stance="like"),
+        ),
+    )
+    actor["owner"].fact["source"]["object_id"] = "reading:private"
+    actor["owner"].fact["source_constraints"] = {"kind": "actor_only"}
+    private = execute(actor, {**append(actor), "idempotency_key": "private-episode"})
+    with actor["store"].transaction(write=True) as db:
+        for index in range(270):
+            key = f"derived:private-topic-{index}"
+            command = derive(
+                private,
+                kind="preference",
+                retention="long",
+                interest=dict(topic=f"private topic {index}", stance="like"),
+            )
+            payload = {
+                k: command[k]
+                for k in (
+                    "kind",
+                    "text",
+                    "episode_refs",
+                    "replaces",
+                    "importance",
+                    "retention",
+                    "interest",
+                )
+            }
+            db.execute(
+                "INSERT INTO actor_derived VALUES (?,?,1,'active',?,?,?,?)",
+                (
+                    key,
+                    "actor:a",
+                    key,
+                    canonical(payload),
+                    "2026-10-27T00:00:00Z",
+                    "2027-04-01T00:00:00Z",
+                ),
+            )
+            db.execute(
+                "INSERT INTO actor_derived_basis VALUES (?,?,?,?)",
+                (key, "actor:a", private["episode_id"], 1),
+            )
+    group = dict(
+        purpose="dialogue",
+        audience=dict(kind="group", conversation_id="conv:group", assertion_ref="origin:group"),
+    )
+    projected = execute(actor, request("interests", context=group, limit=32, budget_bytes=65536))
+    assert [item["ref"] for item in projected["items"]] == [visible["ref"]]
+    assert not projected["omitted"]

@@ -5,7 +5,7 @@ import hmac
 import json
 
 from ..domain import Fault, canonical, fingerprint, require, utc
-from . import lifecycle
+from . import lifecycle, search
 from .facts import INTERNAL, permitted, source_refs
 from .timeline import encode, signature
 
@@ -146,6 +146,7 @@ def _impact(mem, db, request):
 
 
 def _interests(mem, db, request):
+    allowed, parameters = search.basis_predicate(db, request["context"])
     kind = "payload::jsonb->>'kind'" if hasattr(db, "native") else "json_extract(payload,'$.kind')"
     topic = (
         "payload::jsonb->'interest'->>'topic'"
@@ -156,12 +157,14 @@ def _interests(mem, db, request):
     # formulations of one topic cannot crowd out an older, distinct interest.
     rows = list(
         db.execute(
-            "SELECT * FROM (SELECT actor_derived.*,ROW_NUMBER() OVER (PARTITION BY COALESCE(lower(trim("
+            "SELECT * FROM (SELECT m.*,ROW_NUMBER() OVER (PARTITION BY COALESCE(lower(trim("
             + topic
-            + ")),id) ORDER BY CASE WHEN state='active' THEN 0 ELSE 1 END,recorded_at DESC,id DESC) AS topic_rank FROM actor_derived WHERE actor_id=? AND state IN ('active','superseded') AND expires_at>? AND "
+            + ")),id) ORDER BY CASE WHEN state='active' THEN 0 ELSE 1 END,recorded_at DESC,id DESC) AS topic_rank FROM actor_derived m WHERE actor_id=? AND state IN ('active','superseded') AND expires_at>? AND "
             + kind
-            + "='preference') candidates ORDER BY topic_rank,recorded_at DESC,id DESC LIMIT 257",
-            (request["actor_id"], utc(mem.app.clock())),
+            + "='preference' AND ("
+            + allowed
+            + ")) candidates ORDER BY topic_rank,recorded_at DESC,id DESC LIMIT 257",
+            [request["actor_id"], utc(mem.app.clock()), *parameters],
         )
     )
     return [(_ref("derived", row), dict(row)) for row in rows[:256]], len(rows) > 256
