@@ -204,11 +204,14 @@ class SelectedDatabase:
         )
 
 
-def _select(database, statements):
+def _select(database, statements, *, check=None):
     """Run the fixed read-only statements and return their rows, or a verdict for the failure."""
     try:
         with closing(_connect(database)) as connection:
-            return [connection.execute(statement).fetchone() for statement in statements], None
+            rows = [connection.execute(statement).fetchone() for statement in statements]
+            if check is not None and not check(connection):
+                return None, failed()
+            return rows, None
     except sqlite3.Error as error:
         return None, failed(retryable=getattr(error, "sqlite_errorcode", None) in RETRYABLE_SQLITE)
     except (OSError, ValueError):
@@ -228,12 +231,15 @@ def probe_database(database):
             return NOT_CONFIGURED
         if not path.is_file():
             return failed()
+    from .segment_migration import compatible as segment_compatible
+
     rows, verdict = _select(
         path,
         (
             "SELECT name FROM sqlite_master WHERE type='table' AND name='metadata'",
             "SELECT value FROM metadata WHERE key='schema'",
         ),
+        check=segment_compatible,
     )
     if verdict is not None:
         return verdict

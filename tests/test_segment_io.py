@@ -18,6 +18,23 @@ from tianshu_memory.candidate_extraction import CandidateExtraction
 from tianshu_memory.domain import Fault, canonical, fingerprint
 
 
+def test_missing_segment_journal_is_not_ready_or_repaired_by_business_startup(sync):
+    from tianshu_memory.app import configured_app
+    from tianshu_memory.runtime_probes import probe_database
+    from tianshu_memory.segment_migration import compatible
+
+    ready(sync)
+    with sync.store.transaction() as db:
+        db.execute("ALTER TABLE turn_inputs DROP COLUMN event")
+    guard = sync.store.recovery_path.read_bytes()
+    assert probe_database(sync.store).state == "failed"
+    with pytest.raises(Fault, match="dependency_unavailable"):
+        configured_app(sync.config_path)
+    with sync.store.transaction() as db:
+        assert not compatible(db)
+    assert sync.store.recovery_path.read_bytes() == guard
+
+
 def test_front_reuses_two_complete_boundaries_and_preserves_raw_metadata(sync):
     ready(sync)
     event = front(sync, "今天去河边散步。", "bounded-front", accept=False)

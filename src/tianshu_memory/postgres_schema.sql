@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS inbox (
 
 CREATE TABLE IF NOT EXISTS turn_inputs (
   turn_id TEXT NOT NULL, revision BIGINT NOT NULL, digest TEXT NOT NULL,
-  result TEXT NOT NULL, PRIMARY KEY(turn_id,revision));
+  result TEXT NOT NULL, event TEXT, PRIMARY KEY(turn_id,revision));
 
 CREATE TABLE IF NOT EXISTS aggregate_events (
   owner TEXT NOT NULL, aggregate_id TEXT NOT NULL, version BIGINT NOT NULL,

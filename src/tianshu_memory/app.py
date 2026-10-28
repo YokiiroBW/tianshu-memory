@@ -3,7 +3,7 @@ import json
 import math
 import os
 import sqlite3
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -21,7 +21,7 @@ from .diagnostics import (
     note_fault,
     record_execution,
 )
-from .domain import Fault, fingerprint, now, strict_json
+from .domain import Fault, fingerprint, now, require, strict_json
 from .qq_identity import observe_alias
 from .qq_identity import profiles as qq_profiles
 from .service import MemoryService
@@ -720,6 +720,14 @@ def configured_app(
     ) or bool(config.get("browser_readers")):
         contracts.load_profiles()
     store = Store.from_config(config, storage_environ=storage_environ)
+    from .segment_migration import compatible as segment_compatible
+
+    try:
+        with closing(store.readonly()) as db:
+            require(segment_compatible(db), "dependency_unavailable", 503)
+    except BaseException:
+        store.close()
+        raise
     sources = LocalFixtureSources() if config.get("mode") == "local_fixture" else None
     if config.get("mode") == "source_sync":
         from .source_authority import SourceAuthority

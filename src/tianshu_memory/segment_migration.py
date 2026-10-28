@@ -47,6 +47,23 @@ def installed(db):
     return row is not None and row[0] == "1"
 
 
+def has_event_column(db):
+    if is_postgres(db):
+        return (
+            db.native(
+                "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() "
+                "AND table_name='turn_inputs' AND column_name='event'"
+            ).fetchone()
+            is not None
+        )
+    return "event" in {row[1] for row in db.execute("PRAGMA table_info(turn_inputs)")}
+
+
+def compatible(db):
+    """An installed segment journal must have its nullable original-event column."""
+    return not installed(db) or has_event_column(db)
+
+
 def install(db):
     if is_postgres(db):
         db.native("ALTER TABLE turn_inputs ADD COLUMN IF NOT EXISTS event TEXT")
@@ -73,8 +90,13 @@ def migrate(store, backup_path):
         400,
     )
     with store.transaction() as db:
-        if installed(db):
+        already_installed = installed(db)
+        if already_installed and has_event_column(db):
             return dict(memory_segment_schema=1, already_installed=True)
+        # Earlier PG imports copied the segment marker but omitted this column.
+        # Only the explicit, backed-up migration may repair that known omission.
+        if already_installed:
+            require(is_postgres(db), "dependency_unavailable", 503)
         for key, value in (
             ("schema", "3"),
             ("memory_consolidation_schema", "1"),
@@ -89,10 +111,16 @@ def migrate(store, backup_path):
         guard = backup.with_name(backup.name + ".source-guard.json")
         with guard.open("xb") as output:
             output.write(store.recovery_path.read_bytes())
-        install(db)
-    return dict(
+        if already_installed:
+            db.native("ALTER TABLE turn_inputs ADD COLUMN event TEXT")
+        else:
+            install(db)
+    result = dict(
         memory_segment_schema=1,
         backup=str(backup),
         backup_guard=str(guard),
         existing_records_preserved=True,
     )
+    if already_installed:
+        result["repaired_event_column"] = True
+    return result

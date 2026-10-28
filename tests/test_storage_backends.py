@@ -7,7 +7,7 @@ import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -79,6 +79,7 @@ from test_research_notes import (
 from test_revisions_events import (
     test_revision_invalidates_whole_group_projection_old_index_cache_and_job as revision_case,
 )
+from test_source_sync import sync as sync
 from test_source_sync import (
     test_configured_https_consume_candidate_select_probe_and_background_check as source_case,
 )
@@ -618,6 +619,174 @@ def test_postgres_import_preserves_existing_records_outbox_and_receipts(h):
             assert counts == {
                 t: db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in counts
             }
+
+
+@pytest.mark.parametrize("seeded", [False, True], ids=["empty", "committed"])
+def test_postgres_segment_import_preserves_original_journal(sync, seeded):
+    from test_segments import MATERIALS, front, ready
+
+    from tianshu_memory.segment_migration import compatible
+
+    ready(sync)
+    if seeded:
+        _, event = front(sync, "已经收到的原文不能在导入时丢失。", "before-pg")
+    with sync.store.transaction() as db:
+        journal = [tuple(row) for row in db.execute("SELECT * FROM turn_inputs")]
+        material_count = db.execute("SELECT COUNT(*) FROM memory_materials").fetchone()[0]
+    guard = sync.store.recovery_path.read_bytes()
+    sync.store.close()
+    source_digest = hashlib.sha256(Path(sync.store.path).read_bytes()).hexdigest()
+    with postgres_store(sync.store.path, settings=sync.config) as (store, _):
+        sync.store = sync.service.store = store
+        assert store.recovery_path.read_bytes() == guard
+        with store.transaction() as db:
+            assert compatible(db)
+            assert journal == [tuple(row) for row in db.execute("SELECT * FROM turn_inputs")]
+            assert (
+                db.execute("SELECT COUNT(*) FROM memory_materials").fetchone()[0] == material_count
+            )
+            if seeded:
+                assert sync.service.read_committed(db, event["aggregate_id"]) == canonical(event)
+        _, current = front(sync, "导入后的新消息仍按原始事件受理。", "after-pg")
+        repeated = sync.post(MATERIALS, dict(schema_version=1, event=current, context_windows=[]))
+        assert repeated.status_code == 200, repeated.text
+        with store.transaction() as db:
+            assert sync.service.read_committed(db, current["aggregate_id"]) == canonical(current)
+            assert db.execute("SELECT COUNT(*) FROM turn_inputs").fetchone()[0] == len(journal) + 1
+            assert (
+                db.execute("SELECT COUNT(*) FROM memory_materials").fetchone()[0]
+                == material_count + 1
+            )
+        assert hashlib.sha256(Path(store.path).read_bytes()).hexdigest() == source_digest
+
+
+def test_postgres_segment_missing_journal_refuses_business_and_repairs_only_with_backup(
+    pg_sync, monkeypatch, capsys
+):
+    from test_segments import front, ready
+
+    from tianshu_memory.app import configured_app
+    from tianshu_memory.cli import main
+    from tianshu_memory.runtime_probes import probe_database
+    from tianshu_memory.segment_migration import compatible
+
+    ready(pg_sync)
+    _, event = front(pg_sync, "补列前的实际原文与来源账本。", "missing-journal")
+    with pg_sync.store.transaction() as db:
+        db.native("ALTER TABLE turn_inputs DROP COLUMN event")
+        journal = [tuple(row) for row in db.execute("SELECT * FROM turn_inputs")]
+        metadata = dict(db.execute("SELECT key,value FROM metadata"))
+        triggers = [
+            tuple(row)
+            for row in db.native(
+                "SELECT tgname FROM pg_trigger WHERE tgrelid=to_regclass('turn_inputs') ORDER BY tgname"
+            )
+        ]
+    guard = pg_sync.store.recovery_path.read_bytes()
+    pg_sync.store.close()
+    # Store stays available to the original explicit maintenance entry point.
+    with closing(Store.from_config(pg_sync.config)) as maintenance:
+        assert maintenance.backend == "postgresql"
+        assert probe_database(maintenance).state == "failed"
+        with closing(maintenance.readonly()) as db:
+            assert not compatible(db)
+    with pytest.raises(Fault, match="dependency_unavailable"):
+        configured_app(pg_sync.config_path)
+    assert pg_sync.store.recovery_path.read_bytes() == guard
+    backup = pg_sync.directory / "missing-event.backup"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "tianshu-memory",
+            "--config",
+            str(pg_sync.config_path),
+            "migrate-segments",
+            "--backup",
+            str(backup),
+        ],
+    )
+    main()
+    result = json.loads(capsys.readouterr().out)
+    assert result["repaired_event_column"] is True
+    assert result["existing_records_preserved"] is True
+    snapshot = json.loads(backup.read_bytes())
+    assert snapshot["format"] == "tianshu-memory-postgresql-backup/v1"
+    assert snapshot["tables"]["turn_inputs"]["columns"] == [
+        "turn_id",
+        "revision",
+        "digest",
+        "result",
+    ]
+    assert snapshot["tables"]["turn_inputs"]["rows"] == [list(row) for row in journal]
+    assert Path(result["backup_guard"]).read_bytes() == guard
+    with closing(Store.from_config(pg_sync.config)) as repaired:
+        assert probe_database(repaired).state == "ok"
+        with repaired.transaction() as db:
+            assert compatible(db)
+            assert dict(db.execute("SELECT key,value FROM metadata")) == metadata
+            assert [tuple(row) for row in db.execute("SELECT * FROM turn_inputs")] == [
+                (*row, None) for row in journal
+            ]
+            assert pg_sync.service.read_committed(db, event["aggregate_id"]) is None
+            assert [
+                tuple(row)
+                for row in db.native(
+                    "SELECT tgname FROM pg_trigger WHERE tgrelid=to_regclass('turn_inputs') ORDER BY tgname"
+                )
+            ] == triggers
+        assert repaired.recovery_path.read_bytes() == guard
+        backup_digest = hashlib.sha256(backup.read_bytes()).hexdigest()
+        assert repaired.migrate_segments(backup) == dict(
+            memory_segment_schema=1, already_installed=True
+        )
+        assert hashlib.sha256(backup.read_bytes()).hexdigest() == backup_digest
+    app = configured_app(pg_sync.config_path)
+    app.state.storage_store.close()
+
+
+@pytest.mark.parametrize("blocked", ["backup_exists", "guard_mismatch"])
+def test_postgres_segment_journal_repair_keeps_existing_backup_and_guard(pg_sync, blocked):
+    from test_segments import ready
+
+    from tianshu_memory.segment_migration import has_event_column
+
+    ready(pg_sync)
+    with pg_sync.store.transaction() as db:
+        db.native("ALTER TABLE turn_inputs DROP COLUMN event")
+    guard = pg_sync.store.recovery_path.read_bytes()
+    backup = pg_sync.directory / "blocked-event.backup"
+    if blocked == "backup_exists":
+        backup.write_bytes(b"existing backup must not be overwritten")
+        expected = FileExistsError
+    else:
+        wrong = json.loads(guard)
+        wrong["revision"] += 1
+        pg_sync.store.recovery_path.write_text(canonical(wrong), encoding="utf-8")
+        expected = Fault
+    actual_guard = pg_sync.store.recovery_path.read_bytes()
+    with pytest.raises(expected):
+        pg_sync.store.migrate_segments(backup)
+    assert pg_sync.store.recovery_path.read_bytes() == actual_guard
+    with closing(pg_sync.store.readonly()) as db:
+        assert not has_event_column(db)
+    if blocked == "backup_exists":
+        assert backup.read_bytes() == b"existing backup must not be overwritten"
+    else:
+        assert not backup.exists()
+
+
+def test_postgres_unsegmented_authority_accepts_legacy_journal_without_event(tmp_path):
+    from tianshu_memory.runtime_probes import probe_database
+    from tianshu_memory.segment_migration import compatible
+
+    with postgres_store(tmp_path / "unsegmented.sqlite", service="knowledge") as (store, settings):
+        with store.transaction() as db:
+            db.native("ALTER TABLE turn_inputs DROP COLUMN event")
+        store.close()
+        with closing(Store.from_config(settings, service="knowledge")) as reopened:
+            assert probe_database(reopened).state == "ok"
+            with closing(reopened.readonly()) as db:
+                assert compatible(db)
 
 
 def test_file_migration_is_backed_up_preserves_coordinates_and_fails_closed(knowledge):
