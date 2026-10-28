@@ -76,7 +76,13 @@ def candidates(db, request, version):
     bound, after = decode(db, request, version)
     postgres = hasattr(db, "native")
     if postgres:
-        occurred = "(fact::jsonb->>'occurred_at')::timestamptz"
+        # Python/SQLite/cursors truncate sub-microsecond digits; PostgreSQL's
+        # timestamp parser rounds them, potentially across the window boundary.
+        # Truncate the textual fraction before parsing so every key agrees.
+        occurred = (
+            r"regexp_replace(fact::jsonb->>'occurred_at', '(\.[0-9]{6})[0-9]+', '\1')"
+            "::timestamptz"
+        )
         parameter = "%s"
         execute = db.native
     else:

@@ -90,6 +90,28 @@ def test_budget_does_not_skip_or_claim_empty_day(actor):
     assert len(second["items"]) == 1 and second["complete"]
 
 
+def test_submicrosecond_fraction_uses_same_truncated_key_for_window_and_cursor(actor):
+    seed(
+        actor,
+        [
+            "2026-10-26T00:00:00.0000019Z",
+            "2026-10-26T08:00:00.00000199+08:00",
+            "2026-10-26T00:00:00.0000021Z",
+            "2026-10-26T23:59:59.9999999Z",
+            "2026-10-25T23:59:59.9999999Z",
+            "2026-10-27T00:00:00.0000001Z",
+        ],
+    )
+    cursor, found = None, []
+    # Bounded traversal catches a repeated page instead of hanging on it.
+    for _ in range(4):
+        page = timeline(actor, cursor=cursor, limit=1)
+        found.extend(item["ref"]["id"] for item in page["items"])
+        cursor = page["next_cursor"]
+    assert found == [f"episode:fixture:{index:04}" for index in range(4)]
+    assert cursor is None and page["complete"] and not page["omitted"]
+
+
 def test_permanently_oversized_fact_advances_without_claiming_completeness(actor):
     seed(actor, ["2026-10-26T01:00:00Z", "2026-10-26T02:00:00Z"])
     with actor["store"].transaction(write=True) as db:
