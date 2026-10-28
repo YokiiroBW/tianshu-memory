@@ -13,11 +13,26 @@ from ..source_http_pool import OwnerHttpPool
 
 
 class Authority:
-    def __init__(self, config_path, contracts, *, internal_clients=None):
+    def __init__(self, config_path, contracts, *, internal_clients=None, observation_sources=None):
         self.path, self.contracts = Path(config_path), contracts
         self.pool = OwnerHttpPool(internal_clients=internal_clients)
+        self.observation_sources = observation_sources
 
     def _call(self, owner, definition, payload):
+        if owner == "observation" and self.observation_sources is not None:
+            # The original observation owner supplies this narrow port. Actor
+            # authority never opens the user store or refreshes its source head.
+            self.contracts.validate(definition + "_request", payload)
+            result = self.observation_sources(payload)
+            self.contracts.validate(definition + "_result", result)
+            require(
+                result["request_id"] == payload["request_id"]
+                and result["actor_id"] == payload["actor_id"]
+                and len(canonical(result).encode()) <= 1048576,
+                "dependency_unavailable",
+                503,
+            )
+            return result
         try:
             config = json.loads(self.path.read_bytes())["actor_memory"]["authorities"]
             entry = (
@@ -113,6 +128,30 @@ class Authority:
             "forbidden",
             403,
         )
+        return result
+
+    def read_observation_sources(self, request, *, recheck):
+        """Pre-model source proof under existing actor read authority only."""
+        operation = request.get("operation")
+        require(operation in {"source_facts", "source_check"}, "invalid_input", 400)
+        self.contracts.validate(operation + "_request", request)
+        require(
+            all(ref["producer"] == "observation" for ref in request["refs"])
+            and (
+                operation == "source_facts"
+                or request["context"]["audience"]["kind"] == "actor_only"
+            ),
+            "forbidden",
+            403,
+        )
+        caller = recheck()
+        role_request = dict(
+            request, operation="query" if operation == "source_facts" else "check_memory"
+        )
+        before = self.actor(role_request)
+        result = self._call("observation", operation, request)
+        require(self.actor(role_request) == before, "source_changed", 409)
+        require(recheck() == caller, "forbidden", 403)
         return result
 
     def sources(self, request, refs, *, facts=False, context=None):

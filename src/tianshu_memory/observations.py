@@ -197,6 +197,53 @@ class ObservationLedger:
         row = db.execute("SELECT value FROM metadata WHERE key='observation_schema'").fetchone()
         require(row is not None and row[0] == "1", "dependency_unavailable", 503)
 
+    def read_exact(self, db, source_ref):
+        """Read one accepted original on the caller's existing guarded snapshot.
+
+        This owner port does not stage extraction material, refresh source heads,
+        or reinterpret the original body supplied at ingestion.
+        """
+        self._ready(db)
+        row = db.execute(
+            "SELECT o.*,p.payload FROM observation_sources o "
+            "JOIN observation_payloads p ON p.source_ref=o.source_ref WHERE o.source_ref=?",
+            (source_ref,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            original = strict_json(result["payload"])
+            event = _request(original)
+        except (ValueError, KeyError, TypeError):
+            raise Fault("dependency_unavailable", 503) from None
+        except Fault as error:
+            if error.code == "invalid_input":
+                raise Fault("dependency_unavailable", 503) from None
+            raise
+        require(
+            original["source_ref"] == result["source_ref"]
+            and original["source_digest"] == result["digest"] == fingerprint(event)
+            and original["scope_version"] == result["scope_version"]
+            and all(
+                event[wire] == result[column]
+                for wire, column in (
+                    ("platform_id", "instance_id"),
+                    ("self_id", "self_id"),
+                    ("conversation_id", "conversation"),
+                    ("account_id", "author"),
+                    ("event_id", "event_id"),
+                    ("sent_at", "sent_at"),
+                    ("text", "text"),
+                    ("content_state", "content_state"),
+                )
+            ),
+            "dependency_unavailable",
+            503,
+        )
+        result["original"] = original
+        return result
+
     def ingest(self, service, request):
         require(service == "companion", "forbidden", 403)
         event = _request(request)

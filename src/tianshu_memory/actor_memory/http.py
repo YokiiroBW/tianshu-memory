@@ -21,7 +21,15 @@ from .store import Store
 
 
 class Endpoint:
-    def __init__(self, auth, *, max_active, internal_clients=None, storage_environ=None):
+    def __init__(
+        self,
+        auth,
+        *,
+        max_active,
+        internal_clients=None,
+        storage_environ=None,
+        observation_sources=None,
+    ):
         self.auth = auth
         self.admission = Requests(max_active)
         self.application = None
@@ -30,6 +38,7 @@ class Endpoint:
         self.closed = False
         self.internal_clients = internal_clients
         self.storage_environ = storage_environ
+        self.observation_sources = observation_sources
 
     def get(self):
         require(not self.closed and self.auth is not None, "dependency_unavailable", 503)
@@ -60,7 +69,10 @@ class Endpoint:
                 try:
                     contracts = Contracts(section["contract_directory"])
                     authority = Authority(
-                        self.auth.path, contracts, internal_clients=self.internal_clients
+                        self.auth.path,
+                        contracts,
+                        internal_clients=self.internal_clients,
+                        observation_sources=self.observation_sources,
                     )
                     try:
                         store = Store(config, storage_environ=self.storage_environ)
@@ -93,17 +105,18 @@ def mount(
     max_active,
     internal_clients=None,
     storage_environ=None,
+    observation_sources=None,
 ):
     endpoint = Endpoint(
         auth,
         max_active=max_active,
         internal_clients=internal_clients,
         storage_environ=storage_environ,
+        observation_sources=observation_sources,
     )
     app.state.actor_memory = endpoint
 
-    @app.post("/internal/v1/actor-self-memory/operate")
-    async def operate(request: Request):
+    async def dispatch(request: Request, *, observation_read=False):
         lease, request_id, payload = None, "req:unavailable", None
         try:
             require(not endpoint.closed and auth is not None, "dependency_unavailable", 503)
@@ -130,9 +143,13 @@ def mount(
 
             def authorize():
                 name, current = auth.authenticate(request.headers.get("authorization"))
+                operation = payload["operation"]
+                if observation_read:
+                    operation = {"source_facts": "query", "source_check": "check_memory"}.get(
+                        operation
+                    )
                 require(
-                    name == caller_name
-                    and payload["operation"] in current.get("actor_memory_operations", []),
+                    name == caller_name and operation in current.get("actor_memory_operations", []),
                     "forbidden",
                     403,
                 )
@@ -147,6 +164,10 @@ def mount(
             def execute():
                 authorize()
                 application = endpoint.get()
+                if observation_read:
+                    return application.authority.read_observation_sources(
+                        payload, recheck=authorize
+                    )
                 return application.execute(payload, caller=caller_name, recheck=authorize)
 
             lease.request = request
@@ -187,5 +208,13 @@ def mount(
             status_code=status,
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.post("/internal/v1/actor-self-memory/operate")
+    async def operate(request: Request):
+        return await dispatch(request)
+
+    @app.post("/internal/v1/actor-self-memory/observation-source")
+    async def observation_source(request: Request):
+        return await dispatch(request, observation_read=True)
 
     return endpoint

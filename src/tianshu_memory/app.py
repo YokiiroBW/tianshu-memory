@@ -122,6 +122,7 @@ def create_app(
     admission = Requests(max_active, reserve_identity=True)
     app.state.chat_requests = admission
     from .actor_memory.http import mount as mount_actor_memory
+    from .observation_actor_sources import ObservationActorSources
 
     mount_actor_memory(
         app,
@@ -131,6 +132,7 @@ def create_app(
         max_active=max_active,
         internal_clients=internal_clients,
         storage_environ=storage_environ,
+        observation_sources=ObservationActorSources(service) if service is not None else None,
     )
 
     async def drain():
