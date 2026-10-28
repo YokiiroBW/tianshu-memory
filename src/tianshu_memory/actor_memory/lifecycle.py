@@ -1,6 +1,7 @@
 """Body erasure, evidence suppression and bounded deterministic maintenance."""
 
 import json
+from collections import defaultdict, deque
 
 from ..domain import canonical, fingerprint, require, utc
 from . import search
@@ -44,12 +45,16 @@ def suppress(db, actor_id, payload):
 def ensure_unsuppressed(db, actor_id, payload):
     episodes = {part["episode_id"] for part in payload["episode_refs"]}
     current = evidence(db, actor_id, payload["episode_refs"])
+    forgotten_episodes, forgotten_evidence = set(), set()
     for row in db.execute("SELECT value FROM actor_metadata WHERE key LIKE 'forgotten:%'"):
         old = json.loads(row[0])
         if old["actor_id"] != actor_id or old["kind"] != payload["kind"]:
             continue
+        forgotten_episodes.update(old["episodes"])
+        forgotten_evidence.update(old["evidence"])
+    if forgotten_episodes:
         require(
-            not episodes.issubset(set(old["episodes"])) and bool(current - set(old["evidence"])),
+            not episodes.issubset(forgotten_episodes) and bool(current - forgotten_evidence),
             "source_withdrawn",
             409,
         )
@@ -57,6 +62,14 @@ def ensure_unsuppressed(db, actor_id, payload):
 
 def erase_derived(db, row, *, state="withdrawn", suppression=True):
     payload = json.loads(row["payload"])
+    replaces = sorted({ref["id"] for ref in payload.get("replaces", [])})
+    if replaces:
+        # Keep only replacement IDs, never old text/tags. An expired middle
+        # version must remain a bridge when a later version is forgotten.
+        db.execute(
+            "INSERT INTO actor_metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("replacement:" + fingerprint(row["actor_id"]) + ":" + row["id"], canonical(replaces)),
+        )
     if payload and suppression:
         suppress(db, row["actor_id"], payload)
     db.execute(
@@ -81,18 +94,28 @@ def dependents(db, actor_id, ref):
         }
     else:
         selected = {ref["id"]}
-    edges = {
-        row["id"]: {part["id"] for part in json.loads(row["payload"]).get("replaces", [])}
+    edges = defaultdict(set)
+    prefix = "replacement:" + fingerprint(actor_id) + ":"
+    links = [
+        (row["id"], [part["id"] for part in json.loads(row["payload"]).get("replaces", [])])
         for row in rows
-    }
-    while True:
-        previous = set(selected)
-        for key, targets in edges.items():
-            if key in selected or targets & selected:
-                selected.add(key)
-                selected.update(targets)
-        if selected == previous:
-            break
+    ]
+    links.extend(
+        (row[0][len(prefix) :], json.loads(row[1]))
+        for row in db.execute(
+            "SELECT key,value FROM actor_metadata WHERE key LIKE ?", (prefix + "%",)
+        )
+    )
+    for identity, targets in links:
+        for target in targets:
+            edges[identity].add(target)
+            edges[target].add(identity)
+    pending = deque(selected)
+    while pending:
+        identity = pending.popleft()
+        for target in edges[identity] - selected:
+            selected.add(target)
+            pending.append(target)
     return [row for row in rows if row["id"] in selected and row["id"] != ref["id"]]
 
 

@@ -38,7 +38,11 @@ DDL = (
 
 
 def checkpoint(db):
-    metadata = dict(db.execute("SELECT key,value FROM actor_metadata"))
+    metadata = dict(
+        db.execute(
+            "SELECT key,value FROM actor_metadata WHERE key IN ('schema','instance','revision','recovery')"
+        )
+    )
     require(metadata.get("schema") in {"2", "3"}, "dependency_unavailable", 503)
     try:
         return {
