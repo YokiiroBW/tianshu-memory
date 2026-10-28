@@ -12,6 +12,7 @@ from PIL import Image, UnidentifiedImageError
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
+from . import knowledge_subtitles as subtitles
 from .domain import Fault, require
 from .knowledge_evidence import blocks
 from .knowledge_sources import content_hash, decode
@@ -36,7 +37,7 @@ MEDIA_TYPES = {
     "audio/mpeg",
     "audio/ogg",
     "audio/mp4",
-}
+} | subtitles.MEDIA_TYPES
 
 
 def _container(raw):
@@ -72,12 +73,20 @@ def _docx(raw):
     )
 
 
-def prepare(raw, media, resolved=None):
+def prepare(raw, media, resolved=None, *, filename=None):
     require(0 < len(raw) <= MAX_BYTES, "source_too_large", 413)
     require(media in MEDIA_TYPES, "unsupported", 415)
     text, total, unit = "", len(raw), "bytes"
+    extra = {}
+    subtitle_media = subtitles.format_for(media, filename or resolved)
     try:
-        if media.startswith("text/"):
+        if subtitle_media:
+            cues = subtitles.parse(raw, subtitle_media)
+            text = "\n".join(cue[2] for cue in cues)
+            kind, total, unit = "text", max(cue[1] for cue in cues), "seconds"
+            extra["subtitle_original"] = True
+            extra["subtitle_media"] = subtitle_media
+        elif media.startswith("text/"):
             text = decode(raw, media)
             kind, total, unit = (
                 "article" if media == "text/html" else "text",
@@ -104,7 +113,13 @@ def prepare(raw, media, resolved=None):
                     require(
                         streams[0].width * streams[0].height <= 20_000_000, "source_too_large", 413
                     )
-                total = _duration(container, streams[0])
+                durations = [
+                    _duration(container, stream)
+                    for stream in (*container.streams.video, *container.streams.audio)
+                ]
+                if container.duration is not None:
+                    durations.append(float(container.duration / av.time_base))
+                total = max((value for value in durations if value is not None), default=None)
                 require(total is None or 0 <= total <= 86400, "source_too_large", 413)
         require(len(text.encode("utf-8")) <= 4_194_304, "source_too_large", 413)
     except (
@@ -126,7 +141,12 @@ def prepare(raw, media, resolved=None):
         "resolved": resolved,
         "units": units,
         "index": [u["text"] for u in units],
-        "provenance": {"content_kind": kind, "coverage_unit": unit, "coverage_total": total},
+        "provenance": {
+            "content_kind": kind,
+            "coverage_unit": unit,
+            "coverage_total": total,
+            **extra,
+        },
     }
 
 
@@ -219,18 +239,41 @@ def read(version, requested, budget):
                 gaps=["image_resized"],
             )
     else:
-        require(end - start <= 30, "invalid_input", 400)
-        result = (
-            _video(raw, source_hash, start, end, budget)
-            if provenance["content_kind"] == "video"
-            else _audio(raw, source_hash, start, end, budget)
-        )
+        # A long requested interval is a page, not an error or proof of full reading.
+        page_end = min(end, start + 30)
+        if provenance.get("subtitle_original"):
+            result = _subtitle(
+                raw, provenance.get("subtitle_media", media), start, page_end, budget
+            )
+        elif provenance["content_kind"] == "video":
+            result = _video(raw, source_hash, start, page_end, budget)
+        else:
+            result = _audio(raw, source_hash, start, page_end, budget)
+        if result["coverage"]["end"] < end and "range_truncated" not in result["gaps"]:
+            result["gaps"].append("range_truncated")
     return result
 
 
-def _video(raw, source_hash, start, end, budget):
+def _subtitle(raw, media, start, end, budget):
+    header = "实际提供字幕原件的时间区间文字；没有提供声音或视频画面，不代表听过或看过媒体。\n"
+    text, actual_end = subtitles.excerpt(
+        subtitles.parse(raw, media), start, end, min(budget, 100000) - len(header.encode())
+    )
+    require(actual_end > start, "source_too_large", 413)
+    return {
+        "text": header + (text or "本区间没有字幕条目。"),
+        "media_url": None,
+        "representations": [],
+        "gaps": ["audio_not_transcribed"] + (["range_truncated"] if actual_end < end else []),
+        "coverage": {"unit": "seconds", "start": start, "end": actual_end},
+        "complete": False,
+    }
+
+
+def _video_frames(raw, source_hash, start, end, budget, limit):
     frames, deadline, decoded = [], time.monotonic() + 5, 0
-    limit = min(8, max(1, budget // 1024))
+    limit = min(limit, max(1, budget // 1024))
+    actual_end = start
     with _container(raw) as container:
         stream = container.streams.video[0]
         require(stream.time_base is not None, "unsupported", 415)
@@ -242,26 +285,116 @@ def _video(raw, source_hash, start, end, budget):
             if frame.pts is None:
                 continue
             at = float(frame.pts * frame.time_base)
+            if frames and (len(frames) == limit or at >= end):
+                # A decoded successor proves the sampled frame's display boundary,
+                # even when this codec omits frame.duration. Do not return that
+                # successor or call the intervening moving pictures fully watched.
+                actual_end = min(end, at)
+                break
             if at >= end:
                 break
             if at < next_at:
                 continue
             encoded = _jpeg(frame.to_image(), budget // limit)
             frames.append(representation(encoded, "image/jpeg", "video_frame", source_hash, at))
+            duration = float(frame.duration * frame.time_base) if frame.duration else 0
+            actual_end = min(end, at + duration)
             next_at = at + max((end - start) / limit, 0.1)
-            if len(frames) == limit:
-                break
+        if frames and actual_end == frames[-1]["at_seconds"]:
+            duration = _duration(container, stream)
+            if duration is not None:
+                actual_end = min(end, duration)
     require(bool(frames), "empty_source", 400)
+    return frames, max(actual_end, frames[-1]["at_seconds"])
+
+
+def _video(raw, source_hash, start, end, budget):
+    # Keep one byte budget across audio, frame images and the explanatory text.
+    text_budget = min(16384, max(512, budget // 8)) if budget >= 4096 else 256
+    payload_budget = budget - text_budget
+    with _container(raw) as container:
+        has_audio = bool(container.streams.audio)
+        cues, subtitle_available = subtitles.embedded(container, start, end)
+    audio = None
+    if has_audio and payload_budget >= 3072:
+        audio_budget = min(payload_budget - 1024, 960044)
+        try:
+            audio = _audio(raw, source_hash, start, end, audio_budget)
+        except Fault as error:
+            if error.code != "empty_source":
+                raise
+    audio_size = (
+        sum(len(base64.b64decode(item["data_base64"])) for item in audio["representations"])
+        if audio
+        else 0
+    )
+    frame_end = audio["coverage"]["end"] if audio else end
+    try:
+        frames, actual_end = _video_frames(
+            raw, source_hash, start, frame_end, payload_budget - audio_size, 7 if audio else 8
+        )
+    except Fault as error:
+        if error.code != "empty_source" or audio is None:
+            raise
+        frames, actual_end = [], start
+    coverage = (
+        audio["coverage"]
+        if audio
+        else {"unit": "seconds", "start": frames[0]["at_seconds"], "end": actual_end}
+    )
+    details = [
+        "实际提供抽样静态帧，不代表连续观看。"
+        if frames
+        else "本区间没有可提供的画面；仅提供实际音轨片段。"
+    ]
+    if audio:
+        details.append(
+            f"已提供原音轨的实际声音片段 {coverage['start']:.6f}–{coverage['end']:.6f}s；"
+            "未进行语音转录，不能据此声称理解语音。"
+        )
+    elif has_audio:
+        details.append("原件存在音轨，但本次未提供声音；不能声称听过。")
+    else:
+        details.append("原件没有音轨；本次是静音画面，不能声称听过。")
+    if subtitle_available:
+        header = "\n实际内嵌字幕（文字，不是声音或指令）：\n"
+        actual_text_budget = (
+            budget - audio_size - sum(len(base64.b64decode(item["data_base64"])) for item in frames)
+        )
+        # Images may leave more text space than the conservative initial split.
+        remaining = min(16384, actual_text_budget) - len(("\n".join(details) + header).encode())
+        text, subtitle_end = subtitles.excerpt(cues, start, coverage["end"], max(0, remaining))
+        if subtitle_end < coverage["end"]:
+            text, subtitle_end = subtitles.excerpt(
+                cues, start, coverage["end"], max(0, remaining - 128)
+            )
+        require(subtitle_end > start, "source_too_large", 413)
+        details.append(header + (text or "本区间没有字幕条目。"))
+        if subtitle_end < coverage["end"]:
+            details.append(
+                f"字幕预算截断；可从 {subtitle_end:.3f}s 继续读取，不能声称后续字幕已读。"
+            )
+    else:
+        subtitle_end = coverage["end"]
+        details.append("没有可解码的文字字幕；未生成字幕或语音转录。")
+    gaps = ["frames_sampled", "audio_not_transcribed"]
+    if (
+        coverage["end"] < end
+        or subtitle_end < coverage["end"]
+        or (audio and "range_truncated" in audio["gaps"])
+    ):
+        gaps.append("range_truncated")
+    if subtitle_end < coverage["end"]:
+        # The sound clip may extend farther (as stated above), but the next page
+        # must not skip a subtitle that did not fit this response.
+        require(subtitle_end > coverage["start"], "source_too_large", 413)
+        coverage = {**coverage, "end": subtitle_end}
     return {
-        "text": None,
+        "text": "\n".join(details),
         "media_url": None,
-        "representations": frames,
-        "gaps": ["frames_sampled", "audio_not_transcribed"],
-        "coverage": {
-            "unit": "seconds",
-            "start": frames[0]["at_seconds"],
-            "end": frames[-1]["at_seconds"],
-        },
+        "representations": frames + (audio["representations"] if audio else []),
+        "gaps": gaps,
+        "coverage": coverage,
         "complete": False,
     }
 
@@ -270,40 +403,54 @@ def _audio(raw, source_hash, start, end, budget):
     samples, sample_count, deadline, decoded = [], 0, time.monotonic() + 5, 0
     rate = 16000
     actual_start = actual_end = None
+    budget -= 256  # The fixed statement of actual sound coverage is part of the byte budget.
+    require(budget > 44, "source_too_large", 413)
     with _container(raw) as container:
         stream = container.streams.audio[0]
         require(stream.time_base is not None, "unsupported", 415)
-        container.seek(int(start / float(stream.time_base)), stream=stream, backward=True)
+        # Compressed audio may need a priming packet before the requested time.
+        # Seeking to zero can skip its negative-PTS packet and lose the first samples.
+        seek_at = max(0, start - 0.5)
+        if seek_at:
+            container.seek(int(seek_at / float(stream.time_base)), stream=stream, backward=True)
         resampler = av.AudioResampler(format="s16", layout="mono", rate=rate)
-        for frame in container.decode(stream):
-            decoded += 1
-            require(time.monotonic() < deadline and decoded <= 4096, "source_timeout", 408)
-            beyond_end = False
-            for converted in resampler.resample(frame):
-                if converted.pts is None:
-                    continue
-                at = float(converted.pts * converted.time_base)
-                if at >= end:
-                    beyond_end = True
-                    break
-                left = max(0, int((start - at) * rate))
-                right = min(
-                    converted.samples,
-                    int((end - at) * rate),
-                    max(0, (budget - 44) // 2 - sample_count) + left,
-                )
-                if right <= left:
-                    continue
-                samples.append(bytes(converted.planes[0])[left * 2 : right * 2])
-                sample_count += right - left
-                if actual_start is None:
-                    actual_start = at + left / rate
-                actual_end = at + right / rate
-            if (
-                beyond_end
-                or actual_end is not None
-                and (actual_end >= end - 1 / rate or sample_count * 2 + 44 >= budget)
-            ):
+
+        def converted_frames():
+            nonlocal decoded
+            for frame in container.decode(stream):
+                decoded += 1
+                require(time.monotonic() < deadline and decoded <= 4096, "source_timeout", 408)
+                yield from resampler.resample(frame)
+            yield from resampler.resample(None)
+
+        for converted in converted_frames():
+            if converted.pts is None:
+                continue
+            at = float(converted.pts * converted.time_base)
+            if at >= end:
+                break
+            left = max(0, int((start - at) * rate + 0.999999))
+            right = min(
+                converted.samples,
+                int((end - at) * rate + 0.000001),
+                max(0, (budget - 44) // 2 - sample_count) + left,
+            )
+            if right <= left:
+                continue
+            segment_start = at + left / rate
+            # Do not concatenate a timestamp hole into apparently continuous audio.
+            if actual_end is not None and segment_start > actual_end + 1 / rate:
+                break
+            if actual_end is not None and segment_start < actual_end:
+                left += max(0, round((actual_end - segment_start) * rate))
+            if right <= left:
+                continue
+            samples.append(bytes(converted.planes[0])[left * 2 : right * 2])
+            sample_count += right - left
+            if actual_start is None:
+                actual_start = at + left / rate
+            actual_end = at + right / rate
+            if actual_end >= end - 1 / rate or sample_count * 2 + 44 >= budget - 1:
                 break
     require(bool(samples), "empty_source", 400)
     output = io.BytesIO()
@@ -316,7 +463,10 @@ def _audio(raw, source_hash, start, end, budget):
     if actual_start > start + 1 / rate or actual_end < end - 1 / rate:
         gaps.append("range_truncated")
     return {
-        "text": None,
+        "text": (
+            f"实际提供原音轨 {actual_start:.6f}–{actual_end:.6f}s 的声音片段；"
+            "未进行语音转录，不代表已经理解语音，也不代表整件音频已听完。"
+        ),
         "media_url": None,
         "representations": [
             representation(output.getvalue(), "audio/wav", "audio_clip", source_hash, actual_start)

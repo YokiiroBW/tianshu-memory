@@ -286,7 +286,12 @@ class KnowledgeContent:
                 max_bytes=media.MAX_BYTES,
                 include_time=True,
             )
-        prepared = media.prepare(raw, content_type, resolved)
+        prepared = media.prepare(
+            raw,
+            content_type,
+            resolved,
+            filename=descriptor["filename"] if source["kind"] == "upload" else None,
+        )
         authority = refresh()
         locator = source.get("url", source.get("upload_id"))
         source_id = "source:" + fingerprint([authority["owner"], source["kind"], locator])
