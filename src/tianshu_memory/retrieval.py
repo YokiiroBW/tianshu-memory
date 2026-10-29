@@ -8,6 +8,7 @@ from collections import OrderedDict
 from contextlib import closing
 
 from .domain import canonical, require
+from .retrieval_scoring import combine, order
 from .retrieval_vectors import dot, pack, unpack, vectors
 
 
@@ -167,8 +168,7 @@ class Retrieval:
                 while len(self.cache) > 4096:
                     self.cache.popitem(last=False)
             scores = {
-                identity: dot(unpack(cached[key]), query_vector)
-                for identity, key in zip(ids, keys)
+                identity: dot(unpack(cached[key]), query_vector) for identity, key in zip(ids, keys)
             }
             semantic = sorted(ids, key=lambda identity: (-scores[identity], identity))[:limit]
             if settings["mode"] == "vector":
@@ -179,6 +179,15 @@ class Retrieval:
                     for position, identity in enumerate(ranking, 1):
                         fused[identity] = fused.get(identity, 0) + 1 / (60 + position)
                 ranked = sorted(fused, key=lambda identity: (-fused[identity], identity))[:limit]
+        documents = [dict(id=identity, group_id=identity) for identity in by_id]
+        relevance = (
+            {identity: fused[identity] for identity in ranked}
+            if settings["mode"] == "hybrid"
+            else {identity: scores[identity] for identity in ranked}
+            if settings["mode"] == "vector"
+            else {identity: 1 / (60 + index) for index, identity in enumerate(ranked, 1)}
+        )
+        ranked = order(combine(relevance, documents), documents)
         if settings["rerank"] and ranked:
             scores = call(
                 "rerank",

@@ -787,6 +787,8 @@ def execute(application, request, context):
                     plan["lexical_ids"],
                     settings,
                     query_vector=query_vectors[plan["subquery"]["query_id"]],
+                    summaries=frame["summaries"],
+                    now=service.clock(),
                 )
                 if settings
                 else None

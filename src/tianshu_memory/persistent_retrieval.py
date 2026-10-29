@@ -4,9 +4,11 @@ import json
 import time
 from contextlib import closing, nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 
 from .domain import Fault, canonical, require
 from .retrieval_migration import installed as binary_installed
+from .retrieval_scoring import combine, order
 from .retrieval_vectors import dot, pack, unpack, vectors
 
 
@@ -49,6 +51,8 @@ class PreparedRanking:
     corrupted: list
     query_vector: PreparedQueryVector | None = None
     trace: dict | None = None
+    summaries: dict | None = None
+    now: datetime | None = None
 
     @property
     def external(self):
@@ -58,7 +62,7 @@ class PreparedRanking:
         )
 
 
-def prepare(db, documents, lexical_ids, settings, *, query_vector=None):
+def prepare(db, documents, lexical_ids, settings, *, query_vector=None, summaries=None, now=None):
     """Read the existing vectors without calling a backend or opening another transaction."""
     by_id = {item["id"]: item for item in documents}
     available, corrupted = {}, []
@@ -97,6 +101,8 @@ def prepare(db, documents, lexical_ids, settings, *, query_vector=None):
         available,
         corrupted,
         query_vector,
+        summaries=summaries,
+        now=now,
     )
 
 
@@ -192,6 +198,16 @@ def _rank_prepared(retrieval, store, query, plan, *, deadline=None):
         ranked = sorted(fused, key=lambda identity: (-fused[identity], identity))[:limit]
     else:
         ranked = lexical_ids
+    relevance = (
+        {identity: fused[identity] for identity in ranked}
+        if settings["mode"] == "hybrid"
+        else {identity: scores[identity] for identity in ranked}
+        if settings["mode"] == "vector" and semantic
+        else {identity: 1 / (60 + index) for index, identity in enumerate(ranked, 1)}
+    )
+    ranked = order(
+        combine(relevance, list(by_id.values()), plan.summaries, plan.now), list(by_id.values())
+    )
     if settings["rerank"] and ranked:
         missing_text = [identity for identity in ranked if "text" not in by_id[identity]]
         if missing_text:
