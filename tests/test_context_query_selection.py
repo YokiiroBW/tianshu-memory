@@ -365,8 +365,8 @@ def ranked_prefix(monkeypatch, identities, *, only_prefix=False):
     """Controlled order: the live run did not export its original pre-fit rank."""
     original = read_v2.rank_plans
 
-    def rank(service, prepared, backend_failed):
-        original(service, prepared, backend_failed)
+    def rank(service, prepared, backend_failed, **kwargs):
+        original(service, prepared, backend_failed, **kwargs)
         for plan in prepared:
             by_id = {document["id"]: document for document in plan["documents"]}
             first = [by_id[identity] for identity in identities if identity in by_id]
@@ -375,6 +375,8 @@ def ranked_prefix(monkeypatch, identities, *, only_prefix=False):
                 if only_prefix
                 else [item for item in plan["ranked"] if item["id"] not in identities]
             )
+            # This fixture replaces the shortlist itself before fitting.
+            plan.pop("selection_units", None)
 
     monkeypatch.setattr(read_v2, "rank_plans", rank)
 

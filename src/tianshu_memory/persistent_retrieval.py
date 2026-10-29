@@ -145,8 +145,12 @@ def rank(retrieval, store, query, documents, lexical_ids, settings, *, deadline=
     return rank_prepared(retrieval, store, query, plan, deadline=deadline)
 
 
-def rank_prepared(retrieval, store, query, plan, *, deadline=None, query_id=None, limit=None):
-    result, complete = _rank_prepared(retrieval, store, query, plan, deadline=deadline, limit=limit)
+def rank_prepared(
+    retrieval, store, query, plan, *, deadline=None, query_id=None, limit=None, rerank=True
+):
+    result, complete = _rank_prepared(
+        retrieval, store, query, plan, deadline=deadline, limit=limit, rerank=rerank
+    )
     if plan.settings.get("trace", False):
         from .diagnostics import record_recall_trace
         from .recall_trace import build
@@ -170,7 +174,7 @@ def embed_query(retrieval, query, settings, deadline):
     return vectors(response["vectors"], 1)[0]
 
 
-def _rank_prepared(retrieval, store, query, plan, *, deadline=None, limit=None):
+def _rank_prepared(retrieval, store, query, plan, *, deadline=None, limit=None, rerank=True):
     """Use one prepared snapshot; callers release their authority transaction for external work."""
     if plan.external and deadline is None:
         deadline = time.monotonic() + 8
@@ -223,7 +227,26 @@ def _rank_prepared(retrieval, store, query, plan, *, deadline=None, limit=None):
     ranked = order(
         combine(relevance, list(by_id.values()), plan.summaries, plan.now), list(by_id.values())
     )
-    if settings["rerank"] and ranked:
+    complete = not plan.corrupted and (
+        settings["mode"] == "keyword" or len(available) == plan.document_count
+    )
+    if rerank and settings["rerank"] and ranked:
+        result, reranked = rerank_documents(
+            retrieval,
+            store,
+            query,
+            [by_id[identity] for identity in ranked],
+            settings,
+            deadline=deadline,
+        )
+        return result, complete and reranked
+    return [by_id[identity] for identity in ranked], complete
+
+
+def rerank_documents(retrieval, store, query, documents, settings, *, deadline):
+    by_id = {item["id"]: item for item in documents}
+    ranked = list(by_id)
+    if ranked:
         missing_text = [identity for identity in ranked if "text" not in by_id[identity]]
         if missing_text:
             with closing(store.readonly()) as db:
@@ -246,16 +269,22 @@ def _rank_prepared(retrieval, store, query, plan, *, deadline=None, limit=None):
                     "documents": [by_id[identity]["text"] for identity in ranked],
                 },
             )["scores"]
-            require(len(result) == len(ranked), "dependency_unavailable", 503)
+            import math
+
+            require(
+                isinstance(result, list)
+                and len(result) == len(ranked)
+                and all(type(value) in (int, float) and math.isfinite(value) for value in result),
+                "dependency_unavailable",
+                503,
+            )
             ranked = [
                 identity
                 for _, identity in sorted(zip(result, ranked), key=lambda item: (-item[0], item[1]))
             ]
         except (Fault, OSError, TimeoutError, ValueError, TypeError, KeyError):
             return [by_id[identity] for identity in ranked], False
-    return [by_id[identity] for identity in ranked], not plan.corrupted and (
-        settings["mode"] == "keyword" or len(available) == plan.document_count
-    )
+    return [by_id[identity] for identity in ranked], True
 
 
 def missing(db, revision, limit=4):

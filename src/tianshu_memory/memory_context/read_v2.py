@@ -810,7 +810,7 @@ def execute(application, request, context):
             if plan["ranking"] is not None:
                 discard_corrupt(db, plan["ranking"])
         if local_selection:
-            rank_plans(service, prepared, backend_failed)
+            rank_plans(service, prepared, backend_failed, frame=frame)
             evidence, results, _, chosen = _select_evidence(service, db, request, frame, prepared)
             groups, episodes, sources = dependencies(db, frame, evidence)
             selection = dict(
@@ -834,10 +834,10 @@ def execute(application, request, context):
         elif not any(plan["ranking"] is not None and plan["ranking"].external for plan in prepared):
             # The evidence and its negative/selection proof are produced from this
             # same fresh source boundary. Nothing outside the transaction ran.
-            rank_plans(service, prepared, backend_failed)
+            rank_plans(service, prepared, backend_failed, frame=frame)
             return assemble(service, db, request, context, frame, prepared)
     if not local_selection:
-        rank_plans(service, prepared, backend_failed)
+        rank_plans(service, prepared, backend_failed, frame=frame)
     with operation(service, items) as db:
         fresh = collect(service, db, request, context)
         _refresh_ranked(service, db, request, frame, fresh, prepared)
@@ -906,8 +906,14 @@ def document_binding(frame, document):
     return metadata, records
 
 
-def rank_plans(service, prepared, backend_failed):
-    from ..persistent_retrieval import PreparedQueryVector, embed_query, rank_prepared
+def rank_plans(service, prepared, backend_failed, *, frame=None):
+    from ..persistent_retrieval import (
+        PreparedQueryVector,
+        embed_query,
+        rank_prepared,
+        rerank_documents,
+    )
+    from .merge import by_owner, mmr_diversify, quota_merge, unit_items
 
     retrieval_deadline = (
         time.monotonic() + 8
@@ -961,11 +967,45 @@ def rank_plans(service, prepared, backend_failed):
                     deadline=retrieval_deadline,
                     query_id=plan["subquery"]["query_id"],
                     limit=limit,
+                    rerank=False,
                 )
                 complete &= current
             plan["per_owner_ranked"] = ranked
             plan["ranked"] = interleave(ranked)
             plan["index_complete"] = complete and not backend_failed
+            if frame is not None:
+                units = _selection_units(frame, plan, context_mode=plan["context_mode"])
+                positions = {
+                    document["id"]: i for rows in ranked.values() for i, document in enumerate(rows)
+                }
+                items = unit_items(units, positions)
+                vectors = {
+                    item["id"]: ranking.available[item["id"]]
+                    for item in items
+                    if item["id"] in ranking.available
+                }
+                diverse = mmr_diversify(items, vectors)
+                shortlist = quota_merge(by_owner(diverse), min(80, ranking.settings["candidates"]))
+                plan["ranked"] = [member for item in shortlist for member in item["members"]]
+                if "selection_units" in plan:
+                    plan["selection_units"] = [
+                        tuple(member["id"] for member in item["members"]) for item in shortlist
+                    ]
+            if ranking.settings["rerank"] and plan["ranked"]:
+                plan["ranked"], reranked = rerank_documents(
+                    service.retrieval,
+                    service.store,
+                    plan["subquery"]["text"],
+                    plan["ranked"],
+                    ranking.settings,
+                    deadline=retrieval_deadline,
+                )
+                plan["index_complete"] &= reranked
+                if "selection_units" in plan:
+                    positions = {document["id"]: i for i, document in enumerate(plan["ranked"])}
+                    plan["selection_units"].sort(
+                        key=lambda unit: min(positions[identity] for identity in unit)
+                    )
             if ranking.settings.get("trace", False):
                 from ..diagnostics import record_recall_trace
                 from ..recall_trace import build
@@ -1048,7 +1088,11 @@ def _select_evidence(service, db, request, frame, prepared):
         result_ids, omissions, missing_time = [], list(plan.get("selection_omissions", ())), 0
         chosen_documents = set()
         witness_ids = [entry[0]["id"] for entry in domain["witnesses"]]
-        for documents in _selection_units(frame, plan, context_mode=contextual(request)):
+        from .merge import fit_order
+
+        for documents in fit_order(
+            _selection_units(frame, plan, context_mode=contextual(request)), request["limits"]
+        ):
             batches = [
                 fact_evidence(frame, document["group_id"])
                 if document["kind"] != "episode"
@@ -1171,6 +1215,9 @@ def assemble(service, db, request, context, frame, prepared):
         if ranking is not None and ranking.trace is not None:
             ranking.trace.update(
                 selected_ids=sorted(selected), truncation_reasons=result["omissions"]
+            )
+            ranking.trace["distinct_subjects"] = len(
+                {document["scope"] for document in plan["documents"] if document["id"] in selected}
             )
     bundle = make_bundle(service, db, request, context, frame, evidence, constraints)
     size = len(canonical(evidence).encode()) if evidence else 0
