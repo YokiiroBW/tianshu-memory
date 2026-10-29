@@ -464,6 +464,9 @@ class SegmentMaterials:
                 for row in candidates:
                     if row["source_ref"] in known_refs or row["source_ref"] in selected:
                         continue
+                    if not row["text"]:
+                        omitted = True
+                        continue
                     if len(native_counts[row["event_id"]]) != 1:
                         omitted = True
                         continue
@@ -585,6 +588,10 @@ class SegmentMaterials:
                     require(binding is not None, "dependency_unavailable", 503)
                     scope = dict(frame, person_id=binding["person_id"])
                     authorize(publisher, scope)
+                    # Keep the original archive, but a message without text is
+                    # not a learning material or a zero-byte response item.
+                    if not event["text"]:
+                        continue
                     material_id = identity(
                         frame["actor_id"],
                         proof["channel"],
@@ -637,6 +644,8 @@ class SegmentMaterials:
     def _observations(self, request, publisher, *, expected_actor=None):
         service = self.service
         staged = self._stage_observations(request, publisher, expected_actor=expected_actor)
+        if not staged:
+            return []
         scopes = list(dict.fromkeys(item["scope"] for item in staged))
         requirements = [
             dict(

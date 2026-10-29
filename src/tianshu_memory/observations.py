@@ -27,6 +27,7 @@ class PlatformVerifier:
         self.pool.close()
 
     def __call__(self, request):
+        response = None
         try:
             config = strict_json(self.config_path.read_bytes())["observation_source"]
             url, token = config["verify_url"], config["verify_token"]
@@ -63,9 +64,13 @@ class PlatformVerifier:
                 if isinstance(denied, dict) and denied.get("code") == "scope_changed":
                     raise Fault("scope_changed", 409)
             require(
-                response.status_code == 200
-                and len(response.content) <= response_limit
-                and response.headers.get("content-type", "").split(";", 1)[0] == "application/json",
+                response.status_code == 200,
+                "dependency_unavailable",
+                503,
+            )
+            require(len(response.content) <= response_limit, "dependency_unavailable", 503)
+            require(
+                response.headers.get("content-type", "").split(";", 1)[0] == "application/json",
                 "dependency_unavailable",
                 503,
             )
@@ -76,6 +81,11 @@ class PlatformVerifier:
                 503,
             )
             return result
+        except Fault as error:
+            error.source_owner = "platform"
+            if response is not None:
+                error.source_http_status = response.status_code
+            raise
         except (OSError, ValueError, KeyError, TypeError, httpx.HTTPError, ssl.SSLError):
             raise Fault("dependency_unavailable", 503) from None
 

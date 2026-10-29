@@ -639,6 +639,19 @@ class Segments:
                     _prepare_target(service, db, target, used, history_budget)
                     for target in event["targets"]
                 ]
+                # Earlier seals could include empty optional archive context.
+                # No valid model window exists yet: omit only those members
+                # before freezing the first batch, retaining the original job,
+                # new-member coverage and complete source dependency checks.
+                new_members = {
+                    identity for target in targets for identity in target["new_member_ids"]
+                }
+                members = [
+                    member
+                    for member in event["members"]
+                    if member["text"] or member["member_id"] in new_members
+                ]
+                omitted_empty_context = len(members) != len(event["members"])
                 # All historical raw supplied to any target is part of this
                 # one model input, even if no output later cites that history.
                 complete = {
@@ -657,9 +670,12 @@ class Segments:
                     schema_version=6,
                     segment_id=event["segment_id"],
                     frame=event["frame"],
-                    members=event["members"],
+                    members=members,
                     targets=targets,
-                    coverage=dict(complete_new=True, omitted_context=event["omitted_context"]),
+                    coverage=dict(
+                        complete_new=True,
+                        omitted_context=event["omitted_context"] or omitted_empty_context,
+                    ),
                 )
                 manifest["window_id"] = fingerprint(
                     {key: value for key, value in manifest.items() if key != "schema_version"}

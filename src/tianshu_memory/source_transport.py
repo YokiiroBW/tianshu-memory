@@ -121,7 +121,12 @@ class SourceTransport:
                     },
                     content=body,
                 ) as response:
-                    require(response.status_code == 200, "dependency_unavailable", 503)
+                    if response.status_code != 200:
+                        error = Fault("dependency_unavailable", 503)
+                        error.source_owner = owner
+                        error.source_operation = schema
+                        error.source_http_status = response.status_code
+                        raise error
                     require(
                         response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
                         == "application/json"
