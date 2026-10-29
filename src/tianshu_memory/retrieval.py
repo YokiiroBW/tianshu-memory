@@ -8,7 +8,7 @@ from collections import OrderedDict
 from contextlib import closing
 
 from .domain import canonical, require
-from .retrieval_vectors import vectors
+from .retrieval_vectors import dot, pack, unpack, vectors
 
 
 def policy(value):
@@ -143,7 +143,7 @@ class Retrieval:
                     "embed",
                     {"revision": revision, "texts": [texts[identity] for identity, _ in batch]},
                 )
-                computed = vectors(answer["vectors"], len(batch))
+                computed = [pack(value) for value in vectors(answer["vectors"], len(batch))]
                 cached.update((key, vector) for (_, key), vector in zip(batch, computed))
                 # Keep completed batches even if this cold query reaches its deadline.
                 with self.lock:
@@ -157,7 +157,7 @@ class Retrieval:
                 call("embed", {"revision": revision, "texts": [query]})["vectors"], 1
             )[0]
             require(
-                all(len(cached[key]) == len(query_vector) for key in keys),
+                all(len(cached[key]) == len(query_vector) * 4 for key in keys),
                 "dependency_unavailable",
                 503,
             )
@@ -167,7 +167,7 @@ class Retrieval:
                 while len(self.cache) > 4096:
                     self.cache.popitem(last=False)
             scores = {
-                identity: sum(a * b for a, b in zip(cached[key], query_vector))
+                identity: dot(unpack(cached[key]), query_vector)
                 for identity, key in zip(ids, keys)
             }
             semantic = sorted(ids, key=lambda identity: (-scores[identity], identity))[:limit]

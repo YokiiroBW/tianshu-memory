@@ -22,7 +22,7 @@ CREATE INDEX IF NOT EXISTS memory_document_group ON memory_documents(group_id);
 CREATE INDEX IF NOT EXISTS memory_document_source ON memory_documents(source_key);
 CREATE TABLE IF NOT EXISTS memory_vectors (
  document_id TEXT NOT NULL, content_hash TEXT NOT NULL, embedding_revision TEXT NOT NULL,
- dimension INTEGER NOT NULL, vector TEXT NOT NULL,
+ dimension INTEGER NOT NULL, vector TEXT NOT NULL, vector_bytes BLOB,
  PRIMARY KEY(document_id,content_hash,embedding_revision));
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_episode_index USING fts5(document_id UNINDEXED,scope UNINDEXED,text);
 """
@@ -84,6 +84,7 @@ def migrate(store, backup_path):
                 f"CREATE TRIGGER source_revision_fact_subjects_{action} AFTER {action} ON fact_subjects BEGIN UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'; END"
             )
         db.execute("UPDATE metadata SET value='3' WHERE key='automatic_fact_schema'")
+        db.execute("INSERT OR IGNORE INTO metadata VALUES ('memory_retrieval_schema','1')")
         consolidation_migration.install(db)
         db.execute("UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'")
         require(

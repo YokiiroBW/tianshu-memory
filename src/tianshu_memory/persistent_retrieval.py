@@ -6,7 +6,8 @@ from contextlib import closing, nullcontext
 from dataclasses import dataclass
 
 from .domain import Fault, canonical, require
-from .retrieval_vectors import vectors
+from .retrieval_migration import installed as binary_installed
+from .retrieval_vectors import dot, pack, unpack, vectors
 
 
 @dataclass(frozen=True)
@@ -62,17 +63,22 @@ def prepare(db, documents, lexical_ids, settings, *, query_vector=None):
     by_id = {item["id"]: item for item in documents}
     available, corrupted = {}, []
     if settings["mode"] != "keyword" and documents:
+        binary_column = "vector_bytes" if binary_installed(db) else "NULL AS vector_bytes"
         for offset in range(0, len(documents), 256):
             batch = documents[offset : offset + 256]
             for row in db.execute(
-                "SELECT document_id,content_hash,vector FROM memory_vectors WHERE embedding_revision=? AND document_id IN ("
+                f"SELECT document_id,content_hash,vector,{binary_column} FROM memory_vectors WHERE embedding_revision=? AND document_id IN ("
                 + ",".join("?" for _ in batch)
                 + ")",
                 [settings["embedding_revision"], *[item["id"] for item in batch]],
             ):
                 if row["content_hash"] == by_id[row["document_id"]]["content_hash"]:
                     try:
-                        available[row["document_id"]] = vectors([json.loads(row["vector"])], 1)[0]
+                        available[row["document_id"]] = (
+                            unpack(row["vector_bytes"])
+                            if row["vector_bytes"] is not None
+                            else vectors([json.loads(row["vector"])], 1)[0]
+                        )
                     except (Fault, ValueError, TypeError):
                         corrupted.append(
                             (
@@ -80,6 +86,7 @@ def prepare(db, documents, lexical_ids, settings, *, query_vector=None):
                                 row["content_hash"],
                                 settings["embedding_revision"],
                                 row["vector"],
+                                row["vector_bytes"],
                             )
                         )
     return PreparedRanking(
@@ -95,10 +102,14 @@ def prepare(db, documents, lexical_ids, settings, *, query_vector=None):
 
 def discard_corrupt(db, plan):
     if plan.corrupted:
-        db.executemany(
-            "DELETE FROM memory_vectors WHERE document_id=? AND content_hash=? AND embedding_revision=? AND vector=?",
-            plan.corrupted,
-        )
+        sql = "DELETE FROM memory_vectors WHERE document_id=? AND content_hash=? AND embedding_revision=? AND vector=?"
+        if binary_installed(db):
+            db.executemany(
+                sql + " AND (vector_bytes=? OR (vector_bytes IS NULL AND ? IS NULL))",
+                [(*row, row[-1]) for row in plan.corrupted],
+            )
+        else:
+            db.executemany(sql, [row[:4] for row in plan.corrupted])
 
 
 def rank(retrieval, store, query, documents, lexical_ids, settings, *, deadline=None):
@@ -167,10 +178,7 @@ def _rank_prepared(retrieval, store, query, plan, *, deadline=None):
                 "dependency_unavailable",
                 503,
             )
-            scores = {
-                identity: sum(left * right for left, right in zip(value, vector, strict=True))
-                for identity, vector in available.items()
-            }
+            scores = {identity: dot(value, vector) for identity, vector in available.items()}
         except (Fault, OSError, TimeoutError, ValueError, TypeError, KeyError):
             return [by_id[identity] for identity in lexical_ids], False
     semantic = sorted(scores, key=lambda identity: (-scores[identity], identity))[:limit]
@@ -236,8 +244,23 @@ def write(db, document, revision, vector):
     if current is None or current[0] != document["content_hash"]:
         return False
     value = vectors([list(vector)], 1)[0]
+    if binary_installed(db):
+        db.execute(
+            "INSERT INTO memory_vectors(document_id,content_hash,embedding_revision,dimension,vector,vector_bytes) "
+            "VALUES (?,?,?,?,?,?) ON CONFLICT(document_id,content_hash,embedding_revision) "
+            "DO UPDATE SET vector=excluded.vector,vector_bytes=excluded.vector_bytes,dimension=excluded.dimension",
+            (
+                document["id"],
+                document["content_hash"],
+                revision,
+                len(value),
+                canonical(value),
+                pack(value),
+            ),
+        )
+        return True
     db.execute(
-        "INSERT INTO memory_vectors VALUES (?,?,?,?,?) ON CONFLICT(document_id,content_hash,embedding_revision) DO NOTHING",
+        "INSERT INTO memory_vectors(document_id,content_hash,embedding_revision,dimension,vector) VALUES (?,?,?,?,?) ON CONFLICT(document_id,content_hash,embedding_revision) DO NOTHING",
         (document["id"], document["content_hash"], revision, len(value), canonical(value)),
     )
     return True

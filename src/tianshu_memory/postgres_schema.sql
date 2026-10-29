@@ -353,7 +353,7 @@ CREATE INDEX IF NOT EXISTS memory_document_group ON memory_documents(group_id);
 CREATE INDEX IF NOT EXISTS memory_document_source ON memory_documents(source_key);
 CREATE TABLE IF NOT EXISTS memory_vectors (
  document_id TEXT NOT NULL, content_hash TEXT NOT NULL, embedding_revision TEXT NOT NULL,
- dimension BIGINT NOT NULL, vector TEXT NOT NULL,
+ dimension BIGINT NOT NULL, vector TEXT NOT NULL, vector_bytes BYTEA,
  PRIMARY KEY(document_id,content_hash,embedding_revision));
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS extraction_schema BIGINT;
 CREATE TABLE IF NOT EXISTS memory_episode_index (document_id TEXT,scope TEXT,text TEXT);

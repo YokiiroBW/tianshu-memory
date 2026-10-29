@@ -244,7 +244,16 @@ class Store:
         for table in installed_tables(db):
             cursor = db.execute(f"SELECT * FROM {table}")
             names = [c[0] for c in cursor.description]
-            snapshot["tables"][table] = {"columns": names, "rows": [list(r) for r in cursor]}
+            # Binary vectors are a rebuildable copy of the retained JSON column.
+            # Keep backups JSON-compatible and independently restorable without a codec.
+            rows = [
+                [
+                    None if table == "memory_vectors" and name == "vector_bytes" else value
+                    for name, value in zip(names, row, strict=True)
+                ]
+                for row in cursor
+            ]
+            snapshot["tables"][table] = {"columns": names, "rows": rows}
         from .source_recovery import checkpoint
 
         snapshot["guard"] = checkpoint(db)
@@ -385,6 +394,11 @@ class Store:
 
     def migrate_context(self, backup_path):
         from .memory_context.migration import migrate
+
+        return migrate(self, backup_path)
+
+    def migrate_retrieval(self, backup_path):
+        from .retrieval_migration import migrate
 
         return migrate(self, backup_path)
 

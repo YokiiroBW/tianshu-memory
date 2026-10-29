@@ -146,7 +146,8 @@ def test_partial_corrupt_and_empty_index_keep_coverage_semantics(sync, state):
             db.execute("DELETE FROM memory_vectors WHERE document_id=?", (identity,))
         elif state == "corrupt":
             db.execute(
-                "UPDATE memory_vectors SET vector='broken-vector' WHERE document_id=?", (identity,)
+                "UPDATE memory_vectors SET vector_bytes=? WHERE document_id=?",
+                (b"broken-vector", identity),
             )
         elif state == "missing":
             db.execute("DELETE FROM memory_vectors")

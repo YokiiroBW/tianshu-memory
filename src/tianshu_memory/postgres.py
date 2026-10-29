@@ -239,9 +239,15 @@ def dialect(db, sql, parameters):
 def _rows_digest(rows):
     digest = hashlib.sha256()
     for row in rows:
-        digest.update(canonical(list(row)).encode())
+        digest.update(_row_key(row).encode())
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _row_key(row):
+    return canonical(
+        [{"binary_hex": bytes(v).hex()} if isinstance(v, (bytes, memoryview)) else v for v in row]
+    )
 
 
 def _migrate_row(db, table, columns, values):
@@ -379,8 +385,8 @@ def prepare(db, source, *, files, recovery_path, state_directory, epoch):
                 ).fetchall()
                 # Compare the complete transformed rows, not merely counts. Sorting is in
                 # Python too so database collation cannot make equivalent imports disagree.
-                if _rows_digest(sorted(rows, key=canonical)) != _rows_digest(
-                    sorted((tuple(r) for r in copied), key=canonical)
+                if _rows_digest(sorted(rows, key=_row_key)) != _rows_digest(
+                    sorted((tuple(r) for r in copied), key=_row_key)
                 ):
                     raise ValueError("Memory PostgreSQL import validation failed")
     else:

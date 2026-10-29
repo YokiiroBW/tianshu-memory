@@ -86,6 +86,10 @@ def main():
         help="Stop writers; upgrade typed facts, episodes and derived retrieval with backup",
     )
     migrate_memory.add_argument("--backup", required=True)
+    migrate_retrieval = sub.add_parser(
+        "migrate-retrieval", help="Stop writers; add binary vectors with paired backup"
+    )
+    migrate_retrieval.add_argument("--backup", required=True)
     migrate_segments = sub.add_parser(
         "migrate-segments", help="Stop writers; add bounded multi-person jobs with guarded backup"
     )
@@ -145,6 +149,7 @@ def run_local_operation(args, parser):
         "migrate-source-lookup",
         "migrate-facts",
         "migrate-memory",
+        "migrate-retrieval",
         "migrate-segments",
     }:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
@@ -165,6 +170,8 @@ def run_local_operation(args, parser):
                 result = store.migrate_facts(args.backup)
             elif args.operation == "migrate-memory":
                 result = store.migrate_memory(args.backup)
+            elif args.operation == "migrate-retrieval":
+                result = store.migrate_retrieval(args.backup)
             elif args.operation == "migrate-segments":
                 result = store.migrate_segments(args.backup)
             elif args.operation == "migrate-context":
