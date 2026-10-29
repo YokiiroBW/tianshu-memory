@@ -318,6 +318,9 @@ def write(db, document, revision, vector):
                 pack(value),
             ),
         )
+        from .merge_candidates import mark_vector
+
+        mark_vector(db, document, revision, value)
         return True
     db.execute(
         "INSERT INTO memory_vectors(document_id,content_hash,embedding_revision,dimension,vector) VALUES (?,?,?,?,?) ON CONFLICT(document_id,content_hash,embedding_revision) DO NOTHING",

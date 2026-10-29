@@ -62,6 +62,9 @@ class RetrievalTransport:
                         require(len(raw) <= 8 * 1024 * 1024, "dependency_unavailable", 503)
                     answer = strict_json(raw)
                     require(isinstance(answer, dict), "dependency_unavailable", 503)
+                    if operation == "settings" and "trace" in config:
+                        require(type(config["trace"]) is bool, "dependency_unavailable", 503)
+                        answer["trace"] = config["trace"]
                     return answer
         except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError):
             raise Fault("dependency_unavailable", 503) from None

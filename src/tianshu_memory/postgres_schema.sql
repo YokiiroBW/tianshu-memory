@@ -359,6 +359,11 @@ CREATE TABLE IF NOT EXISTS memory_recall_documents (group_id TEXT PRIMARY KEY, t
 CREATE TABLE IF NOT EXISTS memory_target_rotation (
  scope TEXT PRIMARY KEY, person_id TEXT NOT NULL, last_covered_at TEXT NOT NULL,
  covered_count BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS memory_merge_candidates (
+ new_group_id TEXT NOT NULL, prior_group_id TEXT NOT NULL, embedding_revision TEXT NOT NULL,
+ new_hash TEXT NOT NULL, prior_hash TEXT NOT NULL, score DOUBLE PRECISION NOT NULL,
+ created_at TEXT NOT NULL, PRIMARY KEY(new_group_id,prior_group_id,embedding_revision));
+CREATE INDEX IF NOT EXISTS memory_merge_prior ON memory_merge_candidates(prior_group_id,new_group_id);
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS extraction_schema BIGINT;
 CREATE TABLE IF NOT EXISTS memory_episode_index (document_id TEXT,scope TEXT,text TEXT);
 CREATE INDEX IF NOT EXISTS memory_episode_index_terms ON memory_episode_index USING gin(to_tsvector('simple',text));

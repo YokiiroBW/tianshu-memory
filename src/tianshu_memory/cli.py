@@ -98,6 +98,10 @@ def main():
         "migrate-rotation", help="Stop writers; add derived target coverage with backup"
     )
     migrate_rotation.add_argument("--backup", required=True)
+    migrate_merge = sub.add_parser(
+        "migrate-merge-candidates", help="Stop writers; add derived duplicate hints with backup"
+    )
+    migrate_merge.add_argument("--backup", required=True)
     migrate_segments = sub.add_parser(
         "migrate-segments", help="Stop writers; add bounded multi-person jobs with guarded backup"
     )
@@ -160,6 +164,7 @@ def run_local_operation(args, parser):
         "migrate-retrieval",
         "migrate-partitions",
         "migrate-rotation",
+        "migrate-merge-candidates",
         "migrate-segments",
     }:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
@@ -186,6 +191,8 @@ def run_local_operation(args, parser):
                 result = store.migrate_partitions(args.backup)
             elif args.operation == "migrate-rotation":
                 result = store.migrate_rotation(args.backup)
+            elif args.operation == "migrate-merge-candidates":
+                result = store.migrate_merge_candidates(args.backup)
             elif args.operation == "migrate-segments":
                 result = store.migrate_segments(args.backup)
             elif args.operation == "migrate-context":

@@ -617,6 +617,30 @@ class Segments:
                     )
                 return self._invalidated(job["id"], batch)
 
+    def hints(self, request, publisher):
+        require(set(request) == {"job_id", "batch_ref"}, "invalid_input", 400)
+        require(
+            all(isinstance(value, str) and 1 <= len(value) <= 256 for value in request.values()),
+            "invalid_input",
+            400,
+        )
+        with self.service.store.transaction() as db:
+            _, event = self._job(db, request["job_id"], publisher)
+        with self._operation(event, request["job_id"]) as db:
+            self._job(db, request["job_id"], publisher)
+            batch = db.execute(
+                "SELECT manifest FROM memory_batches WHERE job_id=? AND id=?",
+                (request["job_id"], request["batch_ref"]),
+            ).fetchone()
+            require(batch is not None, "not_found", 404)
+            from .merge_candidates import for_window
+
+            return dict(
+                job_id=request["job_id"],
+                batch_ref=request["batch_ref"],
+                merge_candidates=for_window(self.service, db, json.loads(batch[0])),
+            )
+
     def _process(self, request, publisher, event):
         service = self.service
         with self._operation(event, request["job_id"]) as db:
@@ -819,7 +843,7 @@ class Segments:
                         ],
                     )
                 ]
-                _, created, expiry = segment_records.write(
+                created_group, created, expiry = segment_records.write(
                     service,
                     db,
                     batch,
@@ -829,6 +853,9 @@ class Segments:
                     list(source_rows.values()),
                     refs=refs,
                 )
+                from .merge_candidates import mark_exact
+
+                mark_exact(db, created_group)
                 memory_refs.extend(created)
                 for row in actual_rows:
                     retained_keys.add(row["key"])

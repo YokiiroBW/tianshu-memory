@@ -1277,6 +1277,7 @@ class Diagnostics:
         "token_env",
         "writer",
         "environ",
+        "recall_traces",
     )
 
     def __init__(
@@ -1559,6 +1560,24 @@ class Diagnostics:
         """
         app.state.diagnostics = self
         app.state.__dict__[HOOK_NAME] = Hooks(self)
+
+        @app.get("/internal/v1/diagnostics/recall-traces")
+        async def recall_traces(request: Request):
+            from .runtime_probes import present_token
+
+            state = present_token(request, self)
+            if state != "ok":
+                return JSONResponse(
+                    {
+                        "code": "unauthorized"
+                        if state == "unauthorized"
+                        else "dependency_unavailable"
+                    },
+                    status_code=401 if state == "unauthorized" else 503,
+                    headers=dict(NO_STORE),
+                )
+            return JSONResponse({"traces": list(self.recall_traces)}, headers=dict(NO_STORE))
+
         middleware = self._middleware()
 
         @app.middleware("http")

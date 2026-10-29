@@ -412,6 +412,11 @@ class Store:
 
         return migrate(self, backup_path)
 
+    def migrate_merge_candidates(self, backup_path):
+        from .merge_candidates import migrate
+
+        return migrate(self, backup_path)
+
     def migrate_qq_aliases(self, backup_path):
         from .qq_alias_migration import migrate
 

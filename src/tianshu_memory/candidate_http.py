@@ -44,6 +44,7 @@ def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
     @app.post("/internal/v1/memory/candidates/process")
     @app.post("/internal/v1/memory/candidates/materials")
     @app.post("/internal/v1/memory/candidates/segments")
+    @app.post("/internal/v1/memory/candidates/hints")
     async def process(request: Request):
         lease = None
         diagnostic = None
@@ -100,6 +101,8 @@ def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
                         return Segments(service).seal(payload, publisher)
                     from .segments import Segments
 
+                    if request.url.path.endswith("/hints"):
+                        return Segments(service).hints(payload, publisher)
                     require(payload.get("extraction_schema") == 6, "invalid_input", 400)
                     return Segments(service).execute(payload, publisher)
 
