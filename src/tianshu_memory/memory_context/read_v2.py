@@ -3,6 +3,7 @@
 import copy
 import json
 import time
+from dataclasses import replace
 from datetime import timedelta
 
 from .. import automatic_facts, canonical_facts, consolidation_sources, memory_documents
@@ -23,6 +24,7 @@ from . import targets
 from .authorization import authorized_scopes
 from .history import history_version
 from .migration import identity_version
+from .partition import candidate_limit, documents_by_owner, interleave, partition
 from .read_bundle import (
     contextual,
     operation,
@@ -235,19 +237,29 @@ def prepare_query(service, db, frame, subquery, selection, *, context_mode=False
         candidates = [entry for entry in candidates if applies(entry)]
         contextual = [entry for entry in contextual if applies(entry)]
     candidates.extend(contextual)
-    lexical = (
-        service._rank_groups(
-            db,
-            candidates,
-            query_terms(subquery["text"], legacy_hints=not context_mode),
-            subquery["text"],
-            fact_snapshot=frame["snapshot"],
-            authorized_group_ids=frozenset(frame["group_map"]),
-            context_mode=context_mode,
-        )
-        if "facts" in subquery["kinds"]
-        else []
+    per_owner_ranked = (
+        {
+            owner: service._rank_groups(
+                db,
+                entries,
+                query_terms(subquery["text"], legacy_hints=not context_mode),
+                subquery["text"],
+                fact_snapshot=frame["snapshot"],
+                authorized_group_ids=frozenset(frame["group_map"]),
+                context_mode=context_mode,
+            )
+            for owner, entries in partition(candidates).items()
+        }
+        if "facts" in subquery["kinds"] and not context_mode
+        else {}
     )
+    if context_mode and "facts" in subquery["kinds"]:
+        from ..partition_index import rank as rank_partitions
+
+        per_owner_ranked = rank_partitions(
+            db, partition(candidates), query_terms(subquery["text"], legacy_hints=False)
+        )
+    lexical = interleave(per_owner_ranked)
     episode_ids = {
         row["id"]
         for row in memory_documents.eligible_episodes(service, db, domain["episodes"], subquery)
@@ -289,6 +301,7 @@ def prepare_query(service, db, frame, subquery, selection, *, context_mode=False
         domain=domain,
         documents=documents,
         lexical_ids=lexical_ids,
+        context_mode=context_mode,
         reference_incomplete=not context_mode
         and targets.unresolved_reference(subquery["text"], domain["resolution"]),
     )
@@ -789,6 +802,7 @@ def execute(application, request, context):
                     query_vector=query_vectors[plan["subquery"]["query_id"]],
                     summaries=frame["summaries"],
                     now=service.clock(),
+                    partitioned=True,
                 )
                 if settings
                 else None
@@ -893,7 +907,7 @@ def document_binding(frame, document):
 
 
 def rank_plans(service, prepared, backend_failed):
-    from ..persistent_retrieval import rank_prepared
+    from ..persistent_retrieval import PreparedQueryVector, embed_query, rank_prepared
 
     retrieval_deadline = (
         time.monotonic() + 8
@@ -905,14 +919,65 @@ def rank_plans(service, prepared, backend_failed):
         plan["ranked"] = [by_id[identity] for identity in plan["lexical_ids"] if identity in by_id]
         plan["index_complete"] = not backend_failed
         if plan["ranking"] is not None:
-            plan["ranked"], plan["index_complete"] = rank_prepared(
-                service.retrieval,
-                service.store,
-                plan["subquery"]["text"],
-                plan["ranking"],
-                deadline=retrieval_deadline,
-                query_id=plan["subquery"]["query_id"],
-            )
+            ranking = plan["ranking"]
+            partitions = documents_by_owner(plan["documents"])
+            limit = candidate_limit(ranking.settings["candidates"], len(partitions))
+            if len(partitions) > 1 and ranking.available and ranking.query_vector is None:
+                try:
+                    value = embed_query(
+                        service.retrieval,
+                        plan["subquery"]["text"],
+                        ranking.settings,
+                        retrieval_deadline,
+                    )
+                except (Fault, OSError, TimeoutError, ValueError, TypeError, KeyError):
+                    value = None
+                ranking.query_vector = PreparedQueryVector(
+                    plan["subquery"]["text"], canonical(ranking.settings), value
+                )
+            ranked, complete = {}, True
+            for owner, documents in partitions.items():
+                identities = {document["id"] for document in documents}
+                owned = replace(
+                    ranking,
+                    by_id={identity: by_id[identity] for identity in identities},
+                    document_count=len(documents),
+                    lexical_ids=[
+                        identity for identity in ranking.lexical_ids if identity in identities
+                    ],
+                    available={
+                        identity: value
+                        for identity, value in ranking.available.items()
+                        if identity in identities
+                    },
+                    corrupted=[row for row in ranking.corrupted if row[0] in identities],
+                    trace=None,
+                )
+                ranked[owner], current = rank_prepared(
+                    service.retrieval,
+                    service.store,
+                    plan["subquery"]["text"],
+                    owned,
+                    deadline=retrieval_deadline,
+                    query_id=plan["subquery"]["query_id"],
+                    limit=limit,
+                )
+                complete &= current
+            plan["per_owner_ranked"] = ranked
+            plan["ranked"] = interleave(ranked)
+            plan["index_complete"] = complete and not backend_failed
+            if ranking.settings.get("trace", False):
+                from ..diagnostics import record_recall_trace
+                from ..recall_trace import build
+
+                ranking.trace = build(
+                    plan["subquery"]["query_id"], ranking, plan["ranked"], plan["index_complete"]
+                )
+                ranking.trace["owners"] = len(partitions)
+                record_recall_trace(ranking.trace)
+        else:
+            plan["per_owner_ranked"] = documents_by_owner(plan["ranked"])
+            plan["ranked"] = interleave(plan["per_owner_ranked"])
 
 
 def _summary_selection_key(frame, document):

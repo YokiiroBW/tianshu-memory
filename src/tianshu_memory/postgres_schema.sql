@@ -355,6 +355,7 @@ CREATE TABLE IF NOT EXISTS memory_vectors (
  document_id TEXT NOT NULL, content_hash TEXT NOT NULL, embedding_revision TEXT NOT NULL,
  dimension BIGINT NOT NULL, vector TEXT NOT NULL, vector_bytes BYTEA,
  PRIMARY KEY(document_id,content_hash,embedding_revision));
+CREATE TABLE IF NOT EXISTS memory_recall_documents (group_id TEXT PRIMARY KEY, terms TEXT NOT NULL);
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS extraction_schema BIGINT;
 CREATE TABLE IF NOT EXISTS memory_episode_index (document_id TEXT,scope TEXT,text TEXT);
 CREATE INDEX IF NOT EXISTS memory_episode_index_terms ON memory_episode_index USING gin(to_tsvector('simple',text));

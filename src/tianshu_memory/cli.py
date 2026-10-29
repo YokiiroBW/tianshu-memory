@@ -90,6 +90,10 @@ def main():
         "migrate-retrieval", help="Stop writers; add binary vectors with paired backup"
     )
     migrate_retrieval.add_argument("--backup", required=True)
+    migrate_partitions = sub.add_parser(
+        "migrate-partitions", help="Stop writers; index owner recall terms with backup"
+    )
+    migrate_partitions.add_argument("--backup", required=True)
     migrate_segments = sub.add_parser(
         "migrate-segments", help="Stop writers; add bounded multi-person jobs with guarded backup"
     )
@@ -150,6 +154,7 @@ def run_local_operation(args, parser):
         "migrate-facts",
         "migrate-memory",
         "migrate-retrieval",
+        "migrate-partitions",
         "migrate-segments",
     }:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
@@ -172,6 +177,8 @@ def run_local_operation(args, parser):
                 result = store.migrate_memory(args.backup)
             elif args.operation == "migrate-retrieval":
                 result = store.migrate_retrieval(args.backup)
+            elif args.operation == "migrate-partitions":
+                result = store.migrate_partitions(args.backup)
             elif args.operation == "migrate-segments":
                 result = store.migrate_segments(args.backup)
             elif args.operation == "migrate-context":

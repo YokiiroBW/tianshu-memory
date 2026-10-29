@@ -13,6 +13,20 @@ def installed(db):
     return row is not None and row[0] == "1"
 
 
+def backup_before(store, db, backup_path):
+    backup = Path(backup_path).resolve()
+    if str(backup).startswith("\\\\") or backup in {Path(store.path), store.recovery_path}:
+        raise ValueError("Backup must be a distinct local file")
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    with backup.open("xb"):
+        pass
+    store.backup(backup, db=db)
+    guard = backup.with_name(backup.name + ".source-guard.json")
+    with guard.open("xb") as output:
+        output.write(store.recovery_path.read_bytes())
+    return backup, guard
+
+
 def migrate(store, backup_path):
     backup = Path(backup_path).resolve()
     if str(backup).startswith("\\\\") or backup in {Path(store.path), store.recovery_path}:
@@ -26,13 +40,7 @@ def migrate(store, backup_path):
         )
         if installed(db):
             return {"memory_retrieval_schema": 1, "already_installed": True}
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        with backup.open("xb"):
-            pass
-        store.backup(backup, db=db)
-        guard = backup.with_name(backup.name + ".source-guard.json")
-        with guard.open("xb") as output:
-            output.write(store.recovery_path.read_bytes())
+        backup, guard = backup_before(store, db, backup_path)
         if is_postgres(db):
             db.native("ALTER TABLE memory_vectors ADD COLUMN IF NOT EXISTS vector_bytes BYTEA")
         elif "vector_bytes" not in {

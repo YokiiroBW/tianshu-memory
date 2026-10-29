@@ -62,7 +62,17 @@ class PreparedRanking:
         )
 
 
-def prepare(db, documents, lexical_ids, settings, *, query_vector=None, summaries=None, now=None):
+def prepare(
+    db,
+    documents,
+    lexical_ids,
+    settings,
+    *,
+    query_vector=None,
+    summaries=None,
+    now=None,
+    partitioned=False,
+):
     """Read the existing vectors without calling a backend or opening another transaction."""
     by_id = {item["id"]: item for item in documents}
     available, corrupted = {}, []
@@ -96,7 +106,9 @@ def prepare(db, documents, lexical_ids, settings, *, query_vector=None, summarie
     return PreparedRanking(
         by_id,
         len(documents),
-        [identity for identity in lexical_ids if identity in by_id][: settings["candidates"]],
+        [identity for identity in lexical_ids if identity in by_id][
+            : None if partitioned else settings["candidates"]
+        ],
         settings,
         available,
         corrupted,
@@ -133,8 +145,8 @@ def rank(retrieval, store, query, documents, lexical_ids, settings, *, deadline=
     return rank_prepared(retrieval, store, query, plan, deadline=deadline)
 
 
-def rank_prepared(retrieval, store, query, plan, *, deadline=None, query_id=None):
-    result, complete = _rank_prepared(retrieval, store, query, plan, deadline=deadline)
+def rank_prepared(retrieval, store, query, plan, *, deadline=None, query_id=None, limit=None):
+    result, complete = _rank_prepared(retrieval, store, query, plan, deadline=deadline, limit=limit)
     if plan.settings.get("trace", False):
         from .diagnostics import record_recall_trace
         from .recall_trace import build
@@ -144,12 +156,27 @@ def rank_prepared(retrieval, store, query, plan, *, deadline=None, query_id=None
     return result, complete
 
 
-def _rank_prepared(retrieval, store, query, plan, *, deadline=None):
+def embed_query(retrieval, query, settings, deadline):
+    require(time.monotonic() < deadline, "dependency_unavailable", 503)
+    query_method = getattr(retrieval.backend, "embed_query", None)
+    bounded_query = getattr(retrieval.backend, "embed_query_before", None)
+    response = (
+        bounded_query(query, settings["revision"], deadline)
+        if bounded_query
+        else query_method(query, settings["revision"])
+        if query_method
+        else retrieval.backend.call("embed", {"revision": settings["revision"], "texts": [query]})
+    )
+    return vectors(response["vectors"], 1)[0]
+
+
+def _rank_prepared(retrieval, store, query, plan, *, deadline=None, limit=None):
     """Use one prepared snapshot; callers release their authority transaction for external work."""
     if plan.external and deadline is None:
         deadline = time.monotonic() + 8
     by_id, available, settings = plan.by_id, plan.available, plan.settings
-    lexical_ids, limit = plan.lexical_ids, settings["candidates"]
+    limit = settings["candidates"] if limit is None else limit
+    lexical_ids = plan.lexical_ids[:limit]
     scores = {}
     if available:
         try:
@@ -166,19 +193,7 @@ def _rank_prepared(retrieval, store, query, plan, *, deadline=None):
                 # source boundary does not consume a second embedding budget.
                 value = prepared.vector
             else:
-                require(time.monotonic() < deadline, "dependency_unavailable", 503)
-                query_method = getattr(retrieval.backend, "embed_query", None)
-                bounded_query = getattr(retrieval.backend, "embed_query_before", None)
-                response = (
-                    bounded_query(query, settings["revision"], deadline)
-                    if bounded_query
-                    else query_method(query, settings["revision"])
-                    if query_method
-                    else retrieval.backend.call(
-                        "embed", {"revision": settings["revision"], "texts": [query]}
-                    )
-                )
-                value = vectors(response["vectors"], 1)[0]
+                value = embed_query(retrieval, query, settings, deadline)
             require(
                 all(len(vector) == len(value) for vector in available.values()),
                 "dependency_unavailable",

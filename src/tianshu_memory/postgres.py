@@ -36,6 +36,7 @@ SEGMENT_TABLES = {
     "memory_material_aliases",
 }
 DERIVED_TABLES = {"memory_documents", "memory_vectors", "memory_episode_index"}
+DERIVED_TABLES.add("memory_recall_documents")
 SEARCH_TABLES = {
     "search_index",
     "knowledge_index",
@@ -331,6 +332,11 @@ def prepare(db, source, *, files, recovery_path, state_directory, epoch):
         ).fetchone()
         if segment is None:
             required -= SEGMENT_TABLES
+        partition = db.native(
+            "SELECT value FROM metadata WHERE key='memory_partition_schema'"
+        ).fetchone()
+        if partition is None:
+            required.discard("memory_recall_documents")
         if not required <= installed:
             raise ValueError("PostgreSQL Memory schema is incomplete; authority tables missing")
         return

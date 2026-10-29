@@ -3,6 +3,7 @@
 import copy
 import json
 from contextlib import closing
+from datetime import timedelta
 
 import pytest
 from manual_memory_fixtures import initialize
@@ -11,7 +12,7 @@ from test_source_sync import source_contracts as source_contracts
 from test_source_sync import source_examples as source_examples
 from test_source_sync import sync as sync
 
-from tianshu_memory.domain import canonical, fingerprint
+from tianshu_memory.domain import canonical, fingerprint, utc
 
 
 def setup(h):
@@ -39,7 +40,7 @@ def setup(h):
     h.save()
 
 
-def candidate(h, text, serial=1, actor=0, *, reality="real", capture=True):
+def candidate(h, text, serial=1, actor=0, *, reality="real", capture=True, observed_at=None):
     physical, admission, grant = [
         copy.deepcopy(items[actor]) for items in (h.physicals, h.admissions, h.grants)
     ]
@@ -56,7 +57,9 @@ def candidate(h, text, serial=1, actor=0, *, reality="real", capture=True):
     content = dict(
         message_key=dict(physical["key"], revision=physical["revision"]),
         author=physical["author"],
-        sent_at=f"2026-10-11T00:00:{serial:02d}Z",
+        # A default candidate represents new input. Historical cases pass an
+        # explicit timestamp instead of depending on an expired fixed fixture day.
+        sent_at=observed_at or utc(h.service.clock() + timedelta(seconds=serial)),
         kind=physical["kind"],
         parts=[dict(kind="text", text=text)],
         reply_refs=[],

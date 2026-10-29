@@ -171,6 +171,9 @@ class _WorkflowBase:
         from .memory_documents import index_group
 
         index_group(db, unit["semantic_group_id"], fact_schema=fact_schema)
+        from .partition_index import refresh
+
+        refresh(db, unit["semantic_group_id"])
 
     def _publish_profile(self, db, draft, approval_ref, sources):
         scope = profiles.storage_scope(draft)
