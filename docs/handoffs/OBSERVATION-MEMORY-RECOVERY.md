@@ -9,3 +9,9 @@
 必要验证：新增群/私三组共 6 passed，包括空档案合法空回执且可重复、空上下文不污染、旧 job/event 不重封且原 ledger 只提交一次。相关来源撤回、冻结后遗忘及失效回执共 7 passed / 1 场景不适用 skipped。原实现先复现 4 failed；修复过程中空 bundle 的前提已在原入口处理，最终全部受影响新节点通过。ruff 选定规则/格式及 diff 检查通过。仅合成 SQLite/HTTPS owner，无模型/QQ/生产写入；没有执行全量或 PG 矩阵。
 
 部署后须核原 source_ref 的待交接自然转为已接受（空材料不等于新记忆），并用 Companion 既有受控恢复 API 对已证明从未发模型、停在 receipt 的原 job 做一次幂等恢复。原任务、batch/turn 标识和失败次数保持；任何未知发送或提交结果不盲重放。该真实业务恢复与外部模型结果只在发布后记录，不以本地夹具或健康代替。
+
+## 2026-10-30 余项诊断接续
+
+R29已部署并验证正常启动。原46来源44已交接，原恢复16 job中10确认resumed、9各提交一条，另外1个模型返回后proposal拒绝；6个receipt503和持续出现的无job capture仍待定位，未伪称全部恢复。
+
+候选在既有candidate内部错误响应补固定Python代码位置，以及source transport既有core/platform、固定operation与HTTP状态。无异常正文、聊天、URL或token，无接受规则、权限、DDL变化。仅business_started错误含诊断，认证前错误保持原样。新增4定向通过（含群/私聊真实本地HTTP与敏感文本排除）；初次HTTP测试误用了双重路径前缀404，修正夹具调用后通过，非产品故障。将与C一起作为R30诊断增量串行发布，不据此宣称503根因已修。

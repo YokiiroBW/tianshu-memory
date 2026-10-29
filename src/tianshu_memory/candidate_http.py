@@ -12,12 +12,41 @@ from .diagnostics import anote_authenticated, record_execution
 from .domain import Fault, require, strict_json
 
 
+def failure_location(error):
+    """Code locations and fixed peer labels only, never exception text or values."""
+    result = {}
+    trace = error.__traceback__
+    while trace is not None:
+        module = trace.tb_frame.f_globals.get("__name__", "")
+        function = trace.tb_frame.f_code.co_name
+        if module.startswith("tianshu_memory.") and (module, function) != (
+            "tianshu_memory.domain",
+            "require",
+        ):
+            result["site"] = f"{module}:{function}:{trace.tb_lineno}"
+        trace = trace.tb_next
+    if getattr(error, "source_owner", None) in {"core", "platform"}:
+        result["source_owner"] = error.source_owner
+    if getattr(error, "source_operation", None) in {
+        "facts",
+        "current_access",
+        "summary_window_check",
+        "segment_frame",
+    }:
+        result["source_operation"] = error.source_operation
+    status = getattr(error, "source_http_status", None)
+    if type(status) is int and 100 <= status <= 599:
+        result["source_http_status"] = status
+    return result
+
+
 def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
     @app.post("/internal/v1/memory/candidates/process")
     @app.post("/internal/v1/memory/candidates/materials")
     @app.post("/internal/v1/memory/candidates/segments")
     async def process(request: Request):
         lease = None
+        diagnostic = None
         try:
             require(service is not None and auth is not None, "dependency_unavailable", 503)
             lease = admission.claim()
@@ -79,20 +108,26 @@ def mount(app, service, auth, admission, *, body_timeout, execute_timeout):
             return JSONResponse(result, headers={"Cache-Control": "no-store"})
         except Fault as error:
             code, status = error.code, error.status
+            diagnostic = failure_location(error)
         except (TimeoutError, ClientDisconnect):
             code, status = "timeout", 408
-        except (ValidationError, ValueError, TypeError, KeyError):
+        except (ValidationError, ValueError, TypeError, KeyError) as error:
             code, status = "invalid_input", 400
-        except (OSError, sqlite3.Error):
+            diagnostic = failure_location(error)
+        except (OSError, sqlite3.Error) as error:
             code, status = "dependency_unavailable", 503
+            diagnostic = failure_location(error)
         finally:
             if lease is not None:
                 lease.finish()
+        body = dict(
+            code=code,
+            execution_state="unknown" if lease and lease.business_started else "not_started",
+        )
+        if diagnostic and lease and lease.business_started:
+            body["diagnostic"] = diagnostic
         return JSONResponse(
-            dict(
-                code=code,
-                execution_state="unknown" if lease and lease.business_started else "not_started",
-            ),
+            body,
             status_code=status,
             headers={"Cache-Control": "no-store"},
         )
