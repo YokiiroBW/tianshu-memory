@@ -909,6 +909,7 @@ def rank_plans(service, prepared, backend_failed):
                 plan["subquery"]["text"],
                 plan["ranking"],
                 deadline=retrieval_deadline,
+                query_id=plan["subquery"]["query_id"],
             )
 
 
@@ -1097,7 +1098,13 @@ def _select_evidence(service, db, request, frame, prepared):
 
 
 def assemble(service, db, request, context, frame, prepared):
-    evidence, results, constraints, _ = _select_evidence(service, db, request, frame, prepared)
+    evidence, results, constraints, chosen = _select_evidence(service, db, request, frame, prepared)
+    for plan, result, selected in zip(prepared, results, chosen, strict=True):
+        ranking = plan["ranking"]
+        if ranking is not None and ranking.trace is not None:
+            ranking.trace.update(
+                selected_ids=sorted(selected), truncation_reasons=result["omissions"]
+            )
     bundle = make_bundle(service, db, request, context, frame, evidence, constraints)
     size = len(canonical(evidence).encode()) if evidence else 0
     return dict(

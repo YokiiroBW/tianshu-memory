@@ -47,6 +47,7 @@ class PreparedRanking:
     available: dict
     corrupted: list
     query_vector: PreparedQueryVector | None = None
+    trace: dict | None = None
 
     @property
     def external(self):
@@ -115,7 +116,18 @@ def rank(retrieval, store, query, documents, lexical_ids, settings, *, deadline=
     return rank_prepared(retrieval, store, query, plan, deadline=deadline)
 
 
-def rank_prepared(retrieval, store, query, plan, *, deadline=None):
+def rank_prepared(retrieval, store, query, plan, *, deadline=None, query_id=None):
+    result, complete = _rank_prepared(retrieval, store, query, plan, deadline=deadline)
+    if plan.settings.get("trace", False):
+        from .diagnostics import record_recall_trace
+        from .recall_trace import build
+
+        plan.trace = build(query_id, plan, result, complete)
+        record_recall_trace(plan.trace)
+    return result, complete
+
+
+def _rank_prepared(retrieval, store, query, plan, *, deadline=None):
     """Use one prepared snapshot; callers release their authority transaction for external work."""
     if plan.external and deadline is None:
         deadline = time.monotonic() + 8

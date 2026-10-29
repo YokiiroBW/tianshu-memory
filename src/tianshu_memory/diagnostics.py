@@ -1313,6 +1313,10 @@ class Diagnostics:
         self.config_path = config_path
         self.contract_path = contract_path
         self.refused = 0
+        # Internal, bounded explanations; diagnostics/v1 log records stay unchanged.
+        from collections import deque
+
+        self.recall_traces = deque(maxlen=128)
 
     @property
     def durable(self):
@@ -1802,6 +1806,12 @@ def note_fault(code):
     scope = _scope.get()
     if scope is not None:
         scope.diagnostics.note_fault(code)
+
+
+def record_recall_trace(trace):
+    scope = _scope.get()
+    if scope is not None:
+        scope.diagnostics.recall_traces.append(trace)
 
 
 def _duration(value):
