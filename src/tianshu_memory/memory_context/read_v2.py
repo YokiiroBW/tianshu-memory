@@ -106,6 +106,8 @@ def collect(service, db, request, context):
                 group, units, snapshot.decoded[identity], snapshot.rows[identity]["observed_at"]
             )
     episodes = list(memory_documents.episode_metadata(service, db, [item[0] for item in scopes]))
+    from ..memory_events import selection_links
+
     return dict(
         scope=scope,
         scopes=scopes,
@@ -115,6 +117,7 @@ def collect(service, db, request, context):
         documents=document_rows,
         summaries=consolidation_sources.metadata(db, group_ids),
         episodes=episodes,
+        event_links=selection_links(db, groups),
         complete=complete,
     )
 
@@ -1046,17 +1049,41 @@ def _selection_units(frame, plan, *, context_mode):
         return [[document] for document in plan["ranked"]]
     if "selection_units" not in plan:
         companions = {}
+        parents = {document["id"]: document["id"] for document in plan["documents"]}
+
+        def root(identity):
+            while parents[identity] != identity:
+                parents[identity] = parents[parents[identity]]
+                identity = parents[identity]
+            return identity
+
+        def connect(identities):
+            for identity in identities[1:]:
+                parents[root(identity)] = root(identities[0])
+
         for document in plan["documents"]:
             key = _summary_selection_key(frame, document)
             if key is not None:
                 companions.setdefault(key, []).append(document)
+        for members in companions.values():
+            connect([member["id"] for member in members])
+        by_group = {
+            document["group_id"]: document["id"]
+            for document in plan["documents"]
+            if document["kind"] != "episode"
+        }
+        for groups in frame.get("event_links", []):
+            if all(group in by_group for group in groups):
+                connect([by_group[group] for group in groups])
+        components = {}
+        for document in plan["documents"]:
+            components.setdefault(root(document["id"]), []).append(document)
         units, seen = [], set()
         positions = {document["id"]: index for index, document in enumerate(plan["ranked"])}
         for document in plan["ranked"]:
             if document["id"] in seen:
                 continue
-            key = _summary_selection_key(frame, document)
-            members = companions.get(key, [document]) if key is not None else [document]
+            members = components[root(document["id"])]
             members = sorted(
                 members,
                 key=lambda member: (positions.get(member["id"], len(positions)), member["id"]),

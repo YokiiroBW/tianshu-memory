@@ -364,6 +364,13 @@ CREATE TABLE IF NOT EXISTS memory_merge_candidates (
  new_hash TEXT NOT NULL, prior_hash TEXT NOT NULL, score DOUBLE PRECISION NOT NULL,
  created_at TEXT NOT NULL, PRIMARY KEY(new_group_id,prior_group_id,embedding_revision));
 CREATE INDEX IF NOT EXISTS memory_merge_prior ON memory_merge_candidates(prior_group_id,new_group_id);
+CREATE TABLE IF NOT EXISTS memory_event_refs (
+ event_id TEXT NOT NULL, group_id TEXT NOT NULL REFERENCES groups(id) DEFERRABLE INITIALLY IMMEDIATE,
+ scope TEXT NOT NULL, relation TEXT NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY(event_id,group_id));
+CREATE INDEX IF NOT EXISTS memory_event_group ON memory_event_refs(group_id,event_id);
+CREATE TABLE IF NOT EXISTS memory_event_state (
+ event_id TEXT PRIMARY KEY, scope TEXT NOT NULL, kind TEXT NOT NULL, slots TEXT NOT NULL,
+ basis TEXT NOT NULL, version BIGINT NOT NULL, updated_at TEXT NOT NULL);
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS extraction_schema BIGINT;
 CREATE TABLE IF NOT EXISTS memory_episode_index (document_id TEXT,scope TEXT,text TEXT);
 CREATE INDEX IF NOT EXISTS memory_episode_index_terms ON memory_episode_index USING gin(to_tsvector('simple',text));

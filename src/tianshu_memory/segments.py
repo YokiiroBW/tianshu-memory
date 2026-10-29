@@ -856,6 +856,9 @@ class Segments:
                 from .merge_candidates import mark_exact
 
                 mark_exact(db, created_group)
+                from .memory_events import record as record_event
+
+                record_event(db, scope, created_group, memory, batch["recorded_at"])
                 memory_refs.extend(created)
                 for row in actual_rows:
                     retained_keys.add(row["key"])

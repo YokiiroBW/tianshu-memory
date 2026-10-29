@@ -39,6 +39,7 @@ DERIVED_TABLES = {"memory_documents", "memory_vectors", "memory_episode_index"}
 DERIVED_TABLES.add("memory_recall_documents")
 DERIVED_TABLES.add("memory_target_rotation")
 DERIVED_TABLES.add("memory_merge_candidates")
+DERIVED_TABLES.update({"memory_event_refs", "memory_event_state"})
 SEARCH_TABLES = {
     "search_index",
     "knowledge_index",
@@ -347,6 +348,9 @@ def prepare(db, source, *, files, recovery_path, state_directory, epoch):
         merge = db.native("SELECT value FROM metadata WHERE key='memory_merge_schema'").fetchone()
         if merge is None:
             required.discard("memory_merge_candidates")
+        events = db.native("SELECT value FROM metadata WHERE key='memory_event_schema'").fetchone()
+        if events is None:
+            required -= {"memory_event_refs", "memory_event_state"}
         if not required <= installed:
             raise ValueError("PostgreSQL Memory schema is incomplete; authority tables missing")
         return
