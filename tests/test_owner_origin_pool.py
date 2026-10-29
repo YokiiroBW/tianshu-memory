@@ -223,6 +223,9 @@ def test_verifier_preserves_error_json_and_body_boundaries(
             verifier({"operation": operation})
         assert rejected.value.code == code
         assert rejected.value.status == (409 if code == "scope_changed" else 503)
+        if payload != b'{"valid":true,"valid":false}':
+            assert rejected.value.source_owner == "platform"
+            assert rejected.value.source_http_status == status
     finally:
         verifier.close()
 
