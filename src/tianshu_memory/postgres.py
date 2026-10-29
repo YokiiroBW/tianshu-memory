@@ -37,6 +37,7 @@ SEGMENT_TABLES = {
 }
 DERIVED_TABLES = {"memory_documents", "memory_vectors", "memory_episode_index"}
 DERIVED_TABLES.add("memory_recall_documents")
+DERIVED_TABLES.add("memory_target_rotation")
 SEARCH_TABLES = {
     "search_index",
     "knowledge_index",
@@ -337,6 +338,11 @@ def prepare(db, source, *, files, recovery_path, state_directory, epoch):
         ).fetchone()
         if partition is None:
             required.discard("memory_recall_documents")
+        rotation = db.native(
+            "SELECT value FROM metadata WHERE key='memory_rotation_schema'"
+        ).fetchone()
+        if rotation is None:
+            required.discard("memory_target_rotation")
         if not required <= installed:
             raise ValueError("PostgreSQL Memory schema is incomplete; authority tables missing")
         return

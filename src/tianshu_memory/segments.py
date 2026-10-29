@@ -3,7 +3,7 @@
 import copy
 import json
 
-from . import consolidation_sources, segment_records, segment_sources
+from . import consolidation_sources, segment_records, segment_sources, target_rotation
 from .domain import Fault, canonical, fingerprint, new_id, parse_time, require, utc
 from .retention import decide
 from .segment_materials import SegmentMaterials, authorize, human_member
@@ -638,7 +638,7 @@ class Segments:
                 history_budget = [49152]
                 targets = [
                     _prepare_target(service, db, target, used, history_budget)
-                    for target in event["targets"]
+                    for target in target_rotation.order(db, event["targets"])
                 ]
                 # Earlier seals could include empty optional archive context.
                 # No valid model window exists yet: omit only those members
@@ -934,6 +934,7 @@ class Segments:
             )
             if memory_refs or portrait_refs:
                 service._bump(db, scope, history_changed=False)
+            target_rotation.covered(db, scope, utc(service.clock()))
         for group in prior_groups:
             segment_records.supersede(db, group)
         service._emit(
