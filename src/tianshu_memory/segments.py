@@ -949,6 +949,7 @@ class Segments:
                     dict(
                         kind="experience", state="described", retention="medium", valid_until=None
                     ),
+                    kind="source",
                 )
                 for row in unreferenced_rows:
                     segment_records.lifecycle(db, row, "normal", effective, expiry)

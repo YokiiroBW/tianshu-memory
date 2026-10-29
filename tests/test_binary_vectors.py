@@ -61,3 +61,18 @@ def test_explicit_legacy_migration_preserves_guard_backup_and_is_idempotent(sync
         row = db.execute("SELECT vector,vector_bytes FROM memory_vectors").fetchone()
         assert row["vector"] == "[1,0]" and list(unpack(row["vector_bytes"])) == [1, 0]
     assert sync.store.migrate_retrieval(backup)["already_installed"]
+
+
+def test_rollback_keeps_json_and_supports_the_old_positional_writer(sync):
+    from tianshu_memory.retrieval_migration import rollback_binary
+
+    setup(sync)
+    result = rollback_binary(sync.store, sync.directory / "pre-rollback.sqlite")
+    assert result["json_vectors_preserved"]
+    with sync.store.transaction() as db:
+        db.execute("INSERT INTO memory_vectors VALUES ('old','hash','revision',2,'[1,0]')")
+        assert db.execute("SELECT vector FROM memory_vectors").fetchone()[0] == "[1,0]"
+    assert (
+        sync.store.migrate_retrieval(sync.directory / "pre-reapply.sqlite")["vectors_converted"]
+        == 1
+    )

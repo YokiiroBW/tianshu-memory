@@ -76,3 +76,25 @@ def migrate(store, backup_path):
         backup_guard=str(guard),
         vectors_converted=converted,
     )
+
+
+def rollback_binary(store, backup_path):
+    """Restore the five-column layout required by pre-upgrade INSERT ... VALUES writers.
+
+    JSON contains the complete normalized vectors; the float32 copy is rebuildable.
+    Preserve a paired backup and advance the existing guard transaction, never restore
+    an older authority snapshot or edit its checkpoint by hand.
+    """
+    with store.transaction() as db:
+        if not installed(db):
+            return dict(memory_retrieval_schema=0, already_rolled_back=True)
+        backup, guard = backup_before(store, db, backup_path)
+        db.execute("ALTER TABLE memory_vectors DROP COLUMN vector_bytes")
+        db.execute("DELETE FROM metadata WHERE key='memory_retrieval_schema'")
+        db.execute("UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_revision'")
+    return dict(
+        memory_retrieval_schema=0,
+        backup=str(backup),
+        backup_guard=str(guard),
+        json_vectors_preserved=True,
+    )

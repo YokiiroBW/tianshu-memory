@@ -17,7 +17,7 @@ from conftest import Harness, contract_directory
 from tianshu_memory.contracts import Contracts
 
 
-def evaluate(corpus):
+def evaluate(corpus, *, preserve_order=False):
     with tempfile.TemporaryDirectory(prefix="tianshu-recall-eval-") as temporary:
         h = Harness(Path(temporary), Contracts(contract_directory()))
         try:
@@ -48,6 +48,10 @@ def evaluate(corpus):
                         elapsed_ms=elapsed * 1000,
                     )
                 )
+                if preserve_order:
+                    cases[-1]["ranked"] = [
+                        identities[unit["statement"]] for unit in result["selected_units"]
+                    ]
         finally:
             h.client.close()
     summaries = {}

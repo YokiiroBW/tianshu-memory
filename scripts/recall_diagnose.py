@@ -13,7 +13,7 @@ def metrics(cases, k):
     correct = total = complete = 0
     oracle = []
     for case in cases:
-        expected, selected = set(case["expected"]), set(case["selected"][:k])
+        expected, selected = set(case["expected"]), set(case.get("ranked", case["selected"])[:k])
         correct += len(expected & selected)
         total += len(expected)
         complete += expected <= selected
@@ -40,7 +40,7 @@ def main():
     corpus = json.loads(args.fixture.read_text(encoding="utf-8"))
     if args.snapshot:
         corpus["facts"] = json.loads(args.snapshot.read_text(encoding="utf-8"))["facts"]
-    report = evaluate(corpus)
+    report = evaluate(corpus, preserve_order=True)
     report["metrics"] = metrics(report["cases"], args.k)
     report["oracle_boundary"] = "Labelled oracle answers only; null means not evaluated."
     if args.output:

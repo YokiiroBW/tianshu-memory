@@ -53,6 +53,9 @@ class PreparedRanking:
     trace: dict | None = None
     summaries: dict | None = None
     now: datetime | None = None
+    channel_hits: dict | None = None
+    rrf_count: int | None = None
+    degradation: str | None = None
 
     @property
     def external(self):
@@ -181,6 +184,7 @@ def _rank_prepared(retrieval, store, query, plan, *, deadline=None, limit=None, 
     by_id, available, settings = plan.by_id, plan.available, plan.settings
     limit = settings["candidates"] if limit is None else limit
     lexical_ids = plan.lexical_ids[:limit]
+    plan.channel_hits = dict(lexical=len(lexical_ids), vector=0)
     scores = {}
     if available:
         try:
@@ -205,8 +209,18 @@ def _rank_prepared(retrieval, store, query, plan, *, deadline=None, limit=None, 
             )
             scores = {identity: dot(value, vector) for identity, vector in available.items()}
         except (Fault, OSError, TimeoutError, ValueError, TypeError, KeyError):
-            return [by_id[identity] for identity in lexical_ids], False
+            plan.degradation = "query_embedding_failed"
+            plan.rrf_count = len(lexical_ids)
+            relevance = {
+                identity: 1 / (60 + position) for position, identity in enumerate(lexical_ids, 1)
+            }
+            fallback = order(
+                combine(relevance, list(by_id.values()), plan.summaries, plan.now),
+                list(by_id.values()),
+            )
+            return [by_id[identity] for identity in fallback], False
     semantic = sorted(scores, key=lambda identity: (-scores[identity], identity))[:limit]
+    plan.channel_hits["vector"] = len(semantic)
     if settings["mode"] == "vector":
         ranked = semantic or lexical_ids
     elif settings["mode"] == "hybrid":
@@ -217,6 +231,7 @@ def _rank_prepared(retrieval, store, query, plan, *, deadline=None, limit=None, 
         ranked = sorted(fused, key=lambda identity: (-fused[identity], identity))[:limit]
     else:
         ranked = lexical_ids
+    plan.rrf_count = len(ranked)
     relevance = (
         {identity: fused[identity] for identity in ranked}
         if settings["mode"] == "hybrid"
@@ -230,6 +245,9 @@ def _rank_prepared(retrieval, store, query, plan, *, deadline=None, limit=None, 
     complete = not plan.corrupted and (
         settings["mode"] == "keyword" or len(available) == plan.document_count
     )
+    plan.degradation = (
+        None if complete else "corrupt_vectors" if plan.corrupted else "index_incomplete"
+    )
     if rerank and settings["rerank"] and ranked:
         result, reranked = rerank_documents(
             retrieval,
@@ -239,6 +257,8 @@ def _rank_prepared(retrieval, store, query, plan, *, deadline=None, limit=None, 
             settings,
             deadline=deadline,
         )
+        if not reranked:
+            plan.degradation = "rerank_failed"
         return result, complete and reranked
     return [by_id[identity] for identity in ranked], complete
 

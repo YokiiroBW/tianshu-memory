@@ -1,6 +1,7 @@
 import copy
 import json
 
+from test_contextual_recall import contextual_query
 from test_memory_review import saved
 from test_segments import ready
 from test_source_sync import certificates as certificates
@@ -210,3 +211,33 @@ def test_explicit_action_state_and_thought_revision_use_the_same_projector(sync)
             "preference",
             "task",
         }
+
+
+def test_explicit_cross_window_relation_keeps_the_whole_authorized_basis_in_selection(sync):
+    ready(sync)
+    sync.store.migrate_events(sync.directory / "pre-events.sqlite")
+    _, first = saved(
+        sync,
+        "cross-one",
+        "考虑一起取书。",
+        "2026-10-25T00:00:00Z",
+        kind="agreement",
+        state="considering",
+    )
+    saved(
+        sync,
+        "cross-two",
+        "确认一起取书。",
+        "2026-10-26T00:00:00Z",
+        kind="agreement",
+        state="confirmed",
+        operation="append",
+        prior_refs=first["results"][0]["memory_refs"],
+    )
+    one = contextual_query(sync, "取书", limits=dict(facts=1, episodes=0))
+    assert one["evidence"] == [] and "budget" in one["omissions"]
+    two = contextual_query(sync, "取书", limits=dict(facts=2, episodes=0))
+    assert {item["unit"]["statement"] for item in two["evidence"]} == {
+        "考虑一起取书。",
+        "确认一起取书。",
+    }

@@ -7,8 +7,10 @@ def build(query_id, plan, ranked, complete, *, omissions=(), selected=None):
     return dict(
         query_id=query_id,
         candidates=plan.document_count,
-        channels=dict(lexical=len(plan.lexical_ids), vector=len(plan.available)),
-        rrf_count=len(ranked),
+        channels=plan.channel_hits
+        or dict(lexical=len(plan.lexical_ids), vector=len(plan.available)),
+        rrf_count=plan.rrf_count if plan.rrf_count is not None else len(ranked),
+        degradation=plan.degradation,
         index_incomplete=not complete,
         truncation_reasons=list(dict.fromkeys(omissions)),
         ranked_ids=[item["id"] for item in ranked],

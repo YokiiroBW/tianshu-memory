@@ -945,6 +945,8 @@ def rank_plans(service, prepared, backend_failed, *, frame=None):
                     plan["subquery"]["text"], canonical(ranking.settings), value
                 )
             ranked, complete = {}, True
+            ranking.channel_hits = dict(lexical=0, vector=0)
+            ranking.rrf_count = 0
             for owner, documents in partitions.items():
                 identities = {document["id"] for document in documents}
                 owned = replace(
@@ -961,6 +963,9 @@ def rank_plans(service, prepared, backend_failed, *, frame=None):
                     },
                     corrupted=[row for row in ranking.corrupted if row[0] in identities],
                     trace=None,
+                    channel_hits=None,
+                    rrf_count=None,
+                    degradation=None,
                 )
                 ranked[owner], current = rank_prepared(
                     service.retrieval,
@@ -973,6 +978,11 @@ def rank_plans(service, prepared, backend_failed, *, frame=None):
                     rerank=False,
                 )
                 complete &= current
+                for name, count in owned.channel_hits.items():
+                    ranking.channel_hits[name] += count
+                ranking.rrf_count += owned.rrf_count
+                if owned.degradation is not None:
+                    ranking.degradation = owned.degradation
             plan["per_owner_ranked"] = ranked
             plan["ranked"] = interleave(ranked)
             plan["index_complete"] = complete and not backend_failed
@@ -1004,6 +1014,8 @@ def rank_plans(service, prepared, backend_failed, *, frame=None):
                     deadline=retrieval_deadline,
                 )
                 plan["index_complete"] &= reranked
+                if not reranked:
+                    ranking.degradation = "rerank_failed"
                 if "selection_units" in plan:
                     positions = {document["id"]: i for i, document in enumerate(plan["ranked"])}
                     plan["selection_units"].sort(

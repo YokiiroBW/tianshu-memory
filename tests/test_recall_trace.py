@@ -1,7 +1,7 @@
 """Tracing observes ranking without changing the result or the public bytes."""
 
 from tianshu_memory.domain import canonical
-from tianshu_memory.persistent_retrieval import PreparedRanking, rank_prepared
+from tianshu_memory.persistent_retrieval import PreparedQueryVector, PreparedRanking, rank_prepared
 
 
 def test_trace_keeps_result_bytes_and_records_incomplete_index():
@@ -42,3 +42,20 @@ def test_diagnostic_buffer_is_bounded_and_uses_the_existing_operator_token():
             assert response.json()["traces"][0]["query_id"] == "12"
     finally:
         diagnostics.shutdown()
+
+
+def test_channel_hits_report_the_shortlist_instead_of_all_indexed_vectors():
+    settings = dict(mode="hybrid", candidates=1, rerank=False, trace=True)
+    docs = {
+        identity: dict(id=identity, group_id=identity, scope="owner")
+        for identity in ("a", "b", "c")
+    }
+    query = PreparedQueryVector("q", canonical(settings), (1.0, 0.0))
+    plan = PreparedRanking(
+        docs, 3, ["a", "b", "c"], settings, {identity: (1.0, 0.0) for identity in docs}, [], query
+    )
+    result, complete = rank_prepared(None, None, "q", plan)
+    assert complete and len(result) == 1
+    assert plan.trace["candidates"] == 3
+    assert plan.trace["channels"] == dict(lexical=1, vector=1)
+    assert plan.trace["rrf_count"] == 1

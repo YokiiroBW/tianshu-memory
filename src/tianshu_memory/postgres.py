@@ -35,11 +35,16 @@ SEGMENT_TABLES = {
     "memory_observation_heads",
     "memory_material_aliases",
 }
-DERIVED_TABLES = {"memory_documents", "memory_vectors", "memory_episode_index"}
-DERIVED_TABLES.add("memory_recall_documents")
-DERIVED_TABLES.add("memory_target_rotation")
-DERIVED_TABLES.add("memory_merge_candidates")
-DERIVED_TABLES.update({"memory_event_refs", "memory_event_state"})
+DERIVED_TABLES = {
+    "memory_documents",
+    "memory_vectors",
+    "memory_episode_index",
+    "memory_recall_documents",
+    "memory_target_rotation",
+    "memory_merge_candidates",
+    "memory_event_refs",
+    "memory_event_state",
+}
 SEARCH_TABLES = {
     "search_index",
     "knowledge_index",
