@@ -488,7 +488,9 @@ def test_new_state_replaces_exact_prior_and_retention_is_independent(sync):
             (old["record_id"],),
         ).fetchone()
         assert previous["state"] == "superseded"
-        assert parse_time(previous["expires_at"]) == parse_time("2027-01-01T00:00:00Z")
+        # A pending agreement now receives long/high from the server rule,
+        # irrespective of the model's short suggestion and before its valid-until.
+        assert parse_time(previous["expires_at"]) > parse_time("2027-01-01T00:00:00Z")
         assert (
             db.execute(
                 "SELECT state FROM history WHERE record_id=? AND version=1", (old["record_id"],)

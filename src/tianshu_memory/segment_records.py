@@ -1,10 +1,12 @@
 """Per-experience state and retention using the existing records/history/lineage."""
 
 import json
+import logging
 from datetime import timedelta
 
 from .domain import canonical, new_id, parse_time, require, utc
 from .memory_documents import index_group, remove_groups
+from .retention import decide
 from .workflow import _WorkflowBase
 
 RETENTION = {"short": "low", "medium": "normal", "long": "high"}
@@ -19,9 +21,10 @@ def record_refs(db, group_id):
     ]
 
 
-def expires(service, effective_at, memory):
+def expires(service, effective_at, memory, *, kind="summary"):
+    retention = decide(memory)[0] if kind == "summary" else memory["retention"]
     result = parse_time(effective_at) + timedelta(
-        days=service.consolidation_ttl_days[RETENTION[memory["retention"]]]
+        days=service.consolidation_ttl_days[RETENTION[retention]]
     )
     if (
         memory["kind"] == "agreement"
@@ -42,6 +45,21 @@ def write(
         409,
     )
     group_id, record_id = new_id("group"), new_id("record")
+    retention, importance = (
+        decide(memory) if kind == "summary" else (memory["retention"], memory["importance"])
+    )
+    logging.getLogger(__name__).info(
+        canonical(
+            dict(
+                event="memory.retention_decided",
+                group_id=group_id,
+                model_retention=memory["retention"],
+                model_importance=memory["importance"],
+                retention=retention,
+                importance=importance,
+            )
+        )
+    )
     shared = scope["audience"] == "group"
     unit_sources = (
         [
@@ -95,7 +113,7 @@ def write(
         ),
         key=parse_time,
     )
-    expiry = expires(service, effective_at, memory)
+    expiry = expires(service, effective_at, memory, kind=kind)
     db.execute(
         "INSERT INTO memory_summaries VALUES (?,?,?,?,?,?,?,?,?)",
         (
@@ -105,7 +123,7 @@ def write(
             batch["window_id"],
             batch["manifest"],
             canonical(list(refs)),
-            memory["importance"],
+            importance,
             batch["recorded_at"],
             expiry,
         ),
@@ -116,7 +134,7 @@ def write(
             group_id,
             memory["kind"],
             memory["state"],
-            memory["retention"],
+            retention,
             memory["valid_until"],
             effective_at,
             canonical(memory.get("prior_refs", []) if memory.get("operation") == "replace" else []),

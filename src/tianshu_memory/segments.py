@@ -5,6 +5,7 @@ import json
 
 from . import consolidation_sources, segment_records, segment_sources
 from .domain import Fault, canonical, fingerprint, new_id, parse_time, require, utc
+from .retention import decide
 from .segment_materials import SegmentMaterials, authorize, human_member
 from .segment_migration import installed
 
@@ -834,7 +835,7 @@ class Segments:
                     segment_records.lifecycle(
                         db,
                         row,
-                        memory["importance"],
+                        decide(memory)[1],
                         max(
                             (members[item]["observed_at"] for item in target["new_member_ids"]),
                             key=parse_time,

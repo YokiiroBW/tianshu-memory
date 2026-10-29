@@ -73,12 +73,20 @@ def test_review_keeps_repeated_experiences_and_actual_agreement_state_in_own_sco
     assert response.status_code == 200, response.text
     review = response.json()["review"]
     assert review["periods"]["7"]["count"] == 3
-    assert review["periods"]["30"]["count"] == 5
+    # The unqualified Oct 5 experience now has the server's short retention.
+    assert review["periods"]["30"]["count"] == 4
     assert [item["text"] for item in review["periods"]["7"]["items"]].count("又去河边散步。") == 2
     assert review["open_agreements"]["count"] == 1
     assert review["open_agreements"]["items"][0]["state"] == "confirmed"
     assert review["open_agreements"]["items"][0]["overdue"] is True
     assert review["portrait"]["text"] == "愿意户外散步。"
+    from tianshu_memory.recall_trace import retention_distribution
+
+    with sync.store.transaction() as db:
+        distribution = retention_distribution(db)
+        assert distribution["retention"]["long"] == 1
+        assert distribution["importance"]["high"] == 1
+        assert distribution["importance"].get("low", 0) == 0
     assert "他人的独立秘密" not in response.text
     assert "source_key" not in response.text and "message_key" not in response.text
     with monkeypatch.context() as limited:
