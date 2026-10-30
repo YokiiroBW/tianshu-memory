@@ -84,10 +84,23 @@ def test_window_precedes_limit_and_keeps_microseconds_offsets_and_ties(actor):
 def test_budget_does_not_skip_or_claim_empty_day(actor):
     execute(actor, append(actor))
     first = timeline(actor, budget_bytes=1)
-    assert first["items"] == [] and first["omitted"] and not first["complete"]
+    assert first["items"] == [] and not first["omitted"] and not first["complete"]
     assert first["next_cursor"]
     second = timeline(actor, cursor=first["next_cursor"])
     assert len(second["items"]) == 1 and second["complete"]
+
+
+def test_page_budget_counts_array_bytes_and_defers_without_omitting(actor):
+    seed(actor, ["2026-10-26T01:00:00Z", "2026-10-26T02:00:00Z"])
+    expected = timeline(actor)["items"]
+    budget = len(canonical(expected[:1]).encode())
+    first = timeline(actor, budget_bytes=budget)
+    assert first["items"] == expected[:1]
+    assert len(canonical(first["items"]).encode()) == budget
+    assert not first["complete"] and not first["omitted"]
+    second = timeline(actor, budget_bytes=32768, cursor=first["next_cursor"])
+    assert first["items"] + second["items"] == expected
+    assert second["complete"] and not second["omitted"]
 
 
 def test_submicrosecond_fraction_uses_same_truncated_key_for_window_and_cursor(actor):

@@ -141,7 +141,7 @@ def execute(memories, request, *, actor, caller, recheck):
         require(app.store.version(db) == version, "source_changed", 409)
         current = memories._rows(db, request["actor_id"], refs)
         bases = memories._basis(db, request["actor_id"], current)
-        items, used, omitted = [], 0, undated
+        items, used, omitted = [], 2, undated  # JSON array brackets count too.
         for (ref, row), original in zip(current, rows):
             basis = bases.get((ref["kind"], ref["id"]), [])
             state, _ = memories._status(ref, row, basis, observed, context)
@@ -150,14 +150,18 @@ def execute(memories, request, *, actor, caller, recheck):
                 omitted, after = True, position
                 continue
             item = memories._item(ref, row, basis) | {"fact": json.loads(row["fact"])}
-            size = len(canonical(item).encode())
-            if size > 32768:
+            item_size = len(canonical(item).encode())
+            if item_size + 2 > 32768:
                 # The contract cannot fit this item even with the maximum budget.
                 # Advance explicitly as omitted instead of trapping every later page.
                 omitted, after = True, position
                 continue
+            size = item_size + bool(items)  # Comma between JSON array entries.
             if used + size > request["budget_bytes"]:
-                omitted, more = True, True
+                # This row remains at the next cursor. Pagination is incomplete,
+                # but no material has been skipped; later pages can still close
+                # the same day without erasing genuine source omissions.
+                more = True
                 break
             items.append(item)
             used += size
